@@ -14,5 +14,11 @@ int mu_gpu_dense_probe(mu_gpu *gpu, const float *x,
                        int rows, int cols, float *out);
 int mu_gpu_rmsnorm_probe(mu_gpu *gpu, const float *x, const float *weight,
                          int n, float eps, float *out);
+int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
+                         const float *patch_embeds,
+                         int rows, int cols,
+                         const float *rotary,
+                         int rotary_rows, int rotary_cols,
+                         float *out, int out_rows, int out_cols);
 
 #endif

@@ -191,3 +191,23 @@ int mu_gpu_rmsnorm_probe(mu_gpu *gpu, const float *x, const float *weight,
     }
     return 0;
 }
+
+int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
+                         const float *patch_embeds,
+                         int rows, int cols,
+                         const float *rotary,
+                         int rotary_rows, int rotary_cols,
+                         float *out, int out_rows, int out_cols) {
+    (void)gpu;
+    (void)engine;
+    (void)patch_embeds;
+    (void)rows;
+    (void)cols;
+    (void)rotary;
+    (void)rotary_rows;
+    (void)rotary_cols;
+    (void)out;
+    (void)out_rows;
+    (void)out_cols;
+    return -30;
+}

@@ -2438,10 +2438,16 @@ int mu_vision_encode(mu_engine *e, const float *patch_embeds,
                      int rows, int cols,
                      const float *rotary, int rotary_rows, int rotary_cols,
                      float *out, int out_rows, int out_cols) {
+#if defined(__APPLE__)
     if (e && e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
-        int rc = mu_record_cpu_fallback(e, "vision_encode");
+        int rc = mu_gpu_vision_encode(e->gpu, e, patch_embeds, rows, cols,
+                                      rotary, rotary_rows, rotary_cols,
+                                      out, out_rows, out_cols);
+        if (rc == 0) return 0;
+        rc = mu_record_cpu_fallback(e, "vision_encode");
         if (rc) return rc;
     }
+#endif
     return mu_cpu_vision_encode(e, patch_embeds, rows, cols, rotary,
                                 rotary_rows, rotary_cols, out, out_rows, out_cols);
 }

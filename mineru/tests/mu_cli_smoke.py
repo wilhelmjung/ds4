@@ -24,6 +24,32 @@ def run_mu_check(trace: str) -> str:
     return result.stdout
 
 
+def assert_metal_layout_trace_if_available() -> None:
+    result = subprocess.run(
+        [
+            str(ROOT / "mu"),
+            "--backend",
+            "metal",
+            "--check-trace",
+            str(TRACE_DIR / "layout.json"),
+        ],
+        cwd=ROOT,
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        if "Metal" in result.stderr or "metal" in result.stderr:
+            return
+        raise AssertionError(
+            "metal layout trace failed\n"
+            f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+        )
+    assert "trace layout logits ok" in result.stdout
+
+
 def assert_layout_token1_is_checked() -> None:
     trace_path = TRACE_DIR / "layout.json"
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
@@ -140,6 +166,7 @@ def main() -> None:
     assert_image_sidecar_path_runs()
     assert_sidecar_layout_generates_blocks_fast()
     assert_image_native_path_starts()
+    assert_metal_layout_trace_if_available()
 
     print("mu_cli_smoke ok")
 
