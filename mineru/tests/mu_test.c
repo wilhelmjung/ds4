@@ -209,6 +209,33 @@ static int test_mu_gpu_rmsnorm_probe(void) {
     return 0;
 }
 
+static int test_mu_gpu_layernorm_bf16_probe(void) {
+#if defined(__APPLE__)
+    mu_gpu *gpu = NULL;
+    if (mu_gpu_create(&gpu) != 0) return 0;
+    float x[4] = {1.0f, 2.0f, -3.0f, 4.0f};
+    unsigned short w[4] = {0x3f80, 0x4000, 0x3f00, 0xbf80};
+    unsigned short b[4] = {0x0000, 0x3f80, 0xbf80, 0x4000};
+    float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int rc = mu_gpu_layernorm_bf16_probe(gpu, x, w, b, 4, 1e-6f, out);
+    mu_gpu_destroy(gpu);
+    if (rc != 0) return 150;
+
+    float mean = (1.0f + 2.0f - 3.0f + 4.0f) / 4.0f;
+    float var = 0.0f;
+    for (int i = 0; i < 4; i++) {
+        float d = x[i] - mean;
+        var += d * d;
+    }
+    float inv = 1.0f / sqrtf(var / 4.0f + 1e-6f);
+    float exp0 = mu_bf16_to_f32(mu_f32_to_bf16((x[0] - mean) * inv));
+    float exp3 = mu_bf16_to_f32(mu_f32_to_bf16((x[3] - mean) * inv * -1.0f + 2.0f));
+    if (!close_enough(out[0], exp0, 1e-4f)) return 151;
+    if (!close_enough(out[3], exp3, 1e-4f)) return 152;
+#endif
+    return 0;
+}
+
 int main(void) {
     int rc = test_default_options();
     if (rc) {
@@ -258,6 +285,11 @@ int main(void) {
     rc = test_mu_gpu_rmsnorm_probe();
     if (rc) {
         fprintf(stderr, "test_mu_gpu_rmsnorm_probe failed: %d\n", rc);
+        return rc;
+    }
+    rc = test_mu_gpu_layernorm_bf16_probe();
+    if (rc) {
+        fprintf(stderr, "test_mu_gpu_layernorm_bf16_probe failed: %d\n", rc);
         return rc;
     }
     puts("mu_test ok");
