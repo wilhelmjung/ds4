@@ -122,6 +122,13 @@ static int mu_record_cpu_fallback(mu_engine *e, const char *stage) {
     return 0;
 }
 
+static void mu_record_metal_stage(const mu_engine *e, const char *stage) {
+    if (!e || e->opt.backend != MU_BACKEND_METAL) return;
+    if (getenv("MU_METAL_DEBUG")) {
+        fprintf(stderr, "mu metal stage: %s\n", stage ? stage : "unknown");
+    }
+}
+
 static uint64_t mu_read_u64_le(const unsigned char *p) {
     uint64_t v = 0;
     for (int i = 7; i >= 0; i--) {
@@ -1876,7 +1883,10 @@ int mu_vision_block0_norm1_token0(mu_engine *e, const float *patch_embeds,
                                             (const unsigned short *)w,
                                             (const unsigned short *)b,
                                             1, 1280, 1e-6f, out);
-        if (rc == 0) return 0;
+        if (rc == 0) {
+            mu_record_metal_stage(e, "vision_block0_norm1");
+            return 0;
+        }
         rc = mu_record_cpu_fallback(e, "vision_block0_norm1");
         if (rc) return rc;
     }
