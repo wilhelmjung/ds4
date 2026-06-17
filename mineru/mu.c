@@ -106,6 +106,22 @@ struct mu_result {
     char *markdown;
 };
 
+static int mu_record_cpu_fallback(mu_engine *e, const char *stage) {
+    if (!e) return -1;
+    if (e->opt.backend != MU_BACKEND_METAL) return 0;
+    if (!e->opt.allow_cpu_fallback) {
+        fprintf(stderr, "mu metal stage unavailable without CPU fallback: %s\n",
+                stage ? stage : "unknown");
+        return -20;
+    }
+    e->cpu_fallback_count++;
+    if (getenv("MU_METAL_DEBUG")) {
+        fprintf(stderr, "mu metal fallback to CPU: %s\n",
+                stage ? stage : "unknown");
+    }
+    return 0;
+}
+
 static uint64_t mu_read_u64_le(const unsigned char *p) {
     uint64_t v = 0;
     for (int i = 7; i >= 0; i--) {
@@ -2398,10 +2414,10 @@ int mu_vision_encode_hidden(mu_engine *e, const float *patch_embeds,
     return 0;
 }
 
-int mu_vision_encode(mu_engine *e, const float *patch_embeds,
-                     int rows, int cols,
-                     const float *rotary, int rotary_rows, int rotary_cols,
-                     float *out, int out_rows, int out_cols) {
+static int mu_cpu_vision_encode(mu_engine *e, const float *patch_embeds,
+                                int rows, int cols,
+                                const float *rotary, int rotary_rows, int rotary_cols,
+                                float *out, int out_rows, int out_cols) {
     if (!e || !patch_embeds || !rotary || !out ||
         rows <= 0 || cols != 1280 ||
         rotary_rows != rows || rotary_cols != 40 ||
@@ -2416,6 +2432,18 @@ int mu_vision_encode(mu_engine *e, const float *patch_embeds,
     if (rc == 0) rc = mu_vision_merger(e, hidden, rows, 1280, out, out_rows, out_cols);
     free(hidden);
     return rc == 0 ? 0 : -3;
+}
+
+int mu_vision_encode(mu_engine *e, const float *patch_embeds,
+                     int rows, int cols,
+                     const float *rotary, int rotary_rows, int rotary_cols,
+                     float *out, int out_rows, int out_cols) {
+    if (e && e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        int rc = mu_record_cpu_fallback(e, "vision_encode");
+        if (rc) return rc;
+    }
+    return mu_cpu_vision_encode(e, patch_embeds, rows, cols, rotary,
+                                rotary_rows, rotary_cols, out, out_rows, out_cols);
 }
 
 static void mu_rmsnorm_seq_bf16(const float *x, const uint16_t *weight,
@@ -3171,12 +3199,12 @@ fail:
     return -20;
 }
 
-int mu_text_generate_greedy_with_image_embeds(mu_engine *e,
-                                              const int *input_ids, int n_ids,
-                                              int grid_t, int grid_h, int grid_w,
-                                              const float *image_embeds,
-                                              int n_image_embeds,
-                                              int max_new_tokens, int *out) {
+static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
+                                                         const int *input_ids, int n_ids,
+                                                         int grid_t, int grid_h, int grid_w,
+                                                         const float *image_embeds,
+                                                         int n_image_embeds,
+                                                         int max_new_tokens, int *out) {
     if (!e || !input_ids || n_ids <= 0 || grid_t <= 0 || grid_h <= 0 || grid_w <= 0 ||
         !image_embeds || n_image_embeds <= 0 || max_new_tokens <= 0 || !out) {
         return -1;
@@ -3279,6 +3307,21 @@ int mu_text_generate_greedy_with_image_embeds(mu_engine *e,
     free(k_cache);
     free(v_cache);
     return nout;
+}
+
+int mu_text_generate_greedy_with_image_embeds(mu_engine *e,
+                                              const int *input_ids, int n_ids,
+                                              int grid_t, int grid_h, int grid_w,
+                                              const float *image_embeds,
+                                              int n_image_embeds,
+                                              int max_new_tokens, int *out) {
+    if (e && e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        int rc = mu_record_cpu_fallback(e, "text_generate");
+        if (rc) return rc;
+    }
+    return mu_cpu_text_generate_greedy_with_image_embeds(
+        e, input_ids, n_ids, grid_t, grid_h, grid_w, image_embeds,
+        n_image_embeds, max_new_tokens, out);
 }
 
 mu_engine_options mu_engine_options_default(void) {
