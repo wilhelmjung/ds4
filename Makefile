@@ -17,6 +17,7 @@ ROCM_SRCS := $(wildcard rocm/*.cuh)
 
 ifeq ($(UNAME_S),Darwin)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
+MU_LDLIBS := $(LDLIBS) -framework CoreFoundation -framework CoreGraphics -framework ImageIO -framework Accelerate
 CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
 else
@@ -38,9 +39,10 @@ ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
+MU_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm mu-test
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -217,6 +219,22 @@ ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
+mu: mineru/mu_cli.o mineru/mu.o
+	$(CC) $(CFLAGS) -o $@ mineru/mu_cli.o mineru/mu.o $(MU_LDLIBS)
+
+mu-test: mineru/tests/mu_test.o mineru/mu.o
+	$(CC) $(CFLAGS) -Imineru -o $@ mineru/tests/mu_test.o mineru/mu.o $(MU_LDLIBS)
+	./mu-test
+
+mineru/mu.o: mineru/mu.c mineru/mu.h
+	$(CC) $(CFLAGS) -Imineru -c -o $@ mineru/mu.c
+
+mineru/mu_cli.o: mineru/mu_cli.c mineru/mu.h
+	$(CC) $(CFLAGS) -Imineru -c -o $@ mineru/mu_cli.c
+
+mineru/tests/mu_test.o: mineru/tests/mu_test.c mineru/mu.h
+	$(CC) $(CFLAGS) -Imineru -c -o $@ mineru/tests/mu_test.c
+
 ds4_test: ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS)
 ifeq ($(UNAME_S),Darwin)
 	$(CC) $(CFLAGS) -o $@ ds4_test.o ds4_help.o ds4_kvstore.o rax.o $(CORE_OBJS) $(METAL_LDLIBS)
@@ -241,4 +259,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test tests/test_q4k_dot *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test mu mu-test tests/test_q4k_dot *.o mineru/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o mineru/tests/mu_test.o

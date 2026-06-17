@@ -1,0 +1,464 @@
+# mineru/mu.c Metal Backend Design
+
+Date: 2026-06-17
+Branch: `codex/mineru-mu-engine`
+
+This document designs the Metal acceleration path for `mineru/mu.c`. The CPU
+path must remain in the tree and continue to be the precision reference for
+trace checks, page smoke tests, and backend parity debugging.
+
+## Goal
+
+Add a native Metal backend for MinerU2.5-Pro-2605-1.2B without turning `mu.c`
+into a generic VLM runtime.
+
+The Metal backend should accelerate the existing fixed model path:
+
+```text
+Qwen2-VL image preprocessing
+  -> vision tower
+  -> multimodal token embedding scatter
+  -> Qwen2 text decoder
+  -> greedy layout/content generation
+  -> MinerU postprocess
+```
+
+The CPU backend remains authoritative for correctness. Metal may become the
+default performance backend later, but it must never be the only executable
+path.
+
+## Non-Goals
+
+- Do not remove or weaken the CPU implementation.
+- Do not merge MinerU Metal code into DS4 Metal code.
+- Do not introduce DS4 SSD streaming; MinerU2.5-Pro is a dense Qwen2-VL model.
+- Do not quantize weights in the first Metal version.
+- Do not make the backend generic across arbitrary Qwen2-VL checkpoints.
+- Do not require Metal for tests that are meant to run on non-macOS machines.
+
+## Backend Contract
+
+`mu_engine_options.backend` already exposes:
+
+```c
+typedef enum {
+    MU_BACKEND_CPU = 0,
+    MU_BACKEND_METAL = 1,
+} mu_backend;
+```
+
+The public API should stay stable:
+
+```c
+int mu_engine_open(mu_engine **out, const mu_engine_options *opt);
+int mu_parse_image_file(mu_engine *e, const char *path, mu_result **out);
+int mu_text_top_logits(...);
+int mu_vision_encode(...);
+```
+
+Backend selection is an implementation detail behind the same functions:
+
+- `MU_BACKEND_CPU` calls the current C/Accelerate reference kernels.
+- `MU_BACKEND_METAL` calls Metal kernels for implemented stages.
+- Unimplemented Metal stages may temporarily fall back to CPU only while a
+  milestone is in progress.
+- Benchmark mode must be able to reject CPU fallback so performance numbers are
+  honest.
+
+Recommended CLI surface:
+
+```bash
+./mu --backend cpu --check-trace mineru/tests/mu-traces/layout.json
+./mu --backend metal --check-trace mineru/tests/mu-traces/layout.json
+./mu --backend metal --no-cpu-fallback --image page.png --json
+./mu --compare-backends --image page.png --json
+```
+
+`--compare-backends` should run CPU and Metal on the same input and report
+structured deltas without changing the JSON result format used by normal
+callers.
+
+## Proposed File Layout
+
+Keep MinerU-specific acceleration files inside `mineru/`:
+
+```text
+mineru/mu.c                  Existing CPU/reference engine and backend dispatch.
+mineru/mu.h                  Public API and backend enum.
+mineru/mu_gpu.h              Opaque Metal backend interface used by mu.c.
+mineru/mu_metal.m            Objective-C Metal device, pipeline, buffers, dispatch.
+mineru/metal/mu_dense.metal  BF16/f32 dense kernels and top-k helpers.
+mineru/metal/mu_norm.metal   RMSNorm, LayerNorm, residual/add kernels.
+mineru/metal/mu_attn.metal   Qwen2 text attention and KV-cache decode kernels.
+mineru/metal/mu_vision.metal Qwen2-VL vision attention, MLP, merge kernels.
+```
+
+The Makefile should introduce a separate MinerU Metal source set, for example:
+
+```make
+MU_METAL_SRCS := $(wildcard mineru/metal/*.metal)
+```
+
+This avoids coupling `mu` to DS4's root `metal/*.metal` glob and keeps the DS4
+build graph untouched.
+
+## High-Level Architecture
+
+```mermaid
+flowchart TD
+    A["mu_parse_image_file"] --> B["CPU image decode and Qwen2-VL preprocessing"]
+    B --> C{"backend"}
+    C -->|CPU| D["CPU vision tower"]
+    C -->|Metal| E["Metal vision tower"]
+    D --> F["image embeds"]
+    E --> F
+    F --> G{"backend"}
+    G -->|CPU| H["CPU text decoder/generation"]
+    G -->|Metal| I["Metal text decoder/generation"]
+    H --> J["layout/content markup"]
+    I --> J
+    J --> K["CPU MinerU postprocess and JSON/Markdown"]
+```
+
+The document pipeline, tokenizer, image decode, PDF rendering, crop logic,
+layout parser, JSON writer, and Markdown writer should stay CPU-side. Metal
+only owns tensor compute.
+
+## CPU Reference Policy
+
+CPU is not a temporary scaffolding path. It is the precision contract.
+
+Required policy:
+
+- `MU_BACKEND_CPU` remains the default backend until Metal parity and benchmark
+  gates are consistently green.
+- `make mu-test` continues to exercise CPU by default.
+- Every Metal milestone must compare against CPU and the existing Transformers
+  traces.
+- CPU implementations of tokenizer, image preprocessing, vision trace probes,
+  text logits, greedy generation, layout parser, and page smoke tests stay
+  buildable on macOS without Metal-specific compile flags.
+- No shared helper should silently change CPU numerical behavior to simplify a
+  Metal kernel.
+
+The CPU path is allowed to be slow. Its job is reproducibility, debuggability,
+and a stable fallback when Metal results drift.
+
+## Metal Runtime Objects
+
+Add an opaque runtime owned by `mu_engine`:
+
+```c
+typedef struct mu_gpu mu_gpu;
+
+int mu_gpu_create(mu_gpu **out, const mu_engine *engine, bool allow_cpu_fallback);
+void mu_gpu_destroy(mu_gpu *gpu);
+```
+
+`mu_gpu` should own:
+
+- `id<MTLDevice>`
+- `id<MTLCommandQueue>`
+- compiled `id<MTLLibrary>`
+- named `id<MTLComputePipelineState>` objects
+- persistent or lazy weight buffers
+- reusable activation scratch buffers
+- optional debug counters for CPU fallback and bytes moved
+
+`mu.c` should not include Metal headers. It should call narrow C functions from
+`mu_gpu.h`, keeping Objective-C isolated in `mu_metal.m`.
+
+## Weight And Buffer Strategy
+
+The model is currently loaded from BF16 safetensors through mmap. Keep that
+loader as the single source of truth.
+
+Initial strategy:
+
+1. Keep all weights mmap-backed for CPU.
+2. Lazily stage each tensor to a `MTLBuffer` the first time a Metal kernel needs
+   it.
+3. Use `MTLResourceStorageModeShared` on Apple Silicon.
+4. Cache staged buffers for the lifetime of `mu_engine`.
+5. Keep activation scratch buffers separate from weight buffers.
+
+Later optimization:
+
+- Use `newBufferWithBytesNoCopy` for aligned mmap tensor slices when lifetime
+  and alignment are safe.
+- Group frequently used layer weights into per-layer buffer tables.
+- Add an activation arena or `MTLHeap` after kernel shapes stabilize.
+
+This preserves CPU access while avoiding an up-front GPU copy of every tensor
+before the first request.
+
+## Kernel Scope
+
+### Dense BF16 Matmul
+
+Priority: highest.
+
+Needed by both vision and text paths:
+
+- patch embedding
+- Q/K/V/O projections
+- MLP gate/up/down projections
+- vision merger MLP
+- lm head / top-k path
+
+First implementation can accumulate in f32 and write f32 activations. Weight
+input remains BF16.
+
+### Norms And Elementwise Kernels
+
+Needed kernels:
+
+- RMSNorm for text decoder
+- LayerNorm for vision tower
+- residual add
+- SiLU and SwiGLU
+- rotary embedding application
+- embedding scatter for image placeholders
+
+These should be small, simple kernels with CPU comparison tests at fixed trace
+points.
+
+### Vision Tower
+
+The vision tower is a major hot path and a strong first end-to-end Metal target.
+It has fixed shapes for current 120dpi page traces, but the implementation
+should accept the dynamic `grid_t/grid_h/grid_w` already produced by the CPU
+preprocessor.
+
+Metal vision stages:
+
+```text
+pixel_values
+  -> patch_embed
+  -> rotary_pos_emb
+  -> 32 vision blocks
+  -> spatial merge
+  -> projector to text hidden size
+```
+
+Trace probes should remain available:
+
+- patch embedding sample
+- rotary sample
+- block0 norm/qkv/attention/output samples
+- final image embedding sample
+
+### Text Decoder
+
+The first Metal decoder version can run full prefill like the current CPU path.
+After parity, add KV-cache decode.
+
+Stages:
+
+```text
+token/image embeddings
+  -> M-RoPE position application
+  -> 24 decoder layers
+  -> final RMSNorm
+  -> lm head top-k
+```
+
+KV-cache decode should be a later milestone because it changes execution
+structure more than a pure kernel port.
+
+## Dispatch Boundary
+
+Keep high-level functions in `mu.c` and dispatch at stage boundaries:
+
+```text
+mu_vision_encode()
+  if backend == metal and gpu vision ready:
+      mu_gpu_vision_encode(...)
+  else:
+      mu_cpu_vision_encode(...)
+
+mu_text_generate_greedy_with_image_embeds()
+  if backend == metal and gpu decoder ready:
+      mu_gpu_text_generate(...)
+  else:
+      mu_cpu_text_generate(...)
+```
+
+Do not scatter backend checks inside every math helper. Stage-level dispatch
+makes it easier to compare outputs and easier to disable fallback for benchmark
+runs.
+
+## Fallback Rules
+
+During development:
+
+- `--backend metal` may fall back to CPU for incomplete stages.
+- fallback must be counted and visible in `mu_engine_summary()`.
+- `MU_METAL_DEBUG=1` may print fallback stage names to stderr.
+
+For performance tests:
+
+- `--no-cpu-fallback` must fail if any required Metal stage is missing.
+- performance reports must state whether fallback was allowed.
+
+For correctness tests:
+
+- CPU trace checks always run first.
+- Metal trace checks run only on machines with a Metal device.
+- If Metal is unavailable, tests should skip Metal-specific checks with an
+  explicit message, not fail CPU verification.
+
+## Parity Gates
+
+Every milestone needs two kinds of gates: local tensor probes and task-level
+outputs.
+
+Required CPU gates:
+
+```bash
+make mu-test
+make mu
+./mu --backend cpu --check-trace mineru/tests/mu-traces/text.json
+./mu --backend cpu --check-trace mineru/tests/mu-traces/layout.json
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_cli_smoke.py
+```
+
+Required Metal gates on macOS with Metal:
+
+```bash
+./mu --backend metal --check-trace mineru/tests/mu-traces/text.json
+./mu --backend metal --check-trace mineru/tests/mu-traces/layout.json
+./mu --backend metal --no-cpu-fallback --image /path/to/page.png --json
+```
+
+Recommended parity thresholds:
+
+| Boundary | Requirement |
+| --- | --- |
+| tokenizer / position ids | exact |
+| image preprocessing | exact shape, close f32 values |
+| vision trace samples | close f32 values with documented tolerance |
+| text logits | top-1 token exact, top-8 overlap >= 6 |
+| generated text for smoke pages | exact token sequence where deterministic |
+| page blocks | exact count and ordered types |
+| bbox/content | no worse than current CPU-vs-Transformers report |
+
+The tolerance should be documented per kernel once the first Metal results are
+measured. Avoid setting a single global float tolerance before seeing real
+accumulation drift.
+
+## Benchmark Protocol
+
+The existing baseline is recorded in:
+
+```text
+mineru/docs/mu-performance-report.md
+```
+
+Metal benchmark runs should reuse the same 10 pages:
+
+```text
+224, 234, 237, 241, 244, 247, 258, 281, 303, 334
+```
+
+Report all of these:
+
+- CPU reference time
+- Metal time with fallback disabled
+- Transformers/MPS reference time
+- block-count accuracy
+- type accuracy
+- bbox IoU
+- content token F1
+- table cell recall
+- Metal fallback count, expected to be zero in benchmark mode
+
+Do not compare a fallback-enabled Metal run against Transformers as if it were
+a real Metal speed number.
+
+## Implementation Milestones
+
+### Milestone 1: Backend Shell
+
+Add `mineru/mu_gpu.h`, `mineru/mu_metal.m`, and `mineru/metal/`.
+
+Acceptance:
+
+- `./mu --backend cpu --inspect` still works.
+- `./mu --backend metal --inspect` creates a Metal device and prints backend
+  state.
+- CPU tests still pass.
+- Metal unavailable path is explicit and clean.
+
+### Milestone 2: Dense And Norm Kernels
+
+Move isolated dense, norm, and elementwise helpers behind Metal probes.
+
+Acceptance:
+
+- kernel-level samples match CPU within documented tolerances.
+- text trace still passes on CPU.
+- Metal text logits pass with fallback allowed only for not-yet-ported stages.
+
+### Milestone 3: Vision Tower
+
+Move `mu_vision_encode()` to Metal.
+
+Acceptance:
+
+- vision trace probes pass.
+- layout trace logits pass using Metal image embeddings.
+- CPU vision path still passes the same trace.
+
+### Milestone 4: Text Decoder Full Prefill
+
+Move full-prefill decoder generation to Metal.
+
+Acceptance:
+
+- text trace logits and generation pass with Metal.
+- layout generation pass with Metal vision plus Metal decoder.
+- no CPU fallback for dense/norm/attention in benchmark mode.
+
+### Milestone 5: KV-Cache Decode
+
+Add a Metal KV-cache decode path for repeated generation.
+
+Acceptance:
+
+- greedy outputs remain stable.
+- page-level JSON/Markdown stays unchanged against CPU for smoke pages.
+- benchmark shows a meaningful speedup over full-prefill Metal.
+
+### Milestone 6: End-To-End Benchmark
+
+Rerun the 10-page benchmark and update the performance report.
+
+Acceptance:
+
+- benchmark uses `--backend metal --no-cpu-fallback`.
+- accuracy is no worse than the current CPU baseline on sampled pages.
+- performance report clearly lists hardware, fallback count, and page timings.
+
+## Risks
+
+| Risk | Mitigation |
+| --- | --- |
+| Metal numerical drift changes generated tokens | Keep CPU reference and compare logits before generation. |
+| GPU memory pressure on 16GB unified memory | Lazy weight staging, reusable scratch buffers, no eager all-tensor upload at first. |
+| Stage fallback hides performance gaps | Count fallback and require `--no-cpu-fallback` for benchmarks. |
+| Metal code becomes tangled with CPU code | Keep Objective-C in `mu_metal.m` and dispatch only at stage boundaries. |
+| Vision dynamic shapes cause pipeline churn | Compile generic kernels and specialize by constants only after stable profiling. |
+| CPU path regresses while optimizing Metal | Always run CPU trace checks before Metal checks. |
+
+## Design Decision
+
+Proceed with a dual-backend architecture:
+
+- CPU stays as the correctness reference and default stable path.
+- Metal is added as a separate MinerU-specific backend under `mineru/`.
+- Stage-level dispatch chooses CPU or Metal without changing the public API.
+- Benchmarks only count Metal speed when CPU fallback is disabled.
+
+This gives us a clean path to speed while preserving the thing that made the
+current `mu.c` work: deterministic comparison against a trusted reference.
