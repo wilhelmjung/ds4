@@ -41,6 +41,7 @@ typedef struct {
     int max_new_tokens;
     bool inspect_only;
     bool image_analysis;
+    bool allow_cpu_fallback;
 } mu_engine_options;
 
 mu_engine_options mu_engine_options_default(void);
@@ -50,6 +51,8 @@ void mu_engine_close(mu_engine *e);
 void mu_engine_summary(mu_engine *e, FILE *fp);
 int mu_engine_tensor_count(const mu_engine *e);
 int mu_engine_bf16_tensor_count(const mu_engine *e);
+bool mu_engine_metal_available(const mu_engine *e);
+int mu_engine_cpu_fallback_count(const mu_engine *e);
 int mu_engine_text_layers(const mu_engine *e);
 int mu_engine_hidden_size(const mu_engine *e);
 int mu_engine_vision_layers(const mu_engine *e);

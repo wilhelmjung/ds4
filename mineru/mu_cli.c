@@ -1647,6 +1647,18 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model-dir") && i + 1 < argc) {
             opt.model_dir = argv[++i];
+        } else if (!strcmp(argv[i], "--backend") && i + 1 < argc) {
+            const char *backend = argv[++i];
+            if (!strcmp(backend, "cpu")) {
+                opt.backend = MU_BACKEND_CPU;
+            } else if (!strcmp(backend, "metal")) {
+                opt.backend = MU_BACKEND_METAL;
+            } else {
+                fprintf(stderr, "--backend must be cpu or metal\n");
+                return 2;
+            }
+        } else if (!strcmp(argv[i], "--no-cpu-fallback")) {
+            opt.allow_cpu_fallback = false;
         } else if (!strcmp(argv[i], "--inspect")) {
             opt.inspect_only = true;
         } else if (!strcmp(argv[i], "--check-trace") && i + 1 < argc) {
@@ -1658,7 +1670,7 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--markdown")) {
             write_markdown = 1;
         } else {
-            fprintf(stderr, "usage: %s [--model-dir PATH] [--inspect] [--check-trace PATH] [--image PATH (--json|--markdown)]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--model-dir PATH] [--backend cpu|metal] [--no-cpu-fallback] [--inspect] [--check-trace PATH] [--image PATH (--json|--markdown)]\n", argv[0]);
             return 2;
         }
     }

@@ -90,6 +90,8 @@ struct mu_engine {
     int bf16_tensor_count;
     int bound_text_layers;
     int bound_vision_layers;
+    bool metal_available;
+    int cpu_fallback_count;
 };
 
 struct mu_result {
@@ -3279,6 +3281,7 @@ mu_engine_options mu_engine_options_default(void) {
     opt.backend = MU_BACKEND_CPU;
     opt.n_threads = 1;
     opt.max_new_tokens = 512;
+    opt.allow_cpu_fallback = true;
     return opt;
 }
 
@@ -3289,6 +3292,14 @@ int mu_engine_open(mu_engine **out, const mu_engine_options *opt) {
     if (!e) return -2;
     e->st.fd = -1;
     e->opt = opt ? *opt : mu_engine_options_default();
+    if (e->opt.backend == MU_BACKEND_METAL) {
+        e->metal_available = false;
+        if (!e->opt.allow_cpu_fallback) {
+            mu_engine_close(e);
+            return -20;
+        }
+        e->cpu_fallback_count++;
+    }
     int rc = mu_load_safetensors(e);
     if (rc) {
         mu_engine_close(e);
@@ -3326,6 +3337,10 @@ void mu_engine_summary(mu_engine *e, FILE *fp) {
     fprintf(fp, "mu backend=%s model_dir=%s\n",
             e && e->opt.backend == MU_BACKEND_METAL ? "metal" : "cpu",
             e && e->opt.model_dir ? e->opt.model_dir : "(null)");
+    fprintf(fp, "mu metal_available=%s cpu_fallback_count=%d allow_cpu_fallback=%s\n",
+            e && e->metal_available ? "yes" : "no",
+            e ? e->cpu_fallback_count : 0,
+            e && e->opt.allow_cpu_fallback ? "yes" : "no");
     if (e && e->tensor_count > 0) {
         fprintf(fp, "safetensors tensors=%d dtype=BF16\n", e->tensor_count);
         fprintf(fp, "text_layers=%d hidden_size=%d vision_layers=%d\n",
@@ -3341,6 +3356,14 @@ int mu_engine_tensor_count(const mu_engine *e) {
 
 int mu_engine_bf16_tensor_count(const mu_engine *e) {
     return e ? e->bf16_tensor_count : 0;
+}
+
+bool mu_engine_metal_available(const mu_engine *e) {
+    return e && e->metal_available;
+}
+
+int mu_engine_cpu_fallback_count(const mu_engine *e) {
+    return e ? e->cpu_fallback_count : 0;
 }
 
 int mu_engine_text_layers(const mu_engine *e) {
