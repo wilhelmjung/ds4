@@ -189,6 +189,26 @@ static int test_mu_gpu_dense_probe(void) {
     return 0;
 }
 
+static int test_mu_gpu_rmsnorm_probe(void) {
+#if defined(__APPLE__)
+    mu_gpu *gpu = NULL;
+    if (mu_gpu_create(&gpu) != 0) return 0;
+    float x[4] = {1.0f, 2.0f, -3.0f, 4.0f};
+    float w[4] = {1.0f, 0.5f, 2.0f, -1.0f};
+    float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int rc = mu_gpu_rmsnorm_probe(gpu, x, w, 4, 1e-6f, out);
+    mu_gpu_destroy(gpu);
+    if (rc != 0) return 140;
+    float ss = 1.0f + 4.0f + 9.0f + 16.0f;
+    float scale = 1.0f / sqrtf(ss / 4.0f + 1e-6f);
+    float exp0 = x[0] * scale * w[0];
+    float exp3 = x[3] * scale * w[3];
+    if (!close_enough(out[0], exp0, 1e-4f)) return 141;
+    if (!close_enough(out[3], exp3, 1e-4f)) return 142;
+#endif
+    return 0;
+}
+
 int main(void) {
     int rc = test_default_options();
     if (rc) {
@@ -233,6 +253,11 @@ int main(void) {
     rc = test_mu_gpu_dense_probe();
     if (rc) {
         fprintf(stderr, "test_mu_gpu_dense_probe failed: %d\n", rc);
+        return rc;
+    }
+    rc = test_mu_gpu_rmsnorm_probe();
+    if (rc) {
+        fprintf(stderr, "test_mu_gpu_rmsnorm_probe failed: %d\n", rc);
         return rc;
     }
     puts("mu_test ok");

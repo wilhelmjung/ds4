@@ -10,25 +10,28 @@ struct mu_gpu {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> dense_probe;
+    id<MTLComputePipelineState> rmsnorm_probe;
     char device_name[256];
 };
 
-static NSString *mu_gpu_shader_path(void) {
-    NSString *cwd_path = @"mineru/metal/mu_dense.metal";
+static NSString *mu_gpu_shader_path(NSString *name) {
+    NSString *cwd_path = [@"mineru/metal" stringByAppendingPathComponent:name];
     if ([[NSFileManager defaultManager] fileExistsAtPath:cwd_path]) return cwd_path;
 
     NSString *src = [NSString stringWithUTF8String:__FILE__];
     NSString *dir = [src stringByDeletingLastPathComponent];
-    NSString *from_src = [dir stringByAppendingPathComponent:@"metal/mu_dense.metal"];
+    NSString *from_src = [[dir stringByAppendingPathComponent:@"metal"]
+        stringByAppendingPathComponent:name];
     if ([[NSFileManager defaultManager] fileExistsAtPath:from_src]) return from_src;
 
     return cwd_path;
 }
 
 static id<MTLComputePipelineState> mu_gpu_make_pipeline(id<MTLDevice> device,
+                                                        NSString *source_name,
                                                         NSString *function_name) {
     NSError *error = nil;
-    NSString *source = [NSString stringWithContentsOfFile:mu_gpu_shader_path()
+    NSString *source = [NSString stringWithContentsOfFile:mu_gpu_shader_path(source_name)
                                                  encoding:NSUTF8StringEncoding
                                                     error:&error];
     if (!source) return nil;
@@ -54,7 +57,10 @@ int mu_gpu_create(mu_gpu **out) {
         if (!gpu) return -4;
         gpu->device = device;
         gpu->queue = queue;
-        gpu->dense_probe = mu_gpu_make_pipeline(device, @"mu_dense_probe");
+        gpu->dense_probe = mu_gpu_make_pipeline(device, @"mu_dense.metal",
+                                                @"mu_dense_probe");
+        gpu->rmsnorm_probe = mu_gpu_make_pipeline(device, @"mu_norm.metal",
+                                                  @"mu_rmsnorm_probe");
         const char *name = [[device name] UTF8String];
         if (name) {
             strlcpy(gpu->device_name, name, sizeof(gpu->device_name));
@@ -68,6 +74,7 @@ int mu_gpu_create(mu_gpu **out) {
 
 void mu_gpu_destroy(mu_gpu *gpu) {
     if (!gpu) return;
+    gpu->rmsnorm_probe = nil;
     gpu->dense_probe = nil;
     gpu->queue = nil;
     gpu->device = nil;
@@ -130,6 +137,57 @@ int mu_gpu_dense_probe(mu_gpu *gpu, const float *x,
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -6;
 
         memcpy(out, [out_buf contents], out_bytes);
+    }
+    return 0;
+}
+
+int mu_gpu_rmsnorm_probe(mu_gpu *gpu, const float *x, const float *weight,
+                         int n, float eps, float *out) {
+    if (!gpu || !gpu->device || !gpu->queue || !gpu->rmsnorm_probe) return -1;
+    if (!x || !weight || !out || n <= 0) return -2;
+
+    @autoreleasepool {
+        NSUInteger bytes = (NSUInteger)n * sizeof(float);
+        id<MTLBuffer> x_buf = [gpu->device newBufferWithBytes:x
+                                                       length:bytes
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> w_buf = [gpu->device newBufferWithBytes:weight
+                                                       length:bytes
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buf = [gpu->device newBufferWithLength:bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> n_buf = [gpu->device newBufferWithBytes:&n
+                                                       length:sizeof(n)
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> eps_buf = [gpu->device newBufferWithBytes:&eps
+                                                         length:sizeof(eps)
+                                                        options:MTLResourceStorageModeShared];
+        if (!x_buf || !w_buf || !out_buf || !n_buf || !eps_buf) return -3;
+
+        id<MTLCommandBuffer> command_buffer = [gpu->queue commandBuffer];
+        if (!command_buffer) return -4;
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (!encoder) return -5;
+
+        [encoder setComputePipelineState:gpu->rmsnorm_probe];
+        [encoder setBuffer:x_buf offset:0 atIndex:0];
+        [encoder setBuffer:w_buf offset:0 atIndex:1];
+        [encoder setBuffer:out_buf offset:0 atIndex:2];
+        [encoder setBuffer:n_buf offset:0 atIndex:3];
+        [encoder setBuffer:eps_buf offset:0 atIndex:4];
+
+        NSUInteger width = gpu->rmsnorm_probe.threadExecutionWidth;
+        if (width < 1) width = 1;
+        if (width > (NSUInteger)n) width = (NSUInteger)n;
+        MTLSize grid = MTLSizeMake((NSUInteger)n, 1, 1);
+        MTLSize threads = MTLSizeMake(width, 1, 1);
+        [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -6;
+
+        memcpy(out, [out_buf contents], bytes);
     }
     return 0;
 }

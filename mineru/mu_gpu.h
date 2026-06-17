@@ -12,5 +12,7 @@ const char *mu_gpu_device_name(const mu_gpu *gpu);
 int mu_gpu_dense_probe(mu_gpu *gpu, const float *x,
                        const unsigned short *w_bf16,
                        int rows, int cols, float *out);
+int mu_gpu_rmsnorm_probe(mu_gpu *gpu, const float *x, const float *weight,
+                         int n, float eps, float *out);
 
 #endif
