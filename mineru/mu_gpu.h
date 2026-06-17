@@ -18,6 +18,10 @@ int mu_gpu_layernorm_bf16_probe(mu_gpu *gpu, const float *x,
                                 const unsigned short *weight_bf16,
                                 const unsigned short *bias_bf16,
                                 int n, float eps, float *out);
+int mu_gpu_layernorm_bf16_rows(mu_gpu *gpu, const float *x,
+                               const unsigned short *weight_bf16,
+                               const unsigned short *bias_bf16,
+                               int rows, int cols, float eps, float *out);
 int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
                          const float *patch_embeds,
                          int rows, int cols,

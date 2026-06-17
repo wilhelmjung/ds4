@@ -1870,6 +1870,17 @@ int mu_vision_block0_norm1_token0(mu_engine *e, const float *patch_embeds,
     const uint16_t *w = mu_tensor_bf16(e, "visual.blocks.0.norm1.weight", 1, 1280, 0);
     const uint16_t *b = mu_tensor_bf16(e, "visual.blocks.0.norm1.bias", 1, 1280, 0);
     if (!w || !b) return -2;
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        int rc = mu_gpu_layernorm_bf16_rows(e->gpu, patch_embeds,
+                                            (const unsigned short *)w,
+                                            (const unsigned short *)b,
+                                            1, 1280, 1e-6f, out);
+        if (rc == 0) return 0;
+        rc = mu_record_cpu_fallback(e, "vision_block0_norm1");
+        if (rc) return rc;
+    }
+#endif
     return mu_layernorm_one_bf16(patch_embeds, 1280, w, b, 1e-6f, out);
 }
 

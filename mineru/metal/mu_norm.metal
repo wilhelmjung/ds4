@@ -58,3 +58,32 @@ kernel void mu_layernorm_bf16_probe(device const float *x [[buffer(0)]],
         out[gid] = mu_round_bf16(y);
     }
 }
+
+kernel void mu_layernorm_bf16_rows(device const float *x [[buffer(0)]],
+                                   device const ushort *weight [[buffer(1)]],
+                                   device const ushort *bias [[buffer(2)]],
+                                   device float *out [[buffer(3)]],
+                                   constant int &cols [[buffer(4)]],
+                                   constant float &eps [[buffer(5)]],
+                                   uint2 gid [[thread_position_in_grid]]) {
+    int col = (int)gid.x;
+    int row = (int)gid.y;
+    if (col >= cols) return;
+
+    device const float *xr = x + (size_t)row * (size_t)cols;
+    float mean = 0.0f;
+    for (int i = 0; i < cols; i++) {
+        mean += xr[i];
+    }
+    mean /= (float)cols;
+
+    float var = 0.0f;
+    for (int i = 0; i < cols; i++) {
+        float d = xr[i] - mean;
+        var += d * d;
+    }
+    float inv = rsqrt(var / (float)cols + eps);
+    float y = (xr[col] - mean) * inv;
+    y = y * mu_bf16_to_f32(weight[col]) + mu_bf16_to_f32(bias[col]);
+    out[(size_t)row * (size_t)cols + col] = mu_round_bf16(y);
+}

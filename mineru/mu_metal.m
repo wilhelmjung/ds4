@@ -12,6 +12,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> dense_probe;
     id<MTLComputePipelineState> rmsnorm_probe;
     id<MTLComputePipelineState> layernorm_bf16_probe;
+    id<MTLComputePipelineState> layernorm_bf16_rows;
     char device_name[256];
 };
 
@@ -64,6 +65,8 @@ int mu_gpu_create(mu_gpu **out) {
                                                   @"mu_rmsnorm_probe");
         gpu->layernorm_bf16_probe = mu_gpu_make_pipeline(device, @"mu_norm.metal",
                                                          @"mu_layernorm_bf16_probe");
+        gpu->layernorm_bf16_rows = mu_gpu_make_pipeline(device, @"mu_norm.metal",
+                                                        @"mu_layernorm_bf16_rows");
         const char *name = [[device name] UTF8String];
         if (name) {
             strlcpy(gpu->device_name, name, sizeof(gpu->device_name));
@@ -77,6 +80,7 @@ int mu_gpu_create(mu_gpu **out) {
 
 void mu_gpu_destroy(mu_gpu *gpu) {
     if (!gpu) return;
+    gpu->layernorm_bf16_rows = nil;
     gpu->layernorm_bf16_probe = nil;
     gpu->rmsnorm_probe = nil;
     gpu->dense_probe = nil;
@@ -242,6 +246,64 @@ int mu_gpu_layernorm_bf16_probe(mu_gpu *gpu, const float *x,
         if (width < 1) width = 1;
         if (width > (NSUInteger)n) width = (NSUInteger)n;
         MTLSize grid = MTLSizeMake((NSUInteger)n, 1, 1);
+        MTLSize threads = MTLSizeMake(width, 1, 1);
+        [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -6;
+
+        memcpy(out, [out_buf contents], x_bytes);
+    }
+    return 0;
+}
+
+int mu_gpu_layernorm_bf16_rows(mu_gpu *gpu, const float *x,
+                               const unsigned short *weight_bf16,
+                               const unsigned short *bias_bf16,
+                               int rows, int cols, float eps, float *out) {
+    if (!gpu || !gpu->device || !gpu->queue || !gpu->layernorm_bf16_rows) return -1;
+    if (!x || !weight_bf16 || !bias_bf16 || !out || rows <= 0 || cols <= 0) return -2;
+
+    @autoreleasepool {
+        NSUInteger x_bytes = (NSUInteger)rows * (NSUInteger)cols * sizeof(float);
+        NSUInteger bf16_bytes = (NSUInteger)cols * sizeof(unsigned short);
+        id<MTLBuffer> x_buf = [gpu->device newBufferWithBytes:x
+                                                       length:x_bytes
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> w_buf = [gpu->device newBufferWithBytes:weight_bf16
+                                                       length:bf16_bytes
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> b_buf = [gpu->device newBufferWithBytes:bias_bf16
+                                                       length:bf16_bytes
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buf = [gpu->device newBufferWithLength:x_bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> cols_buf = [gpu->device newBufferWithBytes:&cols
+                                                          length:sizeof(cols)
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> eps_buf = [gpu->device newBufferWithBytes:&eps
+                                                         length:sizeof(eps)
+                                                        options:MTLResourceStorageModeShared];
+        if (!x_buf || !w_buf || !b_buf || !out_buf || !cols_buf || !eps_buf) return -3;
+
+        id<MTLCommandBuffer> command_buffer = [gpu->queue commandBuffer];
+        if (!command_buffer) return -4;
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (!encoder) return -5;
+
+        [encoder setComputePipelineState:gpu->layernorm_bf16_rows];
+        [encoder setBuffer:x_buf offset:0 atIndex:0];
+        [encoder setBuffer:w_buf offset:0 atIndex:1];
+        [encoder setBuffer:b_buf offset:0 atIndex:2];
+        [encoder setBuffer:out_buf offset:0 atIndex:3];
+        [encoder setBuffer:cols_buf offset:0 atIndex:4];
+        [encoder setBuffer:eps_buf offset:0 atIndex:5];
+
+        NSUInteger width = gpu->layernorm_bf16_rows.threadExecutionWidth;
+        if (width < 1) width = 1;
+        if (width > (NSUInteger)cols) width = (NSUInteger)cols;
+        MTLSize grid = MTLSizeMake((NSUInteger)cols, (NSUInteger)rows, 1);
         MTLSize threads = MTLSizeMake(width, 1, 1);
         [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
         [encoder endEncoding];
