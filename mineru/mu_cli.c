@@ -516,6 +516,7 @@ static int check_trace_file(mu_engine *engine, const char *path) {
     int is_layout = strcmp(mode, "layout") == 0;
     const char *trace_scope = getenv("MU_CHECK_TRACE_SCOPE");
     int vision_block0_norm_scope = trace_scope && !strcmp(trace_scope, "vision-block0-norm");
+    int vision_block0_qkv_scope = trace_scope && !strcmp(trace_scope, "vision-block0-qkv");
     char *rendered = mu_render_chat_prompt(prompt, is_layout);
     if (!rendered || strcmp(rendered, expected_chat) != 0) {
         fprintf(stderr, "trace %s chat mismatch\n", mode);
@@ -644,7 +645,7 @@ static int check_trace_file(mu_engine *engine, const char *path) {
     }
     printf("trace %s positions ok\n", mode);
 
-    if (is_layout && !vision_block0_norm_scope) {
+    if (is_layout && !vision_block0_norm_scope && !vision_block0_qkv_scope) {
         mu_token_logit expected_top[16];
         mu_token_logit got_top[16];
         int expected_top_n = collect_top_logits(json, expected_top, 16);
@@ -1325,6 +1326,9 @@ static int check_trace_file(mu_engine *engine, const char *path) {
             }
         }
         printf("trace layout vision block0 qkv ok\n");
+        if (vision_block0_qkv_scope) {
+            return 0;
+        }
 
         float *expected_attn_sample = NULL;
         int expected_attn_sample_n = 0;

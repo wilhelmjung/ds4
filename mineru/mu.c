@@ -1900,6 +1900,20 @@ int mu_vision_block0_qkv_token0(mu_engine *e, const float *norm1,
     const uint16_t *w = mu_tensor_bf16(e, "visual.blocks.0.attn.qkv.weight", 2, 3840, 1280);
     const uint16_t *b = mu_tensor_bf16(e, "visual.blocks.0.attn.qkv.bias", 1, 3840, 0);
     if (!w || !b) return -2;
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        int rc = mu_gpu_dense_bf16_bias_probe(e->gpu, norm1,
+                                              (const unsigned short *)w,
+                                              (const unsigned short *)b,
+                                              3840, 1280, out);
+        if (rc == 0) {
+            mu_record_metal_stage(e, "vision_block0_qkv");
+            return 0;
+        }
+        rc = mu_record_cpu_fallback(e, "vision_block0_qkv");
+        if (rc) return rc;
+    }
+#endif
     return mu_linear_one_bf16(norm1, 1280, w, b, 3840, out);
 }
 
