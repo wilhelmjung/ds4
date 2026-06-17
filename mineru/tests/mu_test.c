@@ -211,6 +211,48 @@ static int test_mu_gpu_dense_bf16_bias_probe(void) {
     return 0;
 }
 
+static int test_mu_gpu_vision_attn_concat_probe(void) {
+#if defined(__APPLE__)
+    mu_gpu *gpu = NULL;
+    if (mu_gpu_create(&gpu) != 0) return 0;
+    float *q0 = (float *)calloc(1280u, sizeof(q0[0]));
+    float *kv = (float *)calloc(2u * 2560u, sizeof(kv[0]));
+    float rotary[80] = {0.0f};
+    float *out = (float *)calloc(1280u, sizeof(out[0]));
+    if (!q0 || !kv || !out) {
+        free(q0);
+        free(kv);
+        free(out);
+        mu_gpu_destroy(gpu);
+        return 180;
+    }
+    for (int d = 0; d < 1280; d++) {
+        kv[1280 + d] = 1.0f;
+        kv[2560 + 1280 + d] = 3.0f;
+    }
+    int rc = mu_gpu_vision_attn_concat_probe(gpu, q0, kv, rotary, 2, 0, out);
+    mu_gpu_destroy(gpu);
+    if (rc != 0) {
+        free(q0);
+        free(kv);
+        free(out);
+        return 181;
+    }
+    for (int d = 0; d < 1280; d++) {
+        if (!close_enough(out[d], 2.0f, 1e-4f)) {
+            free(q0);
+            free(kv);
+            free(out);
+            return 182;
+        }
+    }
+    free(q0);
+    free(kv);
+    free(out);
+#endif
+    return 0;
+}
+
 static int test_mu_gpu_rmsnorm_probe(void) {
 #if defined(__APPLE__)
     mu_gpu *gpu = NULL;
@@ -344,6 +386,11 @@ int main(void) {
     rc = test_mu_gpu_dense_bf16_bias_probe();
     if (rc) {
         fprintf(stderr, "test_mu_gpu_dense_bf16_bias_probe failed: %d\n", rc);
+        return rc;
+    }
+    rc = test_mu_gpu_vision_attn_concat_probe();
+    if (rc) {
+        fprintf(stderr, "test_mu_gpu_vision_attn_concat_probe failed: %d\n", rc);
         return rc;
     }
     rc = test_mu_gpu_rmsnorm_probe();

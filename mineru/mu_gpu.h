@@ -26,6 +26,9 @@ int mu_gpu_layernorm_bf16_rows(mu_gpu *gpu, const float *x,
                                const unsigned short *weight_bf16,
                                const unsigned short *bias_bf16,
                                int rows, int cols, float eps, float *out);
+int mu_gpu_vision_attn_concat_probe(mu_gpu *gpu, const float *q0,
+                                    const float *kv, const float *rotary,
+                                    int rows, int token_index, float *out);
 int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
                          const float *patch_embeds,
                          int rows, int cols,
