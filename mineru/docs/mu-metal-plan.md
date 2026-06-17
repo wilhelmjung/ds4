@@ -544,14 +544,17 @@ MU_OBJS := mineru/mu.o
 endif
 ```
 
-Change Darwin targets:
+Change Darwin targets. Do not make normal `mu` or `mu-test` depend on an
+offline `.metallib`; Xcode 27 can install the command-line Metal toolchain as a
+separate component, and this repo should still build the runtime shell when
+that component is missing.
 
 ```make
 ifeq ($(UNAME_S),Darwin)
-mu: mineru/mu_cli.o $(MU_OBJS) mineru/metal/mu.metallib
+mu: mineru/mu_cli.o $(MU_OBJS)
 	$(CC) $(CFLAGS) -o $@ mineru/mu_cli.o $(MU_OBJS) $(MU_LDLIBS) -framework Metal -framework Foundation
 
-mu-test: mineru/tests/mu_test.o $(MU_OBJS) mineru/metal/mu.metallib
+mu-test: mineru/tests/mu_test.o $(MU_OBJS)
 	$(CC) $(CFLAGS) -Imineru -o $@ mineru/tests/mu_test.o $(MU_OBJS) $(MU_LDLIBS) -framework Metal -framework Foundation
 	./mu-test
 else
@@ -564,15 +567,22 @@ mu-test: mineru/tests/mu_test.o $(MU_OBJS)
 endif
 ```
 
-Add object and metallib rules:
+Add the Objective-C object rule and an optional offline metallib target:
 
 ```make
-mineru/metal/mu.metallib: $(MU_METAL_SRCS)
-	xcrun -sdk macosx metal -o mineru/metal/mu.air $(MU_METAL_SRCS)
-	xcrun -sdk macosx metallib -o $@ mineru/metal/mu.air
-
 mineru/mu_metal.o: mineru/mu_metal.m mineru/mu_gpu.h $(MU_METAL_SRCS)
 	$(CC) $(OBJCFLAGS) -Imineru -c -o $@ mineru/mu_metal.m
+
+mu-metallib: mineru/metal/mu.metallib
+
+mineru/metal/mu.metallib: $(MU_METAL_SRCS)
+	@if [ -n "$(METALC)" ] && [ -n "$(METALLIBC)" ]; then \
+		"$(METALC)" -o mineru/metal/mu.air $(MU_METAL_SRCS); \
+		"$(METALLIBC)" -o $@ mineru/metal/mu.air; \
+	else \
+		echo "error: command-line Metal compiler not found; install Xcode MetalToolchain or use runtime source compilation"; \
+		exit 72; \
+	fi
 ```
 
 - [ ] **Step 9: Build and inspect Metal**
@@ -788,11 +798,17 @@ Extend `struct mu_gpu`:
     id<MTLComputePipelineState> dense_probe;
 ```
 
-In `mu_gpu_create()`, load the explicit MinerU metallib and pipeline:
+In `mu_gpu_create()`, compile the probe library from Metal source with
+`newLibraryWithSource`. This avoids depending on the optional command-line
+MetalToolchain during normal development.
 
 ```objc
 NSError *error = nil;
-id<MTLLibrary> library = [device newLibraryWithFile:@"mineru/metal/mu.metallib" error:&error];
+NSString *source = [NSString stringWithContentsOfFile:@"mineru/metal/mu_dense.metal"
+                                             encoding:NSUTF8StringEncoding
+                                                error:&error];
+if (!source) return -5;
+id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
 if (!library) return -5;
 id<MTLFunction> fn = [library newFunctionWithName:@"mu_dense_probe"];
 if (!fn) return -6;

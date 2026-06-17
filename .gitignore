@@ -10,6 +10,8 @@
 /TODO.md
 /gguf/
 *.o
+mineru/metal/*.air
+mineru/metal/*.metallib
 *.dSYM/
 __pycache__/
 *.pyc

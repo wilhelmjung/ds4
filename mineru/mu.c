@@ -26,6 +26,10 @@
 #include <Accelerate/Accelerate.h>
 #endif
 
+#ifdef __APPLE__
+#include "mu_gpu.h"
+#endif
+
 static void mu_debug_dump_rgb(const char *prefix, const unsigned char *rgb, int width, int height);
 
 typedef struct {
@@ -92,6 +96,9 @@ struct mu_engine {
     int bound_vision_layers;
     bool metal_available;
     int cpu_fallback_count;
+#ifdef __APPLE__
+    mu_gpu *gpu;
+#endif
 };
 
 struct mu_result {
@@ -3292,14 +3299,29 @@ int mu_engine_open(mu_engine **out, const mu_engine_options *opt) {
     if (!e) return -2;
     e->st.fd = -1;
     e->opt = opt ? *opt : mu_engine_options_default();
+#ifdef __APPLE__
     if (e->opt.backend == MU_BACKEND_METAL) {
-        e->metal_available = false;
+        int gpu_rc = mu_gpu_create(&e->gpu);
+        if (gpu_rc == 0 && mu_gpu_available(e->gpu)) {
+            e->metal_available = true;
+        } else if (!e->opt.allow_cpu_fallback) {
+            mu_engine_close(e);
+            return -20;
+        } else {
+            e->metal_available = false;
+            e->cpu_fallback_count++;
+        }
+    }
+#else
+    if (e->opt.backend == MU_BACKEND_METAL) {
         if (!e->opt.allow_cpu_fallback) {
             mu_engine_close(e);
             return -20;
         }
+        e->metal_available = false;
         e->cpu_fallback_count++;
     }
+#endif
     int rc = mu_load_safetensors(e);
     if (rc) {
         mu_engine_close(e);
@@ -3321,6 +3343,9 @@ int mu_engine_open(mu_engine **out, const mu_engine_options *opt) {
 
 void mu_engine_close(mu_engine *e) {
     if (!e) return;
+#ifdef __APPLE__
+    mu_gpu_destroy(e->gpu);
+#endif
     mu_hash_free(&e->vocab);
     mu_hash_free(&e->merges);
     for (int i = 0; i < 256; i++) free(e->byte_encoder[i]);
@@ -3341,6 +3366,12 @@ void mu_engine_summary(mu_engine *e, FILE *fp) {
             e && e->metal_available ? "yes" : "no",
             e ? e->cpu_fallback_count : 0,
             e && e->opt.allow_cpu_fallback ? "yes" : "no");
+#ifdef __APPLE__
+    fprintf(fp, "mu metal_device=%s\n",
+            e && e->gpu ? mu_gpu_device_name(e->gpu) : "none");
+#else
+    fprintf(fp, "mu metal_device=none\n");
+#endif
     if (e && e->tensor_count > 0) {
         fprintf(fp, "safetensors tensors=%d dtype=BF16\n", e->tensor_count);
         fprintf(fp, "text_layers=%d hidden_size=%d vision_layers=%d\n",

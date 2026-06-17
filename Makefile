@@ -13,13 +13,17 @@ OBJCFLAGS ?= -O3 -ffast-math $(DEBUG_FLAGS) $(NATIVE_CPU_FLAG) -Wall -Wextra -fo
 
 LDLIBS ?= -lm -pthread
 METAL_SRCS := $(wildcard metal/*.metal)
+MU_METAL_SRCS := $(wildcard mineru/metal/*.metal)
 ROCM_SRCS := $(wildcard rocm/*.cuh)
 
 ifeq ($(UNAME_S),Darwin)
+METALC ?= $(shell xcrun -sdk macosx -find metal 2>/dev/null)
+METALLIBC ?= $(shell xcrun -sdk macosx -find metallib 2>/dev/null)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
 MU_LDLIBS := $(LDLIBS) -framework CoreFoundation -framework CoreGraphics -framework ImageIO -framework Accelerate
 CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
+MU_OBJS = mineru/mu.o mineru/mu_metal.o
 else
 CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
@@ -40,6 +44,7 @@ DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 MU_LDLIBS := $(LDLIBS)
+MU_OBJS = mineru/mu.o
 endif
 
 .PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm mu-test
@@ -219,15 +224,38 @@ ds4_rocm.o: ds4_rocm.cu ds4_gpu.h ds4_iq2_tables_cuda.inc $(ROCM_SRCS)
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
-mu: mineru/mu_cli.o mineru/mu.o
-	$(CC) $(CFLAGS) -o $@ mineru/mu_cli.o mineru/mu.o $(MU_LDLIBS)
+ifeq ($(UNAME_S),Darwin)
+mu: mineru/mu_cli.o $(MU_OBJS)
+	$(CC) $(CFLAGS) -o $@ mineru/mu_cli.o $(MU_OBJS) $(MU_LDLIBS) -framework Foundation -framework Metal
 
-mu-test: mineru/tests/mu_test.o mineru/mu.o
-	$(CC) $(CFLAGS) -Imineru -o $@ mineru/tests/mu_test.o mineru/mu.o $(MU_LDLIBS)
+mu-test: mineru/tests/mu_test.o $(MU_OBJS)
+	$(CC) $(CFLAGS) -Imineru -o $@ mineru/tests/mu_test.o $(MU_OBJS) $(MU_LDLIBS) -framework Foundation -framework Metal
 	./mu-test
+else
+mu: mineru/mu_cli.o $(MU_OBJS)
+	$(CC) $(CFLAGS) -o $@ mineru/mu_cli.o $(MU_OBJS) $(MU_LDLIBS)
+
+mu-test: mineru/tests/mu_test.o $(MU_OBJS)
+	$(CC) $(CFLAGS) -Imineru -o $@ mineru/tests/mu_test.o $(MU_OBJS) $(MU_LDLIBS)
+	./mu-test
+endif
 
 mineru/mu.o: mineru/mu.c mineru/mu.h
 	$(CC) $(CFLAGS) -Imineru -c -o $@ mineru/mu.c
+
+mineru/mu_metal.o: mineru/mu_metal.m mineru/mu_gpu.h $(MU_METAL_SRCS)
+	$(CC) $(OBJCFLAGS) -Imineru -c -o $@ mineru/mu_metal.m
+
+mu-metallib: mineru/metal/mu.metallib
+
+mineru/metal/mu.metallib: $(MU_METAL_SRCS)
+	@if [ -n "$(METALC)" ] && [ -n "$(METALLIBC)" ]; then \
+		"$(METALC)" -o mineru/metal/mu.air $(MU_METAL_SRCS); \
+		"$(METALLIBC)" -o $@ mineru/metal/mu.air; \
+	else \
+		echo "error: command-line Metal compiler not found; install Xcode MetalToolchain or use runtime source compilation"; \
+		exit 72; \
+	fi
 
 mineru/mu_cli.o: mineru/mu_cli.c mineru/mu.h
 	$(CC) $(CFLAGS) -Imineru -c -o $@ mineru/mu_cli.c
@@ -259,4 +287,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test mu mu-test tests/test_q4k_dot *.o mineru/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o mineru/tests/mu_test.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test mu mu-test tests/test_q4k_dot *.o mineru/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o mineru/tests/mu_test.o mineru/metal/mu.air mineru/metal/mu.metallib
