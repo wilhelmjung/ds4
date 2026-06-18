@@ -3828,7 +3828,45 @@ int mu_text_generate_greedy(mu_engine *e, const int *input_ids, int n_ids,
     if (!e || !input_ids || n_ids <= 0 || max_new_tokens <= 0 || !out) return -1;
 #if defined(__APPLE__)
     if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
-        int rc = mu_record_cpu_fallback(e, "text_generate");
+        int cap = n_ids + max_new_tokens;
+        int *ids = NULL;
+        int rc = 0;
+        int nout = 0;
+        if (cap > 64) {
+            rc = -30;
+        } else {
+            ids = (int *)malloc((size_t)cap * sizeof(ids[0]));
+            if (!ids) rc = -2;
+        }
+        if (rc == 0) {
+            memcpy(ids, input_ids, (size_t)n_ids * sizeof(ids[0]));
+            int cur = n_ids;
+            for (int step = 0; step < max_new_tokens; step++) {
+                mu_token_logit top[8];
+                int top_n = mu_text_top_logits(e, ids, cur, 8, top);
+                if (top_n < 1) {
+                    rc = -3;
+                    break;
+                }
+                rc = 0;
+                float best = top[0].logit;
+                int next = top[0].id;
+                for (int i = 1; i < 8; i++) {
+                    if (top[i].id >= 0 && top[i].logit == best && top[i].id < next) {
+                        next = top[i].id;
+                    }
+                }
+                out[nout++] = next;
+                ids[cur++] = next;
+                if (next == 151645 || next == 151643) break;
+            }
+        }
+        free(ids);
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_generate");
+            return nout;
+        }
+        rc = mu_record_cpu_fallback(e, "text_generate");
         if (rc) return rc;
     }
 #endif
