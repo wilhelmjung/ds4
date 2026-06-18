@@ -41,6 +41,9 @@ int mu_gpu_layernorm_bf16_rows(mu_gpu *gpu, const float *x,
 int mu_gpu_vision_attn_concat_probe(mu_gpu *gpu, const float *q0,
                                     const float *kv, const float *rotary,
                                     int rows, int token_index, float *out);
+int mu_gpu_text_attn_token0(mu_gpu *gpu, const float *v, float *out);
+int mu_gpu_add_f32(mu_gpu *gpu, const float *a, const float *b,
+                   int n, float *out);
 int mu_gpu_vision_add_bf16(mu_gpu *gpu, const float *a, const float *b,
                            int n, float *out);
 int mu_gpu_vision_quick_gelu_bf16(mu_gpu *gpu, const float *x,

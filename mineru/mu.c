@@ -2732,6 +2732,64 @@ int mu_text_layer0_qkv_token0(mu_engine *e, const int *input_ids, int n_ids,
     return rc == 0 ? 0 : -5;
 }
 
+int mu_text_layer0_attn_token0(mu_engine *e, const int *input_ids, int n_ids,
+                               float *out, int out_n) {
+    if (!e || !input_ids || n_ids <= 0 || !out || out_n != 896) return -1;
+    const int hidden = 896;
+    const int vocab = 151936;
+    const uint16_t *embed = mu_tensor_bf16(e, "model.embed_tokens.weight", 2, vocab, hidden);
+    const uint16_t *ow = mu_tensor_bf16(e, "model.layers.0.self_attn.o_proj.weight", 2, hidden, hidden);
+    if (!embed || !ow) return -2;
+    int token = input_ids[0];
+    if (token < 0 || token >= vocab) return -3;
+    const uint16_t *row = embed + (size_t)token * hidden;
+    float hidden_state[896];
+    for (int i = 0; i < hidden; i++) hidden_state[i] = mu_bf16_to_f32(row[i]);
+
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        float qkv[1152];
+        float attn[896];
+        float proj[896];
+        int rc = mu_text_layer0_qkv_token0(e, input_ids, n_ids, qkv, 1152);
+        if (rc == 0) {
+            rc = mu_gpu_text_attn_token0(e->gpu, qkv + 1024, attn);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_attn_token0");
+            rc = mu_gpu_dense_probe(e->gpu, attn, (const unsigned short *)ow,
+                                    hidden, hidden, proj);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_o_proj");
+            rc = mu_gpu_add_f32(e->gpu, hidden_state, proj, hidden, out);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_attn_residual");
+            return 0;
+        }
+        rc = mu_record_cpu_fallback(e, "text_layer0_attn");
+        if (rc) return rc;
+    }
+#endif
+
+    float qkv[1152];
+    if (mu_text_layer0_qkv_token0(e, input_ids, n_ids, qkv, 1152) != 0) return -4;
+    float attn[896];
+    for (int h = 0; h < 14; h++) {
+        int kvh = h / 7;
+        memcpy(attn + h * 64, qkv + 1024 + kvh * 64, 64u * sizeof(attn[0]));
+    }
+    float *w_tmp = (float *)malloc((size_t)hidden * hidden * sizeof(w_tmp[0]));
+    float proj[896];
+    if (!w_tmp) return -5;
+    int rc = mu_linear_one_f32_tmp(attn, hidden, ow, NULL, hidden, proj, w_tmp);
+    free(w_tmp);
+    if (rc) return -6;
+    for (int i = 0; i < hidden; i++) out[i] = hidden_state[i] + proj[i];
+    return 0;
+}
+
 static int mu_rope_axis_for_dim(int d) {
     if (d < 8) return 0;
     if (d < 20) return 1;

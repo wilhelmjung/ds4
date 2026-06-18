@@ -283,6 +283,44 @@ static int test_mu_gpu_vision_attn_concat_probe(void) {
     return 0;
 }
 
+static int test_mu_gpu_text_attn_token0(void) {
+#if defined(__APPLE__)
+    mu_gpu *gpu = NULL;
+    if (mu_gpu_create(&gpu) != 0) return 0;
+    float v[128];
+    float out[896];
+    for (int i = 0; i < 128; i++) v[i] = (float)i;
+    int rc = mu_gpu_text_attn_token0(gpu, v, out);
+    mu_gpu_destroy(gpu);
+    if (rc != 0) return 220;
+    for (int h = 0; h < 14; h++) {
+        int kvh = h / 7;
+        for (int d = 0; d < 64; d++) {
+            float expected = v[kvh * 64 + d];
+            if (!close_enough(out[h * 64 + d], expected, 0.0f)) return 221;
+        }
+    }
+#endif
+    return 0;
+}
+
+static int test_mu_gpu_add_f32(void) {
+#if defined(__APPLE__)
+    mu_gpu *gpu = NULL;
+    if (mu_gpu_create(&gpu) != 0) return 0;
+    float a[4] = {1.0f, -2.0f, 3.5f, 0.25f};
+    float b[4] = {4.0f, 1.0f, -0.5f, 0.75f};
+    float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int rc = mu_gpu_add_f32(gpu, a, b, 4, out);
+    mu_gpu_destroy(gpu);
+    if (rc != 0) return 230;
+    for (int i = 0; i < 4; i++) {
+        if (!close_enough(out[i], a[i] + b[i], 0.0f)) return 231 + i;
+    }
+#endif
+    return 0;
+}
+
 static int test_mu_gpu_rmsnorm_probe(void) {
 #if defined(__APPLE__)
     mu_gpu *gpu = NULL;
@@ -466,6 +504,16 @@ int main(void) {
     rc = test_mu_gpu_vision_attn_concat_probe();
     if (rc) {
         fprintf(stderr, "test_mu_gpu_vision_attn_concat_probe failed: %d\n", rc);
+        return rc;
+    }
+    rc = test_mu_gpu_text_attn_token0();
+    if (rc) {
+        fprintf(stderr, "test_mu_gpu_text_attn_token0 failed: %d\n", rc);
+        return rc;
+    }
+    rc = test_mu_gpu_add_f32();
+    if (rc) {
+        fprintf(stderr, "test_mu_gpu_add_f32 failed: %d\n", rc);
         return rc;
     }
     rc = test_mu_gpu_rmsnorm_probe();
