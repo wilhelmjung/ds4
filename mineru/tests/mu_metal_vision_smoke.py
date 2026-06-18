@@ -13,7 +13,7 @@ TRACE = ROOT / "mineru" / "tests" / "mu-traces" / "layout.json"
 
 def main() -> None:
     env = os.environ.copy()
-    env["MU_CHECK_TRACE_SCOPE"] = "vision-block0-attn"
+    env["MU_CHECK_TRACE_SCOPE"] = "vision-block0-output"
     env["MU_METAL_DEBUG"] = "1"
     result = subprocess.run(
         [
@@ -40,6 +40,7 @@ def main() -> None:
     assert "trace layout vision block0 norm ok" in result.stdout
     assert "trace layout vision block0 qkv ok" in result.stdout
     assert "trace layout vision block0 attn ok" in result.stdout
+    assert "trace layout vision block0 output ok" in result.stdout
     assert "mu metal stage: vision_block0_norm1" in result.stderr
     assert "mu metal stage: vision_block0_qkv" in result.stderr
     assert "mu metal stage: vision_block0_attn_norm1" in result.stderr
@@ -47,6 +48,12 @@ def main() -> None:
     assert "mu metal stage: vision_block0_attn_kv" in result.stderr
     assert "mu metal stage: vision_block0_attn_concat" in result.stderr
     assert "mu metal stage: vision_block0_attn_proj" in result.stderr
+    assert "mu metal stage: vision_block0_output_residual1" in result.stderr
+    assert "mu metal stage: vision_block0_output_norm2" in result.stderr
+    assert "mu metal stage: vision_block0_output_fc1" in result.stderr
+    assert "mu metal stage: vision_block0_output_quick_gelu" in result.stderr
+    assert "mu metal stage: vision_block0_output_fc2" in result.stderr
+    assert "mu metal stage: vision_block0_output_residual2" in result.stderr
     assert "fallback" not in result.stderr
     print("mu_metal_vision_smoke ok")
 

@@ -85,3 +85,21 @@ kernel void mu_vision_attn_concat_probe(device const float *q0 [[buffer(0)]],
     }
     out[gid] = mu_round_bf16(acc);
 }
+
+kernel void mu_vision_add_bf16(device const float *a [[buffer(0)]],
+                               device const float *b [[buffer(1)]],
+                               device float *out [[buffer(2)]],
+                               constant int &n [[buffer(3)]],
+                               uint gid [[thread_position_in_grid]]) {
+    if ((int)gid >= n) return;
+    out[gid] = mu_round_bf16(a[gid] + b[gid]);
+}
+
+kernel void mu_vision_quick_gelu_bf16(device const float *x [[buffer(0)]],
+                                      device float *out [[buffer(1)]],
+                                      constant int &n [[buffer(2)]],
+                                      uint gid [[thread_position_in_grid]]) {
+    if ((int)gid >= n) return;
+    float v = x[gid];
+    out[gid] = mu_round_bf16(v / (1.0f + exp(-1.702f * v)));
+}

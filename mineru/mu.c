@@ -2240,6 +2240,80 @@ int mu_vision_block0_output_token(mu_engine *e, const float *patch_embeds,
     const uint16_t *fc2_b = mu_tensor_bf16(e, "visual.blocks.0.mlp.fc2.bias", 1, 1280, 0);
     if (!norm2_w || !norm2_b || !fc1_w || !fc1_b || !fc2_w || !fc2_b) return -2;
 
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        float *attn_m = (float *)malloc(1280u * sizeof(attn_m[0]));
+        float *residual1_m = (float *)malloc(1280u * sizeof(residual1_m[0]));
+        float *norm2_m = (float *)malloc(1280u * sizeof(norm2_m[0]));
+        float *fc1_m = (float *)malloc(5120u * sizeof(fc1_m[0]));
+        float *fc1_act_m = (float *)malloc(5120u * sizeof(fc1_act_m[0]));
+        float *mlp_m = (float *)malloc(1280u * sizeof(mlp_m[0]));
+        if (!attn_m || !residual1_m || !norm2_m || !fc1_m || !fc1_act_m || !mlp_m) {
+            free(attn_m);
+            free(residual1_m);
+            free(norm2_m);
+            free(fc1_m);
+            free(fc1_act_m);
+            free(mlp_m);
+            int frc = mu_record_cpu_fallback(e, "vision_block0_output_alloc");
+            if (frc) return frc;
+            goto cpu_block0_output;
+        }
+
+        int rc = mu_vision_block0_attn_token(e, patch_embeds, rows, cols,
+                                             rotary, rotary_rows, rotary_cols,
+                                             token_index, attn_m, 1280);
+        if (rc == 0) {
+            rc = mu_gpu_vision_add_bf16(e->gpu,
+                                        patch_embeds + (size_t)token_index * 1280u,
+                                        attn_m, 1280, residual1_m);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "vision_block0_output_residual1");
+            rc = mu_gpu_layernorm_bf16_probe(e->gpu, residual1_m,
+                                             (const unsigned short *)norm2_w,
+                                             (const unsigned short *)norm2_b,
+                                             1280, 1e-6f, norm2_m);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "vision_block0_output_norm2");
+            rc = mu_gpu_dense_bf16_bias_probe(e->gpu, norm2_m,
+                                              (const unsigned short *)fc1_w,
+                                              (const unsigned short *)fc1_b,
+                                              5120, 1280, fc1_m);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "vision_block0_output_fc1");
+            rc = mu_gpu_vision_quick_gelu_bf16(e->gpu, fc1_m, 5120, fc1_act_m);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "vision_block0_output_quick_gelu");
+            rc = mu_gpu_dense_bf16_bias_probe(e->gpu, fc1_act_m,
+                                              (const unsigned short *)fc2_w,
+                                              (const unsigned short *)fc2_b,
+                                              1280, 5120, mlp_m);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "vision_block0_output_fc2");
+            rc = mu_gpu_vision_add_bf16(e->gpu, residual1_m, mlp_m, 1280, out);
+        }
+        free(attn_m);
+        free(residual1_m);
+        free(norm2_m);
+        free(fc1_m);
+        free(fc1_act_m);
+        free(mlp_m);
+        if (rc == 0) {
+            mu_record_metal_stage(e, "vision_block0_output_residual2");
+            return 0;
+        }
+        rc = mu_record_cpu_fallback(e, "vision_block0_output");
+        if (rc) return rc;
+    }
+#endif
+
+cpu_block0_output:
+    ;
     float attn[1280];
     if (mu_vision_block0_attn_token(e, patch_embeds, rows, cols,
                                     rotary, rotary_rows, rotary_cols,
