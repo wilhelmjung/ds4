@@ -56,6 +56,9 @@ int mu_gpu_vision_attn_concat_probe(mu_gpu *gpu, const float *q0,
 int mu_gpu_text_attn_token0(mu_gpu *gpu, const float *v, float *out);
 int mu_gpu_text_attn_seq(mu_gpu *gpu, const float *q, const float *k,
                          const float *v, int seq, float *out);
+int mu_gpu_text_attn_seq_pos(mu_gpu *gpu, const float *q, const float *k,
+                             const float *v, const int *position_ids,
+                             int seq, float *out);
 int mu_gpu_add_f32(mu_gpu *gpu, const float *a, const float *b,
                    int n, float *out);
 int mu_gpu_silu_mul_f32(mu_gpu *gpu, const float *gate, const float *up,

@@ -3113,8 +3113,9 @@ static void mu_record_text_layer_seq_stage(const mu_engine *e, int layer,
 
 static int mu_text_layer_mlp_seq_from_hidden(mu_engine *e, int layer,
                                              const float *input_hidden,
+                                             const int *position_ids,
                                              int n_ids, float *out) {
-    if (!e || !input_hidden || n_ids <= 0 || n_ids > 64 || !out ||
+    if (!e || !input_hidden || n_ids <= 0 || !out ||
         layer < 0 || layer >= e->cfg.text_layers) {
         return -1;
     }
@@ -3197,7 +3198,12 @@ static int mu_text_layer_mlp_seq_from_hidden(mu_engine *e, int layer,
         }
         if (rc == 0) {
             mu_record_text_layer_seq_stage(e, layer, "v_proj");
-            rc = mu_gpu_text_attn_seq(e->gpu, q, k, v, n_ids, attn);
+            if (position_ids) {
+                rc = mu_gpu_text_attn_seq_pos(e->gpu, q, k, v,
+                                              position_ids, n_ids, attn);
+            } else {
+                rc = mu_gpu_text_attn_seq(e->gpu, q, k, v, n_ids, attn);
+            }
         }
         if (rc == 0) {
             mu_record_text_layer_seq_stage(e, layer, "attn");
@@ -3276,7 +3282,7 @@ cpu_text_layer_seq:
     if (rc == 0) rc = mu_linear_seq_f32(normed, n_ids, hidden, kw, kb, 128, k, w_tmp);
     if (rc == 0) rc = mu_linear_seq_f32(normed, n_ids, hidden, vw, vb, 128, v, w_tmp);
     if (rc == 0) {
-        mu_apply_text_rope(q, k, n_ids, NULL);
+        mu_apply_text_rope(q, k, n_ids, position_ids);
         rc = mu_text_attention_f32(q, k, v, n_ids, attn);
     }
     if (rc == 0) rc = mu_linear_seq_f32(attn, n_ids, hidden, ow, NULL, hidden, proj, w_tmp);
@@ -3309,7 +3315,7 @@ int mu_text_layer01_mlp_seq(mu_engine *e, const int *input_ids, int n_ids,
     if (!layer0) return -2;
     int rc = mu_text_layer0_mlp_seq(e, input_ids, n_ids, layer0, n_ids, 896);
     if (rc == 0) {
-        rc = mu_text_layer_mlp_seq_from_hidden(e, 1, layer0, n_ids, out);
+        rc = mu_text_layer_mlp_seq_from_hidden(e, 1, layer0, NULL, n_ids, out);
     }
     free(layer0);
     return rc == 0 ? 0 : -3;
@@ -3351,7 +3357,7 @@ int mu_text_layers_mlp_seq(mu_engine *e, const int *input_ids, int n_ids,
     float *dst = b;
     int rc = 0;
     for (int layer = 0; layer < n_layers; layer++) {
-        rc = mu_text_layer_mlp_seq_from_hidden(e, layer, src, n_ids, dst);
+        rc = mu_text_layer_mlp_seq_from_hidden(e, layer, src, NULL, n_ids, dst);
         if (rc != 0) break;
         float *tmp = src;
         src = dst;
@@ -3363,6 +3369,44 @@ int mu_text_layers_mlp_seq(mu_engine *e, const int *input_ids, int n_ids,
     free(a);
     free(b);
     return rc == 0 ? 0 : -5;
+}
+
+static int mu_text_layers_mlp_seq_from_hidden(mu_engine *e,
+                                              const float *initial_hidden,
+                                              int n_ids,
+                                              const int *position_ids,
+                                              int n_layers,
+                                              float *out) {
+    if (!e || !initial_hidden || n_ids <= 0 || !position_ids ||
+        n_layers <= 0 || n_layers > e->cfg.text_layers || !out) {
+        return -1;
+    }
+    const int hidden = 896;
+    float *a = (float *)malloc((size_t)n_ids * hidden * sizeof(a[0]));
+    float *b = (float *)malloc((size_t)n_ids * hidden * sizeof(b[0]));
+    if (!a || !b) {
+        free(a);
+        free(b);
+        return -2;
+    }
+    memcpy(a, initial_hidden, (size_t)n_ids * hidden * sizeof(a[0]));
+
+    float *src = a;
+    float *dst = b;
+    int rc = 0;
+    for (int layer = 0; layer < n_layers; layer++) {
+        rc = mu_text_layer_mlp_seq_from_hidden(e, layer, src, position_ids, n_ids, dst);
+        if (rc != 0) break;
+        float *tmp = src;
+        src = dst;
+        dst = tmp;
+    }
+    if (rc == 0) {
+        memcpy(out, src, (size_t)n_ids * hidden * sizeof(out[0]));
+    }
+    free(a);
+    free(b);
+    return rc == 0 ? 0 : -3;
 }
 
 static int mu_rope_axis_for_dim(int d) {
@@ -3904,16 +3948,12 @@ int mu_text_top_logits_with_image_embeds(mu_engine *e, const int *input_ids, int
         n_image_embeds <= 0 || top_k <= 0 || !out) {
         return -1;
     }
-#if defined(__APPLE__)
-    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
-        int rc = mu_record_cpu_fallback(e, "text_logits");
-        if (rc) return rc;
-    }
-#endif
     const int hidden = 896;
     const int vocab = 151936;
+    const float eps = 1e-6f;
     const uint16_t *embed = mu_tensor_bf16(e, "model.embed_tokens.weight", 2, vocab, hidden);
-    if (!embed) return -2;
+    const uint16_t *final_norm = mu_tensor_bf16(e, "model.norm.weight", 1, hidden, 0);
+    if (!embed || !final_norm) return -2;
 
     float *hidden_states = (float *)malloc((size_t)n_ids * hidden * sizeof(float));
     if (!hidden_states) return -3;
@@ -3941,6 +3981,59 @@ int mu_text_top_logits_with_image_embeds(mu_engine *e, const int *input_ids, int
         free(hidden_states);
         return -6;
     }
+
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        float *encoded = (float *)malloc((size_t)n_ids * hidden * sizeof(encoded[0]));
+        float *last_norm = (float *)malloc((size_t)hidden * sizeof(last_norm[0]));
+        float *logits = (float *)malloc((size_t)vocab * sizeof(logits[0]));
+        int rc = 0;
+        if (!encoded || !last_norm || !logits) {
+            rc = -7;
+        }
+        if (rc == 0) {
+            rc = mu_text_layers_mlp_seq_from_hidden(e, hidden_states, n_ids,
+                                                    position_ids, e->cfg.text_layers,
+                                                    encoded);
+        }
+        if (rc == 0) {
+            rc = mu_gpu_rmsnorm_bf16_rows(e->gpu,
+                                          encoded + (size_t)(n_ids - 1) * hidden,
+                                          (const unsigned short *)final_norm,
+                                          1, hidden, eps, last_norm);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_final_norm");
+            rc = mu_gpu_dense_f32_rows(e->gpu, last_norm,
+                                       (const unsigned short *)embed,
+                                       1, hidden, vocab, logits);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_logits");
+            for (int i = 0; i < top_k; i++) {
+                out[i].id = -1;
+                out[i].logit = -FLT_MAX;
+            }
+            for (int id = 0; id < vocab; id++) {
+                float logit = mu_bf16_to_f32(mu_f32_to_bf16(logits[id]));
+                mu_topk_insert(out, top_k, id, logit);
+            }
+        }
+        free(encoded);
+        free(last_norm);
+        free(logits);
+        if (rc == 0) {
+            free(hidden_states);
+            return top_k;
+        }
+        rc = mu_record_cpu_fallback(e, "text_logits");
+        if (rc) {
+            free(hidden_states);
+            return rc;
+        }
+    }
+#endif
+
     int rc = mu_text_top_logits_from_embeddings(e, hidden_states, n_ids, position_ids, top_k, out);
     free(hidden_states);
     return rc;

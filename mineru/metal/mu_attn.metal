@@ -36,6 +36,23 @@ static inline float mu_text_rope_value(device const float *head,
     return old * c + rot * s;
 }
 
+static inline float mu_text_rope_value_pos(device const float *head,
+                                           device const int *position_ids,
+                                           int seq,
+                                           int token_index,
+                                           int d) {
+    int axis = mu_text_rope_axis(d);
+    int pos = position_ids[(size_t)axis * (size_t)seq + (size_t)token_index];
+    int inv_idx = d < 32 ? d : d - 32;
+    float inv = pow(1000000.0f, -((float)(2 * inv_idx) / 64.0f));
+    float angle = (float)pos * inv;
+    float c = cos(angle);
+    float s = sin(angle);
+    float old = head[d];
+    float rot = d < 32 ? -head[d + 32] : head[d - 32];
+    return old * c + rot * s;
+}
+
 kernel void mu_text_attn_seq(device const float *q [[buffer(0)]],
                              device const float *k [[buffer(1)]],
                              device const float *v [[buffer(2)]],
@@ -94,6 +111,70 @@ kernel void mu_text_attn_seq(device const float *q [[buffer(0)]],
         acc += p * v_head[dim];
     }
     out[gid] = acc;
+}
+
+kernel void mu_text_attn_seq_pos(device const float *q [[buffer(0)]],
+                                 device const float *k [[buffer(1)]],
+                                 device const float *v [[buffer(2)]],
+                                 device const int *position_ids [[buffer(3)]],
+                                 device float *out [[buffer(4)]],
+                                 constant int &seq [[buffer(5)]],
+                                 uint2 gid [[thread_position_in_grid]]) {
+    const int n_heads = 14;
+    const int n_kv_heads = 2;
+    const int kv_group = 7;
+    const int head_dim = 64;
+    int t = (int)gid.x;
+    int head = (int)gid.y;
+    if (t >= seq || head >= n_heads) return;
+
+    int kvh = head / kv_group;
+    device const float *q_head = q + ((size_t)t * n_heads + head) * head_dim;
+
+    float qd[64];
+    for (int d = 0; d < head_dim; d++) {
+        qd[d] = mu_text_rope_value_pos(q_head, position_ids, seq, t, d);
+    }
+
+    float max_score = -3.402823466e38f;
+    for (int sidx = 0; sidx <= t; sidx++) {
+        device const float *k_head = k + ((size_t)sidx * n_kv_heads + kvh) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += qd[d] * mu_text_rope_value_pos(k_head, position_ids, seq, sidx, d);
+        }
+        float score = dot * 0.125f;
+        if (score > max_score) max_score = score;
+    }
+
+    float denom = 0.0f;
+    for (int chunk = 0; chunk <= t; chunk += 64) {
+        int n = min(64, t - chunk + 1);
+        for (int i = 0; i < n; i++) {
+            int sidx = chunk + i;
+            device const float *k_head = k + ((size_t)sidx * n_kv_heads + kvh) * head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; d++) {
+                dot += qd[d] * mu_text_rope_value_pos(k_head, position_ids, seq, sidx, d);
+            }
+            denom += exp(dot * 0.125f - max_score);
+        }
+    }
+
+    device float *oh = out + ((size_t)t * n_heads + head) * head_dim;
+    float acc[64];
+    for (int d = 0; d < head_dim; d++) acc[d] = 0.0f;
+    for (int sidx = 0; sidx <= t; sidx++) {
+        device const float *k_head = k + ((size_t)sidx * n_kv_heads + kvh) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += qd[d] * mu_text_rope_value_pos(k_head, position_ids, seq, sidx, d);
+        }
+        float p = exp(dot * 0.125f - max_score) / denom;
+        device const float *v_head = v + ((size_t)sidx * n_kv_heads + kvh) * head_dim;
+        for (int d = 0; d < head_dim; d++) acc[d] += p * v_head[d];
+    }
+    for (int d = 0; d < head_dim; d++) oh[d] = acc[d];
 }
 
 kernel void mu_add_f32(device const float *a [[buffer(0)]],

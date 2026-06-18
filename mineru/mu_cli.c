@@ -528,6 +528,7 @@ static int check_trace_file(mu_engine *engine, const char *path) {
     int vision_block0_output_scope = trace_scope && !strcmp(trace_scope, "vision-block0-output");
     int vision_block0_tiny_output_scope =
         trace_scope && !strcmp(trace_scope, "vision-block0-tiny-output");
+    int layout_logits_scope = trace_scope && !strcmp(trace_scope, "layout-logits");
     char *rendered = mu_render_chat_prompt(prompt, is_layout);
     if (!rendered || strcmp(rendered, expected_chat) != 0) {
         fprintf(stderr, "trace %s chat mismatch\n", mode);
@@ -911,6 +912,20 @@ static int check_trace_file(mu_engine *engine, const char *path) {
             return 1;
         }
         printf("trace layout logits ok\n");
+        if (layout_logits_scope) {
+            free(json);
+            free(mode);
+            free(prompt);
+            free(expected_chat);
+            mu_free(rendered);
+            free(got_ids);
+            free(expected_pos);
+            free(got_pos);
+            free(embeds_path);
+            free(expected_embed_sample);
+            free(image_embeds);
+            return 0;
+        }
 
         int *expected_layout_gen = NULL;
         int expected_layout_gen_n = 0;
