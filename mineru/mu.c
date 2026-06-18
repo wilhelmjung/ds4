@@ -4400,7 +4400,54 @@ int mu_text_generate_greedy_with_image_embeds(mu_engine *e,
                                               int n_image_embeds,
                                               int max_new_tokens, int *out) {
     if (e && e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
-        int rc = mu_record_cpu_fallback(e, "text_generate");
+        if (!input_ids || n_ids <= 0 || grid_t <= 0 || grid_h <= 0 || grid_w <= 0 ||
+            !image_embeds || n_image_embeds <= 0 || max_new_tokens <= 0 || !out) {
+            return -1;
+        }
+        int cap = n_ids + max_new_tokens;
+        int *ids = (int *)malloc((size_t)cap * sizeof(ids[0]));
+        int *pos = (int *)malloc((size_t)cap * 3u * sizeof(pos[0]));
+        int rc = 0;
+        int nout = 0;
+        if (!ids || !pos) {
+            rc = -2;
+        }
+        if (rc == 0) {
+            memcpy(ids, input_ids, (size_t)n_ids * sizeof(ids[0]));
+            int cur = n_ids;
+            for (int step = 0; step < max_new_tokens; step++) {
+                int pos_n = mu_build_position_ids(e, ids, cur, grid_t, grid_h, grid_w,
+                                                  pos, cur * 3);
+                if (pos_n != cur * 3) {
+                    rc = -3;
+                    break;
+                }
+                mu_token_logit top[8];
+                int top_n = mu_text_top_logits_with_image_embeds(
+                    e, ids, cur, pos, image_embeds, n_image_embeds, 8, top);
+                if (top_n < 1) {
+                    rc = -4;
+                    break;
+                }
+                float best = top[0].logit;
+                int next = top[0].id;
+                for (int i = 1; i < 8; i++) {
+                    if (top[i].id >= 0 && top[i].logit == best && top[i].id < next) {
+                        next = top[i].id;
+                    }
+                }
+                out[nout++] = next;
+                ids[cur++] = next;
+                if (next == 151645 || next == 151643) break;
+            }
+        }
+        free(ids);
+        free(pos);
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_generate");
+            return nout;
+        }
+        rc = mu_record_cpu_fallback(e, "text_generate");
         if (rc) return rc;
     }
     return mu_cpu_text_generate_greedy_with_image_embeds(
