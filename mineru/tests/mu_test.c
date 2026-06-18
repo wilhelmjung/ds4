@@ -321,6 +321,24 @@ static int test_mu_gpu_add_f32(void) {
     return 0;
 }
 
+static int test_mu_gpu_silu_mul_f32(void) {
+#if defined(__APPLE__)
+    mu_gpu *gpu = NULL;
+    if (mu_gpu_create(&gpu) != 0) return 0;
+    float gate[4] = {0.0f, 1.0f, -2.0f, 3.0f};
+    float up[4] = {2.0f, -1.0f, 0.5f, 4.0f};
+    float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int rc = mu_gpu_silu_mul_f32(gpu, gate, up, 4, out);
+    mu_gpu_destroy(gpu);
+    if (rc != 0) return 240;
+    for (int i = 0; i < 4; i++) {
+        float expected = mu_silu_f32(gate[i]) * up[i];
+        if (!close_enough(out[i], expected, 1e-5f)) return 241 + i;
+    }
+#endif
+    return 0;
+}
+
 static int test_mu_gpu_rmsnorm_probe(void) {
 #if defined(__APPLE__)
     mu_gpu *gpu = NULL;
@@ -514,6 +532,11 @@ int main(void) {
     rc = test_mu_gpu_add_f32();
     if (rc) {
         fprintf(stderr, "test_mu_gpu_add_f32 failed: %d\n", rc);
+        return rc;
+    }
+    rc = test_mu_gpu_silu_mul_f32();
+    if (rc) {
+        fprintf(stderr, "test_mu_gpu_silu_mul_f32 failed: %d\n", rc);
         return rc;
     }
     rc = test_mu_gpu_rmsnorm_probe();

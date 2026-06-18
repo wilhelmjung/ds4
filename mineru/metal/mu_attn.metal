@@ -22,3 +22,13 @@ kernel void mu_add_f32(device const float *a [[buffer(0)]],
     if ((int)gid >= n) return;
     out[gid] = a[gid] + b[gid];
 }
+
+kernel void mu_silu_mul_f32(device const float *gate [[buffer(0)]],
+                            device const float *up [[buffer(1)]],
+                            device float *out [[buffer(2)]],
+                            constant int &n [[buffer(3)]],
+                            uint gid [[thread_position_in_grid]]) {
+    if ((int)gid >= n) return;
+    float g = gate[gid];
+    out[gid] = (g / (1.0f + exp(-g))) * up[gid];
+}

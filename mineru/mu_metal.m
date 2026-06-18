@@ -19,6 +19,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> layernorm_bf16_rows;
     id<MTLComputePipelineState> text_attn_token0;
     id<MTLComputePipelineState> add_f32;
+    id<MTLComputePipelineState> silu_mul_f32;
     id<MTLComputePipelineState> vision_attn_concat_probe;
     id<MTLComputePipelineState> vision_add_bf16;
     id<MTLComputePipelineState> vision_quick_gelu_bf16;
@@ -88,6 +89,8 @@ int mu_gpu_create(mu_gpu **out) {
                                                      @"mu_text_attn_token0");
         gpu->add_f32 = mu_gpu_make_pipeline(device, @"mu_attn.metal",
                                             @"mu_add_f32");
+        gpu->silu_mul_f32 = mu_gpu_make_pipeline(device, @"mu_attn.metal",
+                                                 @"mu_silu_mul_f32");
         gpu->vision_attn_concat_probe = mu_gpu_make_pipeline(device, @"mu_vision.metal",
                                                              @"mu_vision_attn_concat_probe");
         gpu->vision_add_bf16 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
@@ -110,6 +113,7 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->vision_quick_gelu_bf16 = nil;
     gpu->vision_add_bf16 = nil;
     gpu->vision_attn_concat_probe = nil;
+    gpu->silu_mul_f32 = nil;
     gpu->add_f32 = nil;
     gpu->text_attn_token0 = nil;
     gpu->layernorm_bf16_rows = nil;
@@ -715,6 +719,53 @@ int mu_gpu_add_f32(mu_gpu *gpu, const float *a, const float *b,
         [encoder setBuffer:n_buf offset:0 atIndex:3];
 
         NSUInteger width = gpu->add_f32.threadExecutionWidth;
+        if (width < 1) width = 1;
+        if (width > (NSUInteger)n) width = (NSUInteger)n;
+        MTLSize grid = MTLSizeMake((NSUInteger)n, 1, 1);
+        MTLSize threads = MTLSizeMake(width, 1, 1);
+        [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -6;
+
+        memcpy(out, [out_buf contents], bytes);
+    }
+    return 0;
+}
+
+int mu_gpu_silu_mul_f32(mu_gpu *gpu, const float *gate, const float *up,
+                        int n, float *out) {
+    if (!gpu || !gpu->device || !gpu->queue || !gpu->silu_mul_f32) return -1;
+    if (!gate || !up || !out || n <= 0) return -2;
+
+    @autoreleasepool {
+        NSUInteger bytes = (NSUInteger)n * sizeof(float);
+        id<MTLBuffer> gate_buf = [gpu->device newBufferWithBytes:gate
+                                                          length:bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> up_buf = [gpu->device newBufferWithBytes:up
+                                                        length:bytes
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buf = [gpu->device newBufferWithLength:bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> n_buf = [gpu->device newBufferWithBytes:&n
+                                                       length:sizeof(n)
+                                                      options:MTLResourceStorageModeShared];
+        if (!gate_buf || !up_buf || !out_buf || !n_buf) return -3;
+
+        id<MTLCommandBuffer> command_buffer = [gpu->queue commandBuffer];
+        if (!command_buffer) return -4;
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (!encoder) return -5;
+
+        [encoder setComputePipelineState:gpu->silu_mul_f32];
+        [encoder setBuffer:gate_buf offset:0 atIndex:0];
+        [encoder setBuffer:up_buf offset:0 atIndex:1];
+        [encoder setBuffer:out_buf offset:0 atIndex:2];
+        [encoder setBuffer:n_buf offset:0 atIndex:3];
+
+        NSUInteger width = gpu->silu_mul_f32.threadExecutionWidth;
         if (width < 1) width = 1;
         if (width > (NSUInteger)n) width = (NSUInteger)n;
         MTLSize grid = MTLSizeMake((NSUInteger)n, 1, 1);

@@ -517,6 +517,7 @@ static int check_trace_file(mu_engine *engine, const char *path) {
     const char *trace_scope = getenv("MU_CHECK_TRACE_SCOPE");
     int text_layer0_qkv_scope = trace_scope && !strcmp(trace_scope, "text-layer0-qkv");
     int text_layer0_attn_scope = trace_scope && !strcmp(trace_scope, "text-layer0-attn");
+    int text_layer0_mlp_scope = trace_scope && !strcmp(trace_scope, "text-layer0-mlp");
     int vision_block0_norm_scope = trace_scope && !strcmp(trace_scope, "vision-block0-norm");
     int vision_block0_qkv_scope = trace_scope && !strcmp(trace_scope, "vision-block0-qkv");
     int vision_block0_attn_scope = trace_scope && !strcmp(trace_scope, "vision-block0-attn");
@@ -651,7 +652,8 @@ static int check_trace_file(mu_engine *engine, const char *path) {
     }
     printf("trace %s positions ok\n", mode);
 
-    if (!is_layout && (text_layer0_qkv_scope || text_layer0_attn_scope)) {
+    if (!is_layout && (text_layer0_qkv_scope || text_layer0_attn_scope ||
+                       text_layer0_mlp_scope)) {
         float qkv[1152];
         if (mu_text_layer0_qkv_token0(engine, got_ids, got_n, qkv, 1152) != 0) {
             fprintf(stderr, "trace text layer0 qkv failed\n");
@@ -666,7 +668,7 @@ static int check_trace_file(mu_engine *engine, const char *path) {
             return 1;
         }
         printf("trace text layer0 qkv ok\n");
-        if (text_layer0_attn_scope) {
+        if (text_layer0_attn_scope || text_layer0_mlp_scope) {
             float attn_out[896];
             if (mu_text_layer0_attn_token0(engine, got_ids, got_n, attn_out, 896) != 0) {
                 fprintf(stderr, "trace text layer0 attn failed\n");
@@ -681,6 +683,22 @@ static int check_trace_file(mu_engine *engine, const char *path) {
                 return 1;
             }
             printf("trace text layer0 attn ok\n");
+        }
+        if (text_layer0_mlp_scope) {
+            float mlp_out[896];
+            if (mu_text_layer0_mlp_token0(engine, got_ids, got_n, mlp_out, 896) != 0) {
+                fprintf(stderr, "trace text layer0 mlp failed\n");
+                free(json);
+                free(mode);
+                free(prompt);
+                free(expected_chat);
+                mu_free(rendered);
+                free(got_ids);
+                free(expected_pos);
+                free(got_pos);
+                return 1;
+            }
+            printf("trace text layer0 mlp ok\n");
         }
         free(json);
         free(mode);

@@ -13,7 +13,7 @@ TRACE = ROOT / "mineru" / "tests" / "mu-traces" / "text.json"
 
 def main() -> None:
     env = os.environ.copy()
-    env["MU_CHECK_TRACE_SCOPE"] = "text-layer0-attn"
+    env["MU_CHECK_TRACE_SCOPE"] = "text-layer0-mlp"
     env["MU_METAL_DEBUG"] = "1"
     result = subprocess.run(
         [
@@ -39,6 +39,7 @@ def main() -> None:
         )
     assert "trace text layer0 qkv ok" in result.stdout
     assert "trace text layer0 attn ok" in result.stdout
+    assert "trace text layer0 mlp ok" in result.stdout
     assert "mu metal stage: text_layer0_input_norm" in result.stderr
     assert "mu metal stage: text_layer0_q_proj" in result.stderr
     assert "mu metal stage: text_layer0_k_proj" in result.stderr
@@ -46,6 +47,12 @@ def main() -> None:
     assert "mu metal stage: text_layer0_attn_token0" in result.stderr
     assert "mu metal stage: text_layer0_o_proj" in result.stderr
     assert "mu metal stage: text_layer0_attn_residual" in result.stderr
+    assert "mu metal stage: text_layer0_post_norm" in result.stderr
+    assert "mu metal stage: text_layer0_gate_proj" in result.stderr
+    assert "mu metal stage: text_layer0_up_proj" in result.stderr
+    assert "mu metal stage: text_layer0_silu_mul" in result.stderr
+    assert "mu metal stage: text_layer0_down_proj" in result.stderr
+    assert "mu metal stage: text_layer0_mlp_residual" in result.stderr
     assert "fallback" not in result.stderr
     print("mu_metal_text_smoke ok")
 

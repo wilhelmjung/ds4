@@ -2790,6 +2790,110 @@ int mu_text_layer0_attn_token0(mu_engine *e, const int *input_ids, int n_ids,
     return 0;
 }
 
+int mu_text_layer0_mlp_token0(mu_engine *e, const int *input_ids, int n_ids,
+                              float *out, int out_n) {
+    if (!e || !input_ids || n_ids <= 0 || !out || out_n != 896) return -1;
+    const int hidden = 896;
+    const int inter = 4864;
+    const float eps = 1e-6f;
+    const uint16_t *post_norm =
+        mu_tensor_bf16(e, "model.layers.0.post_attention_layernorm.weight", 1, hidden, 0);
+    const uint16_t *gate_w = mu_tensor_bf16(e, "model.layers.0.mlp.gate_proj.weight", 2, inter, hidden);
+    const uint16_t *up_w = mu_tensor_bf16(e, "model.layers.0.mlp.up_proj.weight", 2, inter, hidden);
+    const uint16_t *down_w = mu_tensor_bf16(e, "model.layers.0.mlp.down_proj.weight", 2, hidden, inter);
+    if (!post_norm || !gate_w || !up_w || !down_w) return -2;
+
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        float attn_residual[896];
+        float normed[896];
+        float *gate = (float *)malloc((size_t)inter * sizeof(gate[0]));
+        float *up = (float *)malloc((size_t)inter * sizeof(up[0]));
+        float *mid = (float *)malloc((size_t)inter * sizeof(mid[0]));
+        float proj[896];
+        if (!gate || !up || !mid) {
+            free(gate);
+            free(up);
+            free(mid);
+            int frc = mu_record_cpu_fallback(e, "text_layer0_mlp_alloc");
+            if (frc) return frc;
+            goto cpu_text_layer0_mlp;
+        }
+        int rc = mu_text_layer0_attn_token0(e, input_ids, n_ids, attn_residual, hidden);
+        if (rc == 0) {
+            rc = mu_gpu_rmsnorm_bf16_probe(e->gpu, attn_residual,
+                                           (const unsigned short *)post_norm,
+                                           hidden, eps, normed);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_post_norm");
+            rc = mu_gpu_dense_probe(e->gpu, normed, (const unsigned short *)gate_w,
+                                    inter, hidden, gate);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_gate_proj");
+            rc = mu_gpu_dense_probe(e->gpu, normed, (const unsigned short *)up_w,
+                                    inter, hidden, up);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_up_proj");
+            rc = mu_gpu_silu_mul_f32(e->gpu, gate, up, inter, mid);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_silu_mul");
+            rc = mu_gpu_dense_probe(e->gpu, mid, (const unsigned short *)down_w,
+                                    hidden, inter, proj);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_down_proj");
+            rc = mu_gpu_add_f32(e->gpu, attn_residual, proj, hidden, out);
+        }
+        free(gate);
+        free(up);
+        free(mid);
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_mlp_residual");
+            return 0;
+        }
+        rc = mu_record_cpu_fallback(e, "text_layer0_mlp");
+        if (rc) return rc;
+    }
+#endif
+
+cpu_text_layer0_mlp:
+    ;
+    float attn_residual[896];
+    if (mu_text_layer0_attn_token0(e, input_ids, n_ids, attn_residual, hidden) != 0) return -3;
+    float normed[896];
+    mu_rmsnorm_one_bf16(attn_residual, post_norm, hidden, eps, normed);
+    float *gate = (float *)malloc((size_t)inter * sizeof(gate[0]));
+    float *up = (float *)malloc((size_t)inter * sizeof(up[0]));
+    float *mid = (float *)malloc((size_t)inter * sizeof(mid[0]));
+    float *w_tmp = (float *)malloc((size_t)inter * hidden * sizeof(w_tmp[0]));
+    float proj[896];
+    if (!gate || !up || !mid || !w_tmp) {
+        free(gate);
+        free(up);
+        free(mid);
+        free(w_tmp);
+        return -4;
+    }
+    int rc = mu_linear_one_f32_tmp(normed, hidden, gate_w, NULL, inter, gate, w_tmp);
+    if (rc == 0) rc = mu_linear_one_f32_tmp(normed, hidden, up_w, NULL, inter, up, w_tmp);
+    if (rc == 0) {
+        for (int i = 0; i < inter; i++) mid[i] = mu_silu_f32(gate[i]) * up[i];
+        rc = mu_linear_one_f32_tmp(mid, inter, down_w, NULL, hidden, proj, w_tmp);
+    }
+    if (rc == 0) {
+        for (int i = 0; i < hidden; i++) out[i] = attn_residual[i] + proj[i];
+    }
+    free(gate);
+    free(up);
+    free(mid);
+    free(w_tmp);
+    return rc == 0 ? 0 : -5;
+}
+
 static int mu_rope_axis_for_dim(int d) {
     if (d < 8) return 0;
     if (d < 20) return 1;
