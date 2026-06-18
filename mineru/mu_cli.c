@@ -519,6 +519,7 @@ static int check_trace_file(mu_engine *engine, const char *path) {
     int text_layer0_attn_scope = trace_scope && !strcmp(trace_scope, "text-layer0-attn");
     int text_layer0_mlp_scope = trace_scope && !strcmp(trace_scope, "text-layer0-mlp");
     int text_layer0_seq_scope = trace_scope && !strcmp(trace_scope, "text-layer0-seq");
+    int text_layer01_seq_scope = trace_scope && !strcmp(trace_scope, "text-layer01-seq");
     int vision_block0_norm_scope = trace_scope && !strcmp(trace_scope, "vision-block0-norm");
     int vision_block0_qkv_scope = trace_scope && !strcmp(trace_scope, "vision-block0-qkv");
     int vision_block0_attn_scope = trace_scope && !strcmp(trace_scope, "vision-block0-attn");
@@ -654,7 +655,8 @@ static int check_trace_file(mu_engine *engine, const char *path) {
     printf("trace %s positions ok\n", mode);
 
     if (!is_layout && (text_layer0_qkv_scope || text_layer0_attn_scope ||
-                       text_layer0_mlp_scope || text_layer0_seq_scope)) {
+                       text_layer0_mlp_scope || text_layer0_seq_scope ||
+                       text_layer01_seq_scope)) {
         float qkv[1152];
         if (mu_text_layer0_qkv_token0(engine, got_ids, got_n, qkv, 1152) != 0) {
             fprintf(stderr, "trace text layer0 qkv failed\n");
@@ -669,7 +671,8 @@ static int check_trace_file(mu_engine *engine, const char *path) {
             return 1;
         }
         printf("trace text layer0 qkv ok\n");
-        if (text_layer0_attn_scope || text_layer0_mlp_scope || text_layer0_seq_scope) {
+        if (text_layer0_attn_scope || text_layer0_mlp_scope ||
+            text_layer0_seq_scope || text_layer01_seq_scope) {
             float attn_out[896];
             if (mu_text_layer0_attn_token0(engine, got_ids, got_n, attn_out, 896) != 0) {
                 fprintf(stderr, "trace text layer0 attn failed\n");
@@ -685,7 +688,7 @@ static int check_trace_file(mu_engine *engine, const char *path) {
             }
             printf("trace text layer0 attn ok\n");
         }
-        if (text_layer0_mlp_scope || text_layer0_seq_scope) {
+        if (text_layer0_mlp_scope || text_layer0_seq_scope || text_layer01_seq_scope) {
             float mlp_out[896];
             if (mu_text_layer0_mlp_token0(engine, got_ids, got_n, mlp_out, 896) != 0) {
                 fprintf(stderr, "trace text layer0 mlp failed\n");
@@ -701,7 +704,7 @@ static int check_trace_file(mu_engine *engine, const char *path) {
             }
             printf("trace text layer0 mlp ok\n");
         }
-        if (text_layer0_seq_scope) {
+        if (text_layer0_seq_scope || text_layer01_seq_scope) {
             float *seq_out = (float *)malloc((size_t)got_n * 896u * sizeof(seq_out[0]));
             if (!seq_out ||
                 mu_text_layer0_mlp_seq(engine, got_ids, got_n,
@@ -719,6 +722,26 @@ static int check_trace_file(mu_engine *engine, const char *path) {
                 return 1;
             }
             printf("trace text layer0 seq ok\n");
+            free(seq_out);
+        }
+        if (text_layer01_seq_scope) {
+            float *seq_out = (float *)malloc((size_t)got_n * 896u * sizeof(seq_out[0]));
+            if (!seq_out ||
+                mu_text_layer01_mlp_seq(engine, got_ids, got_n,
+                                        seq_out, got_n, 896) != 0) {
+                fprintf(stderr, "trace text layer01 seq failed\n");
+                free(seq_out);
+                free(json);
+                free(mode);
+                free(prompt);
+                free(expected_chat);
+                mu_free(rendered);
+                free(got_ids);
+                free(expected_pos);
+                free(got_pos);
+                return 1;
+            }
+            printf("trace text layer01 seq ok\n");
             free(seq_out);
         }
         free(json);
