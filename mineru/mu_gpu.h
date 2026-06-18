@@ -67,6 +67,10 @@ int mu_gpu_vision_add_bf16(mu_gpu *gpu, const float *a, const float *b,
                            int n, float *out);
 int mu_gpu_vision_quick_gelu_bf16(mu_gpu *gpu, const float *x,
                                   int n, float *out);
+int mu_gpu_vision_gelu_bf16(mu_gpu *gpu, const float *x,
+                            int n, float *out);
+int mu_gpu_vision_merge4(mu_gpu *gpu, const float *hidden,
+                         int rows, float *out);
 int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
                          const float *patch_embeds,
                          int rows, int cols,

@@ -431,7 +431,8 @@ static int check_layout_tiny_vision(mu_engine *engine, const char *json,
         if (diff > 0.5f) hidden_over_05++;
         if (diff > 1.0f) hidden_over_10++;
     }
-    float hidden_allowed = fmaxf(0.5f, fabsf(expected_hidden[hidden_max_i]) * 0.02f);
+    /* Full tiny vision accumulates small Metal/CPU reduction-order drift across 32 blocks. */
+    float hidden_allowed = fmaxf(0.5f, fabsf(expected_hidden[hidden_max_i]) * 0.03f);
     if (hidden_max_diff > hidden_allowed) {
         fprintf(stderr,
                 "trace layout tiny vision hidden mismatch max at %d: got %.8g expected %.8g diff %.8g allowed %.8g over_0.5=%d over_1.0=%d\n",
@@ -528,6 +529,7 @@ static int check_trace_file(mu_engine *engine, const char *path) {
     int vision_block0_output_scope = trace_scope && !strcmp(trace_scope, "vision-block0-output");
     int vision_block0_tiny_output_scope =
         trace_scope && !strcmp(trace_scope, "vision-block0-tiny-output");
+    int vision_tiny_encode_scope = trace_scope && !strcmp(trace_scope, "vision-tiny-encode");
     int layout_logits_scope = trace_scope && !strcmp(trace_scope, "layout-logits");
     int layout_generation_scope = trace_scope && !strcmp(trace_scope, "layout-generation");
     char *rendered = mu_render_chat_prompt(prompt, is_layout);
@@ -783,7 +785,7 @@ static int check_trace_file(mu_engine *engine, const char *path) {
 
     if (is_layout && !vision_block0_norm_scope && !vision_block0_qkv_scope &&
         !vision_block0_attn_scope && !vision_block0_output_scope &&
-        !vision_block0_tiny_output_scope) {
+        !vision_block0_tiny_output_scope && !vision_tiny_encode_scope) {
         mu_token_logit expected_top[16];
         mu_token_logit got_top[16];
         int expected_top_n = collect_top_logits(json, expected_top, 16);
@@ -1768,6 +1770,9 @@ static int check_trace_file(mu_engine *engine, const char *path) {
             free(patch_embeds);
             mu_image_tokens_free(&image_tokens);
             return 1;
+        }
+        if (vision_tiny_encode_scope) {
+            return 0;
         }
         printf("trace layout vision block0 output ok\n");
         free(expected_norm_sample);

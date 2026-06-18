@@ -103,3 +103,36 @@ kernel void mu_vision_quick_gelu_bf16(device const float *x [[buffer(0)]],
     float v = x[gid];
     out[gid] = mu_round_bf16(v / (1.0f + exp(-1.702f * v)));
 }
+
+static inline float mu_erf_approx(float x) {
+    float sign = x < 0.0f ? -1.0f : 1.0f;
+    float ax = abs(x);
+    float t = 1.0f / (1.0f + 0.3275911f * ax);
+    float poly = (((((1.061405429f * t - 1.453152027f) * t) +
+                    1.421413741f) * t - 0.284496736f) * t +
+                  0.254829592f) * t;
+    return sign * (1.0f - poly * exp(-ax * ax));
+}
+
+kernel void mu_vision_gelu_bf16(device const float *x [[buffer(0)]],
+                                device float *out [[buffer(1)]],
+                                constant int &n [[buffer(2)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if ((int)gid >= n) return;
+    float v = x[gid];
+    out[gid] = mu_round_bf16(0.5f * v * (1.0f + mu_erf_approx(v * 0.7071067811865476f)));
+}
+
+kernel void mu_vision_merge4(device const float *hidden [[buffer(0)]],
+                             device float *out [[buffer(1)]],
+                             constant int &groups [[buffer(2)]],
+                             uint gid [[thread_position_in_grid]]) {
+    int i = (int)gid;
+    int total = groups * 5120;
+    if (i >= total) return;
+    int group = i / 5120;
+    int col = i - group * 5120;
+    int row_in_group = col / 1280;
+    int inner = col - row_in_group * 1280;
+    out[i] = hidden[((group * 4 + row_in_group) * 1280) + inner];
+}

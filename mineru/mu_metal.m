@@ -28,6 +28,8 @@ struct mu_gpu {
     id<MTLComputePipelineState> vision_attn_concat_probe;
     id<MTLComputePipelineState> vision_add_bf16;
     id<MTLComputePipelineState> vision_quick_gelu_bf16;
+    id<MTLComputePipelineState> vision_gelu_bf16;
+    id<MTLComputePipelineState> vision_merge4;
     char device_name[256];
 };
 
@@ -112,6 +114,10 @@ int mu_gpu_create(mu_gpu **out) {
                                                     @"mu_vision_add_bf16");
         gpu->vision_quick_gelu_bf16 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
                                                            @"mu_vision_quick_gelu_bf16");
+        gpu->vision_gelu_bf16 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
+                                                     @"mu_vision_gelu_bf16");
+        gpu->vision_merge4 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
+                                                  @"mu_vision_merge4");
         const char *name = [[device name] UTF8String];
         if (name) {
             strlcpy(gpu->device_name, name, sizeof(gpu->device_name));
@@ -125,6 +131,8 @@ int mu_gpu_create(mu_gpu **out) {
 
 void mu_gpu_destroy(mu_gpu *gpu) {
     if (!gpu) return;
+    gpu->vision_merge4 = nil;
+    gpu->vision_gelu_bf16 = nil;
     gpu->vision_quick_gelu_bf16 = nil;
     gpu->vision_add_bf16 = nil;
     gpu->vision_attn_concat_probe = nil;
@@ -1181,6 +1189,58 @@ int mu_gpu_vision_quick_gelu_bf16(mu_gpu *gpu, const float *x,
                                   int n, float *out) {
     return mu_gpu_dispatch_vision_unary(gpu, gpu ? gpu->vision_quick_gelu_bf16 : nil,
                                         x, n, out);
+}
+
+int mu_gpu_vision_gelu_bf16(mu_gpu *gpu, const float *x,
+                            int n, float *out) {
+    return mu_gpu_dispatch_vision_unary(gpu, gpu ? gpu->vision_gelu_bf16 : nil,
+                                        x, n, out);
+}
+
+int mu_gpu_vision_merge4(mu_gpu *gpu, const float *hidden,
+                         int rows, float *out) {
+    if (!gpu || !gpu->device || !gpu->queue || !gpu->vision_merge4) return -1;
+    if (!hidden || !out || rows <= 0 || rows % 4 != 0) return -2;
+
+    @autoreleasepool {
+        int groups = rows / 4;
+        NSUInteger in_bytes = (NSUInteger)rows * 1280u * sizeof(float);
+        NSUInteger out_bytes = (NSUInteger)groups * 5120u * sizeof(float);
+        id<MTLBuffer> hidden_buf = [gpu->device newBufferWithBytes:hidden
+                                                            length:in_bytes
+                                                           options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buf = [gpu->device newBufferWithLength:out_bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> groups_buf = [gpu->device newBufferWithBytes:&groups
+                                                            length:sizeof(groups)
+                                                           options:MTLResourceStorageModeShared];
+        if (!hidden_buf || !out_buf || !groups_buf) return -3;
+
+        id<MTLCommandBuffer> command_buffer = [gpu->queue commandBuffer];
+        if (!command_buffer) return -4;
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (!encoder) return -5;
+
+        [encoder setComputePipelineState:gpu->vision_merge4];
+        [encoder setBuffer:hidden_buf offset:0 atIndex:0];
+        [encoder setBuffer:out_buf offset:0 atIndex:1];
+        [encoder setBuffer:groups_buf offset:0 atIndex:2];
+
+        NSUInteger n = (NSUInteger)groups * 5120u;
+        NSUInteger width = gpu->vision_merge4.threadExecutionWidth;
+        if (width < 1) width = 1;
+        if (width > n) width = n;
+        MTLSize grid = MTLSizeMake(n, 1, 1);
+        MTLSize threads = MTLSizeMake(width, 1, 1);
+        [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -6;
+
+        memcpy(out, [out_buf contents], out_bytes);
+    }
+    return 0;
 }
 
 int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
