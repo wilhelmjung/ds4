@@ -49,6 +49,26 @@ kernel void mu_rmsnorm_bf16_probe(device const float *x [[buffer(0)]],
     }
 }
 
+kernel void mu_rmsnorm_bf16_rows(device const float *x [[buffer(0)]],
+                                 device const ushort *weight [[buffer(1)]],
+                                 device float *out [[buffer(2)]],
+                                 constant int &cols [[buffer(3)]],
+                                 constant float &eps [[buffer(4)]],
+                                 uint2 gid [[thread_position_in_grid]]) {
+    int col = (int)gid.x;
+    int row = (int)gid.y;
+    if (col >= cols) return;
+
+    device const float *xr = x + (size_t)row * (size_t)cols;
+    float ss = 0.0f;
+    for (int i = 0; i < cols; i++) {
+        ss += xr[i] * xr[i];
+    }
+    float scale = rsqrt(ss / (float)cols + eps);
+    out[(size_t)row * (size_t)cols + (size_t)col] =
+        xr[col] * scale * mu_bf16_to_f32(weight[col]);
+}
+
 kernel void mu_layernorm_bf16_probe(device const float *x [[buffer(0)]],
                                     device const ushort *weight [[buffer(1)]],
                                     device const ushort *bias [[buffer(2)]],

@@ -55,6 +55,45 @@ kernel void mu_dense_f32_bias_probe(device const float *x [[buffer(0)]],
     out[row] = acc;
 }
 
+kernel void mu_dense_f32_rows(device const float *x [[buffer(0)]],
+                              device const ushort *w [[buffer(1)]],
+                              device float *out [[buffer(2)]],
+                              constant int &cols [[buffer(3)]],
+                              constant int &out_cols [[buffer(4)]],
+                              uint2 gid [[thread_position_in_grid]]) {
+    int out_col = (int)gid.x;
+    int row = (int)gid.y;
+    if (out_col >= out_cols) return;
+
+    device const float *xrow = x + (size_t)row * (size_t)cols;
+    device const ushort *wrow = w + (size_t)out_col * (size_t)cols;
+    float acc = 0.0f;
+    for (int c = 0; c < cols; c++) {
+        acc += xrow[c] * mu_bf16_to_f32(wrow[c]);
+    }
+    out[(size_t)row * (size_t)out_cols + (size_t)out_col] = acc;
+}
+
+kernel void mu_dense_f32_bias_rows(device const float *x [[buffer(0)]],
+                                   device const ushort *w [[buffer(1)]],
+                                   device const ushort *bias [[buffer(2)]],
+                                   device float *out [[buffer(3)]],
+                                   constant int &cols [[buffer(4)]],
+                                   constant int &out_cols [[buffer(5)]],
+                                   uint2 gid [[thread_position_in_grid]]) {
+    int out_col = (int)gid.x;
+    int row = (int)gid.y;
+    if (out_col >= out_cols) return;
+
+    device const float *xrow = x + (size_t)row * (size_t)cols;
+    device const ushort *wrow = w + (size_t)out_col * (size_t)cols;
+    float acc = mu_bf16_to_f32(bias[out_col]);
+    for (int c = 0; c < cols; c++) {
+        acc += xrow[c] * mu_bf16_to_f32(wrow[c]);
+    }
+    out[(size_t)row * (size_t)out_cols + (size_t)out_col] = acc;
+}
+
 kernel void mu_dense_bf16_bias_rows(device const float *x [[buffer(0)]],
                                     device const ushort *w [[buffer(1)]],
                                     device const ushort *bias [[buffer(2)]],

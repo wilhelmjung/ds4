@@ -304,6 +304,44 @@ static int test_mu_gpu_text_attn_token0(void) {
     return 0;
 }
 
+static int test_mu_gpu_text_attn_seq(void) {
+#if defined(__APPLE__)
+    mu_gpu *gpu = NULL;
+    if (mu_gpu_create(&gpu) != 0) return 0;
+    float *q = (float *)calloc(2u * 896u, sizeof(q[0]));
+    float *k = (float *)calloc(2u * 128u, sizeof(k[0]));
+    float *v = (float *)calloc(2u * 128u, sizeof(v[0]));
+    float *out = (float *)calloc(2u * 896u, sizeof(out[0]));
+    if (!q || !k || !v || !out) {
+        free(q); free(k); free(v); free(out);
+        mu_gpu_destroy(gpu);
+        return 250;
+    }
+    for (int i = 0; i < 128; i++) {
+        v[i] = 1.0f;
+        v[128 + i] = 3.0f;
+    }
+    int rc = mu_gpu_text_attn_seq(gpu, q, k, v, 2, out);
+    mu_gpu_destroy(gpu);
+    if (rc != 0) {
+        free(q); free(k); free(v); free(out);
+        return 251;
+    }
+    for (int d = 0; d < 896; d++) {
+        if (!close_enough(out[d], 1.0f, 1e-4f)) {
+            free(q); free(k); free(v); free(out);
+            return 252;
+        }
+        if (!close_enough(out[896 + d], 2.0f, 1e-4f)) {
+            free(q); free(k); free(v); free(out);
+            return 253;
+        }
+    }
+    free(q); free(k); free(v); free(out);
+#endif
+    return 0;
+}
+
 static int test_mu_gpu_add_f32(void) {
 #if defined(__APPLE__)
     mu_gpu *gpu = NULL;
@@ -379,6 +417,33 @@ static int test_mu_gpu_rmsnorm_bf16_probe(void) {
     return 0;
 }
 
+static int test_mu_gpu_rmsnorm_bf16_rows(void) {
+#if defined(__APPLE__)
+    mu_gpu *gpu = NULL;
+    if (mu_gpu_create(&gpu) != 0) return 0;
+    float x[8] = {
+        1.0f, 2.0f, -3.0f, 4.0f,
+        -1.0f, 0.0f, 3.0f, 5.0f,
+    };
+    unsigned short w[4] = {0x3f80, 0x3f00, 0x4000, 0xbf80};
+    float out[8] = {0.0f};
+    int rc = mu_gpu_rmsnorm_bf16_rows(gpu, x, w, 2, 4, 1e-6f, out);
+    mu_gpu_destroy(gpu);
+    if (rc != 0) return 260;
+    for (int row = 0; row < 2; row++) {
+        const float *xr = x + row * 4;
+        float ss = 0.0f;
+        for (int i = 0; i < 4; i++) ss += xr[i] * xr[i];
+        float scale = 1.0f / sqrtf(ss / 4.0f + 1e-6f);
+        for (int i = 0; i < 4; i++) {
+            float expected = xr[i] * scale * mu_bf16_to_f32(w[i]);
+            if (!close_enough(out[row * 4 + i], expected, 1e-4f)) return 261 + row;
+        }
+    }
+#endif
+    return 0;
+}
+
 static int test_mu_gpu_dense_f32_bias_probe(void) {
 #if defined(__APPLE__)
     mu_gpu *gpu = NULL;
@@ -395,6 +460,55 @@ static int test_mu_gpu_dense_f32_bias_probe(void) {
     if (rc != 0) return 210;
     if (!close_enough(out[0], -1.0f, 1e-4f)) return 211;
     if (!close_enough(out[1], -5.0f, 1e-4f)) return 212;
+#endif
+    return 0;
+}
+
+static int test_mu_gpu_dense_f32_rows(void) {
+#if defined(__APPLE__)
+    mu_gpu *gpu = NULL;
+    if (mu_gpu_create(&gpu) != 0) return 0;
+    float x[6] = {
+        1.0f, -2.0f, 0.5f,
+        0.25f, 3.0f, -1.0f,
+    };
+    unsigned short w[6] = {
+        0x3f80, 0x4000, 0x4040,
+        0xbf80, 0x3f80, 0x0000,
+    };
+    float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int rc = mu_gpu_dense_f32_rows(gpu, x, w, 2, 3, 2, out);
+    mu_gpu_destroy(gpu);
+    if (rc != 0) return 270;
+    float expected[4] = {-1.5f, -3.0f, 3.25f, 2.75f};
+    for (int i = 0; i < 4; i++) {
+        if (!close_enough(out[i], expected[i], 1e-4f)) return 271 + i;
+    }
+#endif
+    return 0;
+}
+
+static int test_mu_gpu_dense_f32_bias_rows(void) {
+#if defined(__APPLE__)
+    mu_gpu *gpu = NULL;
+    if (mu_gpu_create(&gpu) != 0) return 0;
+    float x[6] = {
+        1.0f, -2.0f, 0.5f,
+        0.25f, 3.0f, -1.0f,
+    };
+    unsigned short w[6] = {
+        0x3f80, 0x4000, 0x4040,
+        0xbf80, 0x3f80, 0x0000,
+    };
+    unsigned short b[2] = {0x3f00, 0xc000};
+    float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int rc = mu_gpu_dense_f32_bias_rows(gpu, x, w, b, 2, 3, 2, out);
+    mu_gpu_destroy(gpu);
+    if (rc != 0) return 280;
+    float expected[4] = {-1.0f, -5.0f, 3.75f, 0.75f};
+    for (int i = 0; i < 4; i++) {
+        if (!close_enough(out[i], expected[i], 1e-4f)) return 281 + i;
+    }
 #endif
     return 0;
 }
@@ -529,6 +643,11 @@ int main(void) {
         fprintf(stderr, "test_mu_gpu_text_attn_token0 failed: %d\n", rc);
         return rc;
     }
+    rc = test_mu_gpu_text_attn_seq();
+    if (rc) {
+        fprintf(stderr, "test_mu_gpu_text_attn_seq failed: %d\n", rc);
+        return rc;
+    }
     rc = test_mu_gpu_add_f32();
     if (rc) {
         fprintf(stderr, "test_mu_gpu_add_f32 failed: %d\n", rc);
@@ -549,9 +668,24 @@ int main(void) {
         fprintf(stderr, "test_mu_gpu_rmsnorm_bf16_probe failed: %d\n", rc);
         return rc;
     }
+    rc = test_mu_gpu_rmsnorm_bf16_rows();
+    if (rc) {
+        fprintf(stderr, "test_mu_gpu_rmsnorm_bf16_rows failed: %d\n", rc);
+        return rc;
+    }
     rc = test_mu_gpu_dense_f32_bias_probe();
     if (rc) {
         fprintf(stderr, "test_mu_gpu_dense_f32_bias_probe failed: %d\n", rc);
+        return rc;
+    }
+    rc = test_mu_gpu_dense_f32_rows();
+    if (rc) {
+        fprintf(stderr, "test_mu_gpu_dense_f32_rows failed: %d\n", rc);
+        return rc;
+    }
+    rc = test_mu_gpu_dense_f32_bias_rows();
+    if (rc) {
+        fprintf(stderr, "test_mu_gpu_dense_f32_bias_rows failed: %d\n", rc);
         return rc;
     }
     rc = test_mu_gpu_layernorm_bf16_probe();

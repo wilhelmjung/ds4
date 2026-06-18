@@ -2659,6 +2659,9 @@ static void mu_rmsnorm_one_bf16(const float *x, const uint16_t *weight,
 static int mu_linear_one_f32_tmp(const float *x, int in,
                                  const uint16_t *w_bf16, const uint16_t *bias_bf16,
                                  int out_n, float *out, float *w_tmp);
+static void mu_apply_text_rope(float *q, float *k, int seq, const int *position_ids);
+static int mu_text_attention_f32(const float *q, const float *k, const float *v,
+                                 int seq, float *out);
 
 int mu_text_layer0_qkv_token0(mu_engine *e, const int *input_ids, int n_ids,
                               float *out, int out_n) {
@@ -2892,6 +2895,203 @@ cpu_text_layer0_mlp:
     free(mid);
     free(w_tmp);
     return rc == 0 ? 0 : -5;
+}
+
+int mu_text_layer0_mlp_seq(mu_engine *e, const int *input_ids, int n_ids,
+                           float *out, int out_rows, int out_cols) {
+    if (!e || !input_ids || n_ids <= 0 || !out ||
+        out_rows != n_ids || out_cols != 896 || n_ids > 64) {
+        return -1;
+    }
+    const int hidden = 896;
+    const int inter = 4864;
+    const int vocab = 151936;
+    const float eps = 1e-6f;
+    const uint16_t *embed = mu_tensor_bf16(e, "model.embed_tokens.weight", 2, vocab, hidden);
+    const uint16_t *input_norm =
+        mu_tensor_bf16(e, "model.layers.0.input_layernorm.weight", 1, hidden, 0);
+    const uint16_t *post_norm =
+        mu_tensor_bf16(e, "model.layers.0.post_attention_layernorm.weight", 1, hidden, 0);
+    const uint16_t *qw = mu_tensor_bf16(e, "model.layers.0.self_attn.q_proj.weight", 2, hidden, hidden);
+    const uint16_t *qb = mu_tensor_bf16(e, "model.layers.0.self_attn.q_proj.bias", 1, hidden, 0);
+    const uint16_t *kw = mu_tensor_bf16(e, "model.layers.0.self_attn.k_proj.weight", 2, 128, hidden);
+    const uint16_t *kb = mu_tensor_bf16(e, "model.layers.0.self_attn.k_proj.bias", 1, 128, 0);
+    const uint16_t *vw = mu_tensor_bf16(e, "model.layers.0.self_attn.v_proj.weight", 2, 128, hidden);
+    const uint16_t *vb = mu_tensor_bf16(e, "model.layers.0.self_attn.v_proj.bias", 1, 128, 0);
+    const uint16_t *ow = mu_tensor_bf16(e, "model.layers.0.self_attn.o_proj.weight", 2, hidden, hidden);
+    const uint16_t *gate_w = mu_tensor_bf16(e, "model.layers.0.mlp.gate_proj.weight", 2, inter, hidden);
+    const uint16_t *up_w = mu_tensor_bf16(e, "model.layers.0.mlp.up_proj.weight", 2, inter, hidden);
+    const uint16_t *down_w = mu_tensor_bf16(e, "model.layers.0.mlp.down_proj.weight", 2, hidden, inter);
+    if (!embed || !input_norm || !post_norm || !qw || !qb || !kw || !kb || !vw || !vb ||
+        !ow || !gate_w || !up_w || !down_w) {
+        return -2;
+    }
+
+    float *hidden_states = (float *)malloc((size_t)n_ids * hidden * sizeof(hidden_states[0]));
+    if (!hidden_states) return -3;
+    for (int s = 0; s < n_ids; s++) {
+        int id = input_ids[s];
+        if (id < 0 || id >= vocab) {
+            free(hidden_states);
+            return -4;
+        }
+        const uint16_t *row = embed + (size_t)id * hidden;
+        for (int i = 0; i < hidden; i++) {
+            hidden_states[(size_t)s * hidden + i] = mu_bf16_to_f32(row[i]);
+        }
+    }
+
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        float *normed = (float *)malloc((size_t)n_ids * hidden * sizeof(normed[0]));
+        float *q = (float *)malloc((size_t)n_ids * hidden * sizeof(q[0]));
+        float *k = (float *)malloc((size_t)n_ids * 128u * sizeof(k[0]));
+        float *v = (float *)malloc((size_t)n_ids * 128u * sizeof(v[0]));
+        float *attn = (float *)malloc((size_t)n_ids * hidden * sizeof(attn[0]));
+        float *proj = (float *)malloc((size_t)n_ids * hidden * sizeof(proj[0]));
+        float *attn_residual = (float *)malloc((size_t)n_ids * hidden * sizeof(attn_residual[0]));
+        float *gate = (float *)malloc((size_t)n_ids * inter * sizeof(gate[0]));
+        float *up = (float *)malloc((size_t)n_ids * inter * sizeof(up[0]));
+        float *mid = (float *)malloc((size_t)n_ids * inter * sizeof(mid[0]));
+        if (!normed || !q || !k || !v || !attn || !proj || !attn_residual ||
+            !gate || !up || !mid) {
+            free(normed); free(q); free(k); free(v); free(attn); free(proj);
+            free(attn_residual); free(gate); free(up); free(mid);
+            int frc = mu_record_cpu_fallback(e, "text_layer0_seq_alloc");
+            if (frc) {
+                free(hidden_states);
+                return frc;
+            }
+            goto cpu_text_layer0_seq;
+        }
+        int rc = mu_gpu_rmsnorm_bf16_rows(e->gpu, hidden_states,
+                                          (const unsigned short *)input_norm,
+                                          n_ids, hidden, eps, normed);
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_seq_input_norm");
+            rc = mu_gpu_dense_f32_bias_rows(e->gpu, normed,
+                                            (const unsigned short *)qw,
+                                            (const unsigned short *)qb,
+                                            n_ids, hidden, hidden, q);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_seq_q_proj");
+            rc = mu_gpu_dense_f32_bias_rows(e->gpu, normed,
+                                            (const unsigned short *)kw,
+                                            (const unsigned short *)kb,
+                                            n_ids, hidden, 128, k);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_seq_k_proj");
+            rc = mu_gpu_dense_f32_bias_rows(e->gpu, normed,
+                                            (const unsigned short *)vw,
+                                            (const unsigned short *)vb,
+                                            n_ids, hidden, 128, v);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_seq_v_proj");
+            rc = mu_gpu_text_attn_seq(e->gpu, q, k, v, n_ids, attn);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_seq_attn");
+            rc = mu_gpu_dense_f32_rows(e->gpu, attn, (const unsigned short *)ow,
+                                       n_ids, hidden, hidden, proj);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_seq_o_proj");
+            rc = mu_gpu_add_f32(e->gpu, hidden_states, proj,
+                                n_ids * hidden, attn_residual);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_seq_attn_residual");
+            rc = mu_gpu_rmsnorm_bf16_rows(e->gpu, attn_residual,
+                                          (const unsigned short *)post_norm,
+                                          n_ids, hidden, eps, normed);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_seq_post_norm");
+            rc = mu_gpu_dense_f32_rows(e->gpu, normed, (const unsigned short *)gate_w,
+                                       n_ids, hidden, inter, gate);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_seq_gate_proj");
+            rc = mu_gpu_dense_f32_rows(e->gpu, normed, (const unsigned short *)up_w,
+                                       n_ids, hidden, inter, up);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_seq_up_proj");
+            rc = mu_gpu_silu_mul_f32(e->gpu, gate, up, n_ids * inter, mid);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_seq_silu_mul");
+            rc = mu_gpu_dense_f32_rows(e->gpu, mid, (const unsigned short *)down_w,
+                                       n_ids, inter, hidden, proj);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_seq_down_proj");
+            rc = mu_gpu_add_f32(e->gpu, attn_residual, proj, n_ids * hidden, out);
+        }
+        free(normed); free(q); free(k); free(v); free(attn); free(proj);
+        free(attn_residual); free(gate); free(up); free(mid);
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_seq_mlp_residual");
+            free(hidden_states);
+            return 0;
+        }
+        rc = mu_record_cpu_fallback(e, "text_layer0_seq");
+        if (rc) {
+            free(hidden_states);
+            return rc;
+        }
+    }
+#endif
+
+cpu_text_layer0_seq:
+    ;
+    float *residual = (float *)malloc((size_t)n_ids * hidden * sizeof(residual[0]));
+    float *normed = (float *)malloc((size_t)n_ids * hidden * sizeof(normed[0]));
+    float *q = (float *)malloc((size_t)n_ids * hidden * sizeof(q[0]));
+    float *k = (float *)malloc((size_t)n_ids * 128u * sizeof(k[0]));
+    float *v = (float *)malloc((size_t)n_ids * 128u * sizeof(v[0]));
+    float *attn = (float *)malloc((size_t)n_ids * hidden * sizeof(attn[0]));
+    float *proj = (float *)malloc((size_t)n_ids * hidden * sizeof(proj[0]));
+    float *gate = (float *)malloc((size_t)n_ids * inter * sizeof(gate[0]));
+    float *up = (float *)malloc((size_t)n_ids * inter * sizeof(up[0]));
+    float *mid = (float *)malloc((size_t)n_ids * inter * sizeof(mid[0]));
+    float *w_tmp = (float *)malloc((size_t)inter * hidden * sizeof(w_tmp[0]));
+    if (!residual || !normed || !q || !k || !v || !attn || !proj ||
+        !gate || !up || !mid || !w_tmp) {
+        free(hidden_states); free(residual); free(normed); free(q); free(k); free(v);
+        free(attn); free(proj); free(gate); free(up); free(mid); free(w_tmp);
+        return -5;
+    }
+    memcpy(residual, hidden_states, (size_t)n_ids * hidden * sizeof(residual[0]));
+    mu_rmsnorm_seq_bf16(hidden_states, input_norm, n_ids, hidden, eps, normed);
+    int rc = mu_linear_seq_f32(normed, n_ids, hidden, qw, qb, hidden, q, w_tmp);
+    if (rc == 0) rc = mu_linear_seq_f32(normed, n_ids, hidden, kw, kb, 128, k, w_tmp);
+    if (rc == 0) rc = mu_linear_seq_f32(normed, n_ids, hidden, vw, vb, 128, v, w_tmp);
+    if (rc == 0) {
+        mu_apply_text_rope(q, k, n_ids, NULL);
+        rc = mu_text_attention_f32(q, k, v, n_ids, attn);
+    }
+    if (rc == 0) rc = mu_linear_seq_f32(attn, n_ids, hidden, ow, NULL, hidden, proj, w_tmp);
+    if (rc == 0) {
+        for (int i = 0; i < n_ids * hidden; i++) hidden_states[i] = residual[i] + proj[i];
+        memcpy(residual, hidden_states, (size_t)n_ids * hidden * sizeof(residual[0]));
+        mu_rmsnorm_seq_bf16(hidden_states, post_norm, n_ids, hidden, eps, normed);
+        rc = mu_linear_seq_f32(normed, n_ids, hidden, gate_w, NULL, inter, gate, w_tmp);
+    }
+    if (rc == 0) rc = mu_linear_seq_f32(normed, n_ids, hidden, up_w, NULL, inter, up, w_tmp);
+    if (rc == 0) {
+        for (int i = 0; i < n_ids * inter; i++) mid[i] = mu_silu_f32(gate[i]) * up[i];
+        rc = mu_linear_seq_f32(mid, n_ids, inter, down_w, NULL, hidden, proj, w_tmp);
+    }
+    if (rc == 0) {
+        for (int i = 0; i < n_ids * hidden; i++) out[i] = residual[i] + proj[i];
+    }
+    free(hidden_states); free(residual); free(normed); free(q); free(k); free(v);
+    free(attn); free(proj); free(gate); free(up); free(mid); free(w_tmp);
+    return rc == 0 ? 0 : -6;
 }
 
 static int mu_rope_axis_for_dim(int d) {

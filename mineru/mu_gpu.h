@@ -20,6 +20,15 @@ int mu_gpu_dense_f32_bias_probe(mu_gpu *gpu, const float *x,
                                 const unsigned short *w_bf16,
                                 const unsigned short *bias_bf16,
                                 int rows, int cols, float *out);
+int mu_gpu_dense_f32_rows(mu_gpu *gpu, const float *x,
+                          const unsigned short *w_bf16,
+                          int x_rows, int cols, int out_cols,
+                          float *out);
+int mu_gpu_dense_f32_bias_rows(mu_gpu *gpu, const float *x,
+                               const unsigned short *w_bf16,
+                               const unsigned short *bias_bf16,
+                               int x_rows, int cols, int out_cols,
+                               float *out);
 int mu_gpu_dense_bf16_bias_rows(mu_gpu *gpu, const float *x,
                                 const unsigned short *w_bf16,
                                 const unsigned short *bias_bf16,
@@ -30,6 +39,9 @@ int mu_gpu_rmsnorm_probe(mu_gpu *gpu, const float *x, const float *weight,
 int mu_gpu_rmsnorm_bf16_probe(mu_gpu *gpu, const float *x,
                               const unsigned short *weight_bf16,
                               int n, float eps, float *out);
+int mu_gpu_rmsnorm_bf16_rows(mu_gpu *gpu, const float *x,
+                             const unsigned short *weight_bf16,
+                             int rows, int cols, float eps, float *out);
 int mu_gpu_layernorm_bf16_probe(mu_gpu *gpu, const float *x,
                                 const unsigned short *weight_bf16,
                                 const unsigned short *bias_bf16,
@@ -42,6 +54,8 @@ int mu_gpu_vision_attn_concat_probe(mu_gpu *gpu, const float *q0,
                                     const float *kv, const float *rotary,
                                     int rows, int token_index, float *out);
 int mu_gpu_text_attn_token0(mu_gpu *gpu, const float *v, float *out);
+int mu_gpu_text_attn_seq(mu_gpu *gpu, const float *q, const float *k,
+                         const float *v, int seq, float *out);
 int mu_gpu_add_f32(mu_gpu *gpu, const float *a, const float *b,
                    int n, float *out);
 int mu_gpu_silu_mul_f32(mu_gpu *gpu, const float *gate, const float *up,
