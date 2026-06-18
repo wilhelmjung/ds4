@@ -303,6 +303,46 @@ static int test_mu_gpu_rmsnorm_probe(void) {
     return 0;
 }
 
+static int test_mu_gpu_rmsnorm_bf16_probe(void) {
+#if defined(__APPLE__)
+    mu_gpu *gpu = NULL;
+    if (mu_gpu_create(&gpu) != 0) return 0;
+    float x[4] = {1.0f, 2.0f, -3.0f, 4.0f};
+    unsigned short w[4] = {0x3f80, 0x3f00, 0x4000, 0xbf80};
+    float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    int rc = mu_gpu_rmsnorm_bf16_probe(gpu, x, w, 4, 1e-6f, out);
+    mu_gpu_destroy(gpu);
+    if (rc != 0) return 200;
+    float ss = 1.0f + 4.0f + 9.0f + 16.0f;
+    float scale = 1.0f / sqrtf(ss / 4.0f + 1e-6f);
+    for (int i = 0; i < 4; i++) {
+        float expected = x[i] * scale * mu_bf16_to_f32(w[i]);
+        if (!close_enough(out[i], expected, 1e-4f)) return 201 + i;
+    }
+#endif
+    return 0;
+}
+
+static int test_mu_gpu_dense_f32_bias_probe(void) {
+#if defined(__APPLE__)
+    mu_gpu *gpu = NULL;
+    if (mu_gpu_create(&gpu) != 0) return 0;
+    float x[3] = {1.0f, -2.0f, 0.5f};
+    unsigned short w[6] = {
+        0x3f80, 0x4000, 0x4040,
+        0xbf80, 0x3f80, 0x0000,
+    };
+    unsigned short b[2] = {0x3f00, 0xc000};
+    float out[2] = {0.0f, 0.0f};
+    int rc = mu_gpu_dense_f32_bias_probe(gpu, x, w, b, 2, 3, out);
+    mu_gpu_destroy(gpu);
+    if (rc != 0) return 210;
+    if (!close_enough(out[0], -1.0f, 1e-4f)) return 211;
+    if (!close_enough(out[1], -5.0f, 1e-4f)) return 212;
+#endif
+    return 0;
+}
+
 static int test_mu_gpu_layernorm_bf16_probe(void) {
 #if defined(__APPLE__)
     mu_gpu *gpu = NULL;
@@ -431,6 +471,16 @@ int main(void) {
     rc = test_mu_gpu_rmsnorm_probe();
     if (rc) {
         fprintf(stderr, "test_mu_gpu_rmsnorm_probe failed: %d\n", rc);
+        return rc;
+    }
+    rc = test_mu_gpu_rmsnorm_bf16_probe();
+    if (rc) {
+        fprintf(stderr, "test_mu_gpu_rmsnorm_bf16_probe failed: %d\n", rc);
+        return rc;
+    }
+    rc = test_mu_gpu_dense_f32_bias_probe();
+    if (rc) {
+        fprintf(stderr, "test_mu_gpu_dense_f32_bias_probe failed: %d\n", rc);
         return rc;
     }
     rc = test_mu_gpu_layernorm_bf16_probe();

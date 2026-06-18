@@ -2656,6 +2656,82 @@ static void mu_rmsnorm_one_bf16(const float *x, const uint16_t *weight,
     for (int i = 0; i < hidden; i++) out[i] = x[i] * inv * mu_bf16_to_f32(weight[i]);
 }
 
+static int mu_linear_one_f32_tmp(const float *x, int in,
+                                 const uint16_t *w_bf16, const uint16_t *bias_bf16,
+                                 int out_n, float *out, float *w_tmp);
+
+int mu_text_layer0_qkv_token0(mu_engine *e, const int *input_ids, int n_ids,
+                              float *out, int out_n) {
+    if (!e || !input_ids || n_ids <= 0 || !out || out_n != 1152) return -1;
+    const int hidden = 896;
+    const int vocab = 151936;
+    const int q_out = 896;
+    const int kv_out = 128;
+    const float eps = 1e-6f;
+    const uint16_t *embed = mu_tensor_bf16(e, "model.embed_tokens.weight", 2, vocab, hidden);
+    const uint16_t *input_norm =
+        mu_tensor_bf16(e, "model.layers.0.input_layernorm.weight", 1, hidden, 0);
+    const uint16_t *qw = mu_tensor_bf16(e, "model.layers.0.self_attn.q_proj.weight", 2, q_out, hidden);
+    const uint16_t *qb = mu_tensor_bf16(e, "model.layers.0.self_attn.q_proj.bias", 1, q_out, 0);
+    const uint16_t *kw = mu_tensor_bf16(e, "model.layers.0.self_attn.k_proj.weight", 2, kv_out, hidden);
+    const uint16_t *kb = mu_tensor_bf16(e, "model.layers.0.self_attn.k_proj.bias", 1, kv_out, 0);
+    const uint16_t *vw = mu_tensor_bf16(e, "model.layers.0.self_attn.v_proj.weight", 2, kv_out, hidden);
+    const uint16_t *vb = mu_tensor_bf16(e, "model.layers.0.self_attn.v_proj.bias", 1, kv_out, 0);
+    if (!embed || !input_norm || !qw || !qb || !kw || !kb || !vw || !vb) return -2;
+    int token = input_ids[0];
+    if (token < 0 || token >= vocab) return -3;
+    const uint16_t *row = embed + (size_t)token * hidden;
+    float hidden_state[896];
+    for (int i = 0; i < hidden; i++) hidden_state[i] = mu_bf16_to_f32(row[i]);
+
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        float normed_m[896];
+        int rc = mu_gpu_rmsnorm_bf16_probe(e->gpu, hidden_state,
+                                           (const unsigned short *)input_norm,
+                                           hidden, eps, normed_m);
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_input_norm");
+            rc = mu_gpu_dense_f32_bias_probe(e->gpu, normed_m,
+                                             (const unsigned short *)qw,
+                                             (const unsigned short *)qb,
+                                             q_out, hidden, out);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_q_proj");
+            rc = mu_gpu_dense_f32_bias_probe(e->gpu, normed_m,
+                                             (const unsigned short *)kw,
+                                             (const unsigned short *)kb,
+                                             kv_out, hidden, out + q_out);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_k_proj");
+            rc = mu_gpu_dense_f32_bias_probe(e->gpu, normed_m,
+                                             (const unsigned short *)vw,
+                                             (const unsigned short *)vb,
+                                             kv_out, hidden, out + q_out + kv_out);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_layer0_v_proj");
+            return 0;
+        }
+        rc = mu_record_cpu_fallback(e, "text_layer0_qkv");
+        if (rc) return rc;
+    }
+#endif
+
+    float normed[896];
+    float *w_tmp = (float *)malloc((size_t)q_out * hidden * sizeof(w_tmp[0]));
+    if (!w_tmp) return -4;
+    mu_rmsnorm_one_bf16(hidden_state, input_norm, hidden, eps, normed);
+    int rc = mu_linear_one_f32_tmp(normed, hidden, qw, qb, q_out, out, w_tmp);
+    if (rc == 0) rc = mu_linear_one_f32_tmp(normed, hidden, kw, kb, kv_out, out + q_out, w_tmp);
+    if (rc == 0) rc = mu_linear_one_f32_tmp(normed, hidden, vw, vb, kv_out,
+                                            out + q_out + kv_out, w_tmp);
+    free(w_tmp);
+    return rc == 0 ? 0 : -5;
+}
+
 static int mu_rope_axis_for_dim(int d) {
     if (d < 8) return 0;
     if (d < 20) return 1;
@@ -2954,6 +3030,12 @@ fail:
 int mu_text_top_logits(mu_engine *e, const int *input_ids, int n_ids,
                        int top_k, mu_token_logit *out) {
     if (!e || !input_ids || n_ids <= 0 || top_k <= 0 || !out) return -1;
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        int rc = mu_record_cpu_fallback(e, "text_logits");
+        if (rc) return rc;
+    }
+#endif
     const int hidden = 896;
     const int inter = 4864;
     const int vocab = 151936;
@@ -3075,6 +3157,12 @@ fail:
 int mu_text_generate_greedy(mu_engine *e, const int *input_ids, int n_ids,
                             int max_new_tokens, int *out) {
     if (!e || !input_ids || n_ids <= 0 || max_new_tokens <= 0 || !out) return -1;
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        int rc = mu_record_cpu_fallback(e, "text_generate");
+        if (rc) return rc;
+    }
+#endif
     int cap = n_ids + max_new_tokens;
     int *ids = (int *)malloc((size_t)cap * sizeof(ids[0]));
     if (!ids) return -2;
@@ -3109,6 +3197,12 @@ int mu_text_top_logits_with_image_embeds(mu_engine *e, const int *input_ids, int
         n_image_embeds <= 0 || top_k <= 0 || !out) {
         return -1;
     }
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        int rc = mu_record_cpu_fallback(e, "text_logits");
+        if (rc) return rc;
+    }
+#endif
     const int hidden = 896;
     const int vocab = 151936;
     const uint16_t *embed = mu_tensor_bf16(e, "model.embed_tokens.weight", 2, vocab, hidden);

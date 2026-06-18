@@ -114,6 +114,8 @@ int mu_vision_encode_hidden(mu_engine *e, const float *patch_embeds,
                             float *out, int out_rows, int out_cols);
 int mu_text_top_logits(mu_engine *e, const int *input_ids, int n_ids,
                        int top_k, mu_token_logit *out);
+int mu_text_layer0_qkv_token0(mu_engine *e, const int *input_ids, int n_ids,
+                              float *out, int out_n);
 int mu_text_generate_greedy(mu_engine *e, const int *input_ids, int n_ids,
                             int max_new_tokens, int *out);
 int mu_text_top_logits_with_image_embeds(mu_engine *e, const int *input_ids, int n_ids,

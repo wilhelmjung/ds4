@@ -16,6 +16,10 @@ int mu_gpu_dense_bf16_bias_probe(mu_gpu *gpu, const float *x,
                                  const unsigned short *w_bf16,
                                  const unsigned short *bias_bf16,
                                  int rows, int cols, float *out);
+int mu_gpu_dense_f32_bias_probe(mu_gpu *gpu, const float *x,
+                                const unsigned short *w_bf16,
+                                const unsigned short *bias_bf16,
+                                int rows, int cols, float *out);
 int mu_gpu_dense_bf16_bias_rows(mu_gpu *gpu, const float *x,
                                 const unsigned short *w_bf16,
                                 const unsigned short *bias_bf16,
@@ -23,6 +27,9 @@ int mu_gpu_dense_bf16_bias_rows(mu_gpu *gpu, const float *x,
                                 float *out);
 int mu_gpu_rmsnorm_probe(mu_gpu *gpu, const float *x, const float *weight,
                          int n, float eps, float *out);
+int mu_gpu_rmsnorm_bf16_probe(mu_gpu *gpu, const float *x,
+                              const unsigned short *weight_bf16,
+                              int n, float eps, float *out);
 int mu_gpu_layernorm_bf16_probe(mu_gpu *gpu, const float *x,
                                 const unsigned short *weight_bf16,
                                 const unsigned short *bias_bf16,

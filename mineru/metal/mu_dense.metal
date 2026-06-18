@@ -42,6 +42,19 @@ kernel void mu_dense_bf16_bias_probe(device const float *x [[buffer(0)]],
     out[row] = mu_round_bf16(acc);
 }
 
+kernel void mu_dense_f32_bias_probe(device const float *x [[buffer(0)]],
+                                    device const ushort *w [[buffer(1)]],
+                                    device const ushort *bias [[buffer(2)]],
+                                    device float *out [[buffer(3)]],
+                                    constant int &cols [[buffer(4)]],
+                                    uint row [[thread_position_in_grid]]) {
+    float acc = mu_bf16_to_f32(bias[row]);
+    for (int c = 0; c < cols; c++) {
+        acc += x[c] * mu_bf16_to_f32(w[row * cols + c]);
+    }
+    out[row] = acc;
+}
+
 kernel void mu_dense_bf16_bias_rows(device const float *x [[buffer(0)]],
                                     device const ushort *w [[buffer(1)]],
                                     device const ushort *bias [[buffer(2)]],
