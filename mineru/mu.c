@@ -2383,6 +2383,19 @@ static int mu_vision_block_output_all_layer(mu_engine *e, int layer,
         layer < 0 || layer >= e->cfg.vision_layers) {
         return -1;
     }
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available &&
+        layer == 0 && rows <= 16) {
+        for (int r = 0; r < rows; r++) {
+            int rc = mu_vision_block0_output_token(e, patch_embeds, rows, cols,
+                                                   rotary, rotary_rows, rotary_cols,
+                                                   r, out + (size_t)r * 1280u, 1280);
+            if (rc) return rc;
+        }
+        mu_record_metal_stage(e, "vision_block0_output_all_rows");
+        return 0;
+    }
+#endif
     const uint16_t *norm1_w = mu_vision_block_tensor_bf16(e, layer, "norm1.weight", 1, 1280, 0);
     const uint16_t *norm1_b = mu_vision_block_tensor_bf16(e, layer, "norm1.bias", 1, 1280, 0);
     const uint16_t *qkv_w = mu_vision_block_tensor_bf16(e, layer, "attn.qkv.weight", 2, 3840, 1280);

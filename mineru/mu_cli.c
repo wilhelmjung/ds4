@@ -519,6 +519,8 @@ static int check_trace_file(mu_engine *engine, const char *path) {
     int vision_block0_qkv_scope = trace_scope && !strcmp(trace_scope, "vision-block0-qkv");
     int vision_block0_attn_scope = trace_scope && !strcmp(trace_scope, "vision-block0-attn");
     int vision_block0_output_scope = trace_scope && !strcmp(trace_scope, "vision-block0-output");
+    int vision_block0_tiny_output_scope =
+        trace_scope && !strcmp(trace_scope, "vision-block0-tiny-output");
     char *rendered = mu_render_chat_prompt(prompt, is_layout);
     if (!rendered || strcmp(rendered, expected_chat) != 0) {
         fprintf(stderr, "trace %s chat mismatch\n", mode);
@@ -648,7 +650,8 @@ static int check_trace_file(mu_engine *engine, const char *path) {
     printf("trace %s positions ok\n", mode);
 
     if (is_layout && !vision_block0_norm_scope && !vision_block0_qkv_scope &&
-        !vision_block0_attn_scope && !vision_block0_output_scope) {
+        !vision_block0_attn_scope && !vision_block0_output_scope &&
+        !vision_block0_tiny_output_scope) {
         mu_token_logit expected_top[16];
         mu_token_logit got_top[16];
         int expected_top_n = collect_top_logits(json, expected_top, 16);
@@ -1572,6 +1575,9 @@ static int check_trace_file(mu_engine *engine, const char *path) {
             free(patch_embeds);
             mu_image_tokens_free(&image_tokens);
             return 1;
+        }
+        if (vision_block0_tiny_output_scope) {
+            return 0;
         }
         if (check_layout_tiny_vision(engine, json,
                                      patch_embeds, expected_patch_shape[0],
