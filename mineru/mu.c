@@ -3663,12 +3663,6 @@ fail:
 int mu_text_top_logits(mu_engine *e, const int *input_ids, int n_ids,
                        int top_k, mu_token_logit *out) {
     if (!e || !input_ids || n_ids <= 0 || top_k <= 0 || !out) return -1;
-#if defined(__APPLE__)
-    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
-        int rc = mu_record_cpu_fallback(e, "text_logits");
-        if (rc) return rc;
-    }
-#endif
     const int hidden = 896;
     const int inter = 4864;
     const int vocab = 151936;
@@ -3683,6 +3677,48 @@ int mu_text_top_logits(mu_engine *e, const int *input_ids, int n_ids,
     const uint16_t *embed = mu_tensor_bf16(e, "model.embed_tokens.weight", 2, vocab, hidden);
     const uint16_t *final_norm = mu_tensor_bf16(e, "model.norm.weight", 1, hidden, 0);
     if (!embed || !final_norm) return -2;
+
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        float *hidden_states =
+            (float *)malloc((size_t)n_ids * hidden * sizeof(hidden_states[0]));
+        float *last_norm = (float *)malloc((size_t)hidden * sizeof(last_norm[0]));
+        float *logits = (float *)malloc((size_t)vocab * sizeof(logits[0]));
+        int rc = 0;
+        if (!hidden_states || !last_norm || !logits) {
+            rc = -3;
+        }
+        if (rc == 0) {
+            rc = mu_text_layers_mlp_seq(e, input_ids, n_ids, e->cfg.text_layers,
+                                        hidden_states, n_ids, hidden);
+        }
+        if (rc == 0) {
+            rc = mu_gpu_rmsnorm_bf16_rows(e->gpu,
+                                          hidden_states + (size_t)(n_ids - 1) * hidden,
+                                          (const unsigned short *)final_norm,
+                                          1, hidden, eps, last_norm);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_final_norm");
+            rc = mu_gpu_dense_f32_rows(e->gpu, last_norm,
+                                       (const unsigned short *)embed,
+                                       1, hidden, vocab, logits);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_logits");
+            for (int id = 0; id < vocab; id++) {
+                float logit = mu_bf16_to_f32(mu_f32_to_bf16(logits[id]));
+                mu_topk_insert(out, top_k, id, logit);
+            }
+        }
+        free(hidden_states);
+        free(last_norm);
+        free(logits);
+        if (rc == 0) return top_k;
+        rc = mu_record_cpu_fallback(e, "text_logits");
+        if (rc) return rc;
+    }
+#endif
 
     float *hidden_states = (float *)malloc((size_t)n_ids * hidden * sizeof(float));
     float *residual = (float *)malloc((size_t)n_ids * hidden * sizeof(float));

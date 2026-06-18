@@ -515,6 +515,7 @@ static int check_trace_file(mu_engine *engine, const char *path) {
 
     int is_layout = strcmp(mode, "layout") == 0;
     const char *trace_scope = getenv("MU_CHECK_TRACE_SCOPE");
+    int text_logits_scope = trace_scope && !strcmp(trace_scope, "text-logits");
     int text_layer0_qkv_scope = trace_scope && !strcmp(trace_scope, "text-layer0-qkv");
     int text_layer0_attn_scope = trace_scope && !strcmp(trace_scope, "text-layer0-attn");
     int text_layer0_mlp_scope = trace_scope && !strcmp(trace_scope, "text-layer0-mlp");
@@ -1049,6 +1050,15 @@ static int check_trace_file(mu_engine *engine, const char *path) {
             return 1;
         }
         printf("trace text logits ok\n");
+        if (text_logits_scope) {
+            free(json);
+            free(mode);
+            free(prompt);
+            free(expected_chat);
+            mu_free(rendered);
+            free(got_ids);
+            return 0;
+        }
 
         int *expected_gen = NULL;
         int expected_gen_n = 0;
