@@ -3315,6 +3315,56 @@ int mu_text_layer01_mlp_seq(mu_engine *e, const int *input_ids, int n_ids,
     return rc == 0 ? 0 : -3;
 }
 
+int mu_text_layers_mlp_seq(mu_engine *e, const int *input_ids, int n_ids,
+                           int n_layers, float *out, int out_rows, int out_cols) {
+    if (!e || !input_ids || n_ids <= 0 || n_ids > 64 || n_layers <= 0 ||
+        n_layers > e->cfg.text_layers || !out || out_rows != n_ids ||
+        out_cols != 896) {
+        return -1;
+    }
+    const int hidden = 896;
+    const int vocab = 151936;
+    const uint16_t *embed = mu_tensor_bf16(e, "model.embed_tokens.weight", 2, vocab, hidden);
+    if (!embed) return -2;
+
+    float *a = (float *)malloc((size_t)n_ids * hidden * sizeof(a[0]));
+    float *b = (float *)malloc((size_t)n_ids * hidden * sizeof(b[0]));
+    if (!a || !b) {
+        free(a);
+        free(b);
+        return -3;
+    }
+    for (int s = 0; s < n_ids; s++) {
+        int id = input_ids[s];
+        if (id < 0 || id >= vocab) {
+            free(a);
+            free(b);
+            return -4;
+        }
+        const uint16_t *row = embed + (size_t)id * hidden;
+        for (int i = 0; i < hidden; i++) {
+            a[(size_t)s * hidden + i] = mu_bf16_to_f32(row[i]);
+        }
+    }
+
+    float *src = a;
+    float *dst = b;
+    int rc = 0;
+    for (int layer = 0; layer < n_layers; layer++) {
+        rc = mu_text_layer_mlp_seq_from_hidden(e, layer, src, n_ids, dst);
+        if (rc != 0) break;
+        float *tmp = src;
+        src = dst;
+        dst = tmp;
+    }
+    if (rc == 0) {
+        memcpy(out, src, (size_t)n_ids * hidden * sizeof(out[0]));
+    }
+    free(a);
+    free(b);
+    return rc == 0 ? 0 : -5;
+}
+
 static int mu_rope_axis_for_dim(int d) {
     if (d < 8) return 0;
     if (d < 20) return 1;
