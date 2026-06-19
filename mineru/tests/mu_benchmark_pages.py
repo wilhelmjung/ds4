@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -17,6 +18,10 @@ ROOT = Path(__file__).resolve().parents[2]
 MU = ROOT / "mu"
 PDF = Path("/Users/will/github/mineru-model/testdata/nasa_systems_engineering_handbook_rev2.pdf")
 DEFAULT_PAGES = [224, 234, 237, 241, 244, 247, 258, 281, 303, 334]
+TIMING_RE = re.compile(
+    r"^mu_timing\s+stage=([A-Za-z0-9_.:-]+)\s+seconds=([0-9]+(?:\.[0-9]+)?)$",
+    re.MULTILINE,
+)
 
 
 def parse_pages(text: str) -> list[int]:
@@ -38,6 +43,14 @@ def render_page(page_number: int, out_path: Path) -> None:
     Image.frombytes("RGB", [pix.width, pix.height], pix.samples).save(out_path)
 
 
+def parse_stage_timings(stderr: str) -> dict[str, float]:
+    timings: dict[str, float] = {}
+    for match in TIMING_RE.finditer(stderr):
+        stage = match.group(1)
+        timings[stage] = timings.get(stage, 0.0) + float(match.group(2))
+    return timings
+
+
 def run_one(
     backend: str,
     image: Path,
@@ -48,6 +61,7 @@ def run_one(
     output_dir: Path | None = None,
     page: int | None = None,
     content_max_new_tokens: int | None = None,
+    timing: bool = False,
 ) -> dict:
     cmd = [str(MU), "--backend", backend]
     if backend == "metal":
@@ -60,9 +74,12 @@ def run_one(
 
     start = time.perf_counter()
     env = None
-    if content_max_new_tokens is not None:
+    if content_max_new_tokens is not None or timing:
         env = os.environ.copy()
+    if content_max_new_tokens is not None:
         env["MU_CONTENT_MAX_NEW_TOKENS"] = str(content_max_new_tokens)
+    if timing:
+        env["MU_TIMING"] = "1"
     try:
         result = subprocess.run(
             cmd,
@@ -95,6 +112,7 @@ def run_one(
         }
     elapsed = time.perf_counter() - start
     fallback_detected = "fallback" in result.stderr.lower()
+    stage_timings = parse_stage_timings(result.stderr)
     row = {
         "seconds": elapsed,
         "command": cmd,
@@ -103,6 +121,8 @@ def run_one(
         "fallback_detected": fallback_detected,
         "stderr_tail": result.stderr[-4000:],
     }
+    if stage_timings:
+        row["stage_timings"] = stage_timings
     if result.returncode != 0:
         row["error"] = f"mu exited with {result.returncode}"
         row["stdout_tail"] = result.stdout[-4000:]
@@ -130,14 +150,25 @@ def summarize(args: argparse.Namespace, rows: list[dict]) -> dict:
     completed = [r for r in rows if r.get("returncode") == 0 and "error" not in r]
     total = sum(float(r["seconds"]) for r in completed)
     mean = total / len(completed) if completed else 0.0
+    timing_sums: dict[str, float] = {}
+    timing_counts: dict[str, int] = {}
+    for row in completed:
+        for stage, seconds in dict(row.get("stage_timings") or {}).items():
+            timing_sums[stage] = timing_sums.get(stage, 0.0) + float(seconds)
+            timing_counts[stage] = timing_counts.get(stage, 0) + 1
     return {
         "backend": args.backend,
         "pages": args.pages,
         "max_new_tokens": args.max_new_tokens,
         "content_max_new_tokens": args.content_max_new_tokens,
         "skip_content": args.skip_content,
+        "timing": args.timing,
         "total_seconds": total,
         "mean_seconds": mean,
+        "mean_stage_timings": {
+            stage: timing_sums[stage] / timing_counts[stage]
+            for stage in sorted(timing_sums)
+        },
         "completed_pages": len(completed),
         "failed_pages": len(rows) - len(completed),
         "fallback_rows": sum(1 for r in rows if r.get("fallback_detected")),
@@ -165,6 +196,8 @@ def load_resume_rows(args: argparse.Namespace) -> list[dict]:
         raise SystemExit(f"cannot resume {path}: content_max_new_tokens mismatch")
     if data.get("skip_content") != args.skip_content:
         raise SystemExit(f"cannot resume {path}: skip_content mismatch")
+    if data.get("timing") != args.timing:
+        raise SystemExit(f"cannot resume {path}: timing mismatch")
     return list(data.get("rows", []))
 
 
@@ -181,6 +214,7 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--keep-going", action="store_true")
     parser.add_argument("--save-output-dir", type=Path)
+    parser.add_argument("--timing", action="store_true")
     args = parser.parse_args()
 
     rows = load_resume_rows(args)
@@ -205,6 +239,7 @@ def main() -> None:
                 output_dir=args.save_output_dir,
                 page=page,
                 content_max_new_tokens=args.content_max_new_tokens,
+                timing=args.timing,
             )
             row["page"] = page
             rows.append(row)

@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #ifdef __APPLE__
@@ -127,6 +128,23 @@ static void mu_record_metal_stage(const mu_engine *e, const char *stage) {
     if (getenv("MU_METAL_DEBUG")) {
         fprintf(stderr, "mu metal stage: %s\n", stage ? stage : "unknown");
     }
+}
+
+static int mu_timing_enabled(void) {
+    const char *v = getenv("MU_TIMING");
+    return v && *v && strcmp(v, "0") != 0;
+}
+
+static double mu_time_now_seconds(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+
+static void mu_timing_log_stage(int enabled, const char *stage, double start) {
+    if (!enabled || !stage) return;
+    fprintf(stderr, "mu_timing stage=%s seconds=%.6f\n",
+            stage, mu_time_now_seconds() - start);
 }
 
 static uint64_t mu_read_u64_le(const unsigned char *p) {
@@ -5387,9 +5405,13 @@ static char *mu_generate_image_region_text(mu_engine *e, const char *path,
                                            const float bbox[4],
                                            const char *task_prompt,
                                            int max_new_tokens) {
+    int timing = mu_timing_enabled();
+    double total_start = mu_time_now_seconds();
+    double stage_start = total_start;
     mu_image_tokens tokens;
     memset(&tokens, 0, sizeof(tokens));
     int rc = mu_preprocess_layout_image_region_file(e, path, bbox, &tokens);
+    mu_timing_log_stage(timing, "content_region_preprocess", stage_start);
     if (rc) return NULL;
 
     int grid_t = tokens.grid_t;
@@ -5407,12 +5429,22 @@ static char *mu_generate_image_region_text(mu_engine *e, const char *path,
         mu_image_tokens_free(&tokens);
         return NULL;
     }
+    stage_start = mu_time_now_seconds();
     rc = mu_vision_patch_embed(e, &tokens, patch_embeds, tokens.rows, 1280);
-    if (rc == 0) rc = mu_vision_rotary_pos_emb(e, tokens.grid_t, tokens.grid_h, tokens.grid_w,
-                                               rotary, tokens.rows, 40);
-    if (rc == 0) rc = mu_vision_encode(e, patch_embeds, tokens.rows, 1280,
-                                       rotary, tokens.rows, 40,
-                                       image_embeds, n_image_embeds, 896);
+    mu_timing_log_stage(timing, "content_region_patch_embed", stage_start);
+    if (rc == 0) {
+        stage_start = mu_time_now_seconds();
+        rc = mu_vision_rotary_pos_emb(e, tokens.grid_t, tokens.grid_h, tokens.grid_w,
+                                      rotary, tokens.rows, 40);
+        mu_timing_log_stage(timing, "content_region_rotary", stage_start);
+    }
+    if (rc == 0) {
+        stage_start = mu_time_now_seconds();
+        rc = mu_vision_encode(e, patch_embeds, tokens.rows, 1280,
+                              rotary, tokens.rows, 40,
+                              image_embeds, n_image_embeds, 896);
+        mu_timing_log_stage(timing, "content_region_vision_encode", stage_start);
+    }
     free(patch_embeds);
     free(rotary);
     mu_image_tokens_free(&tokens);
@@ -5421,6 +5453,7 @@ static char *mu_generate_image_region_text(mu_engine *e, const char *path,
         return NULL;
     }
 
+    stage_start = mu_time_now_seconds();
     char *prompt = mu_render_chat_prompt(task_prompt, true);
     if (!prompt) {
         free(image_embeds);
@@ -5429,6 +5462,7 @@ static char *mu_generate_image_region_text(mu_engine *e, const char *path,
     int cap = 8192;
     int *ids = (int *)malloc((size_t)cap * sizeof(ids[0]));
     int n_ids = ids ? mu_tokenize_image_text(e, prompt, grid_t, grid_h, grid_w, ids, cap) : -1;
+    mu_timing_log_stage(timing, "content_region_prompt_tokenize", stage_start);
     mu_free(prompt);
     if (n_ids <= 0) {
         free(ids);
@@ -5441,15 +5475,18 @@ static char *mu_generate_image_region_text(mu_engine *e, const char *path,
         free(image_embeds);
         return NULL;
     }
+    stage_start = mu_time_now_seconds();
     int n_generated = mu_text_generate_greedy_with_image_embeds(
         e, ids, n_ids, grid_t, grid_h, grid_w,
         image_embeds, n_image_embeds, max_new_tokens, generated);
+    mu_timing_log_stage(timing, "content_region_generate", stage_start);
     free(ids);
     free(image_embeds);
     if (n_generated < 0) {
         free(generated);
         return NULL;
     }
+    stage_start = mu_time_now_seconds();
     char *text = mu_decode_token_ids(e, generated, n_generated);
     free(generated);
     if (text) {
@@ -5457,24 +5494,32 @@ static char *mu_generate_image_region_text(mu_engine *e, const char *path,
         if (!end) end = strstr(text, "<|endoftext|>");
         if (end) *end = 0;
     }
+    mu_timing_log_stage(timing, "content_region_decode", stage_start);
+    mu_timing_log_stage(timing, "content_region_total", total_start);
     return text;
 }
 
 int mu_parse_image_file(mu_engine *e, const char *path, mu_result **out) {
     if (!e || !path || !out) return -1;
     *out = NULL;
+    int timing = mu_timing_enabled();
+    double total_start = mu_time_now_seconds();
+    double stage_start = total_start;
     const char *embeds_path = getenv("MU_IMAGE_EMBEDS_FILE");
 
     mu_image_tokens tokens;
     memset(&tokens, 0, sizeof(tokens));
     int rc = mu_preprocess_layout_image_file(e, path, &tokens);
+    mu_timing_log_stage(timing, "layout_preprocess", stage_start);
     if (rc) return -10 + rc;
 
     const int n_image_embeds = (tokens.grid_t * tokens.grid_h * tokens.grid_w) /
                                (e->cfg.spatial_merge_size * e->cfg.spatial_merge_size);
     float *image_embeds = NULL;
     if (embeds_path && *embeds_path) {
+        stage_start = mu_time_now_seconds();
         image_embeds = mu_read_f32_file_exact(embeds_path, n_image_embeds * 896);
+        mu_timing_log_stage(timing, "layout_image_embeds_load", stage_start);
     } else {
         float *patch_embeds = (float *)malloc((size_t)tokens.rows * 1280u * sizeof(patch_embeds[0]));
         float *rotary = (float *)malloc((size_t)tokens.rows * 40u * sizeof(rotary[0]));
@@ -5486,15 +5531,21 @@ int mu_parse_image_file(mu_engine *e, const char *path, mu_result **out) {
             mu_image_tokens_free(&tokens);
             return -20;
         }
+        stage_start = mu_time_now_seconds();
         rc = mu_vision_patch_embed(e, &tokens, patch_embeds, tokens.rows, 1280);
+        mu_timing_log_stage(timing, "layout_patch_embed", stage_start);
         if (rc == 0) {
+            stage_start = mu_time_now_seconds();
             rc = mu_vision_rotary_pos_emb(e, tokens.grid_t, tokens.grid_h, tokens.grid_w,
                                           rotary, tokens.rows, 40);
+            mu_timing_log_stage(timing, "layout_rotary", stage_start);
         }
         if (rc == 0) {
+            stage_start = mu_time_now_seconds();
             rc = mu_vision_encode(e, patch_embeds, tokens.rows, 1280,
                                   rotary, tokens.rows, 40,
                                   image_embeds, n_image_embeds, 896);
+            mu_timing_log_stage(timing, "layout_vision_encode", stage_start);
         }
         free(patch_embeds);
         free(rotary);
@@ -5509,6 +5560,7 @@ int mu_parse_image_file(mu_engine *e, const char *path, mu_result **out) {
         return -20;
     }
 
+    stage_start = mu_time_now_seconds();
     char *prompt = mu_render_chat_prompt("\nLayout Detection:", true);
     if (!prompt) {
         free(image_embeds);
@@ -5524,6 +5576,7 @@ int mu_parse_image_file(mu_engine *e, const char *path, mu_result **out) {
         return -22;
     }
     int n_ids = mu_tokenize_image_text(e, prompt, tokens.grid_t, tokens.grid_h, tokens.grid_w, ids, cap);
+    mu_timing_log_stage(timing, "layout_prompt_tokenize", stage_start);
     if (n_ids <= 0) {
         free(ids);
         mu_free(prompt);
@@ -5545,9 +5598,11 @@ int mu_parse_image_file(mu_engine *e, const char *path, mu_result **out) {
         mu_image_tokens_free(&tokens);
         return -24;
     }
+    stage_start = mu_time_now_seconds();
     int n_generated = mu_text_generate_greedy_with_image_embeds(
         e, ids, n_ids, tokens.grid_t, tokens.grid_h, tokens.grid_w,
         image_embeds, n_image_embeds, max_new, generated);
+    mu_timing_log_stage(timing, "layout_generate", stage_start);
     if (n_generated < 0) {
         free(generated);
         free(ids);
@@ -5556,6 +5611,7 @@ int mu_parse_image_file(mu_engine *e, const char *path, mu_result **out) {
         mu_image_tokens_free(&tokens);
         return -30 + n_generated;
     }
+    stage_start = mu_time_now_seconds();
     char *raw = mu_decode_token_ids(e, generated, n_generated);
     if (!raw) {
         free(generated);
@@ -5568,6 +5624,7 @@ int mu_parse_image_file(mu_engine *e, const char *path, mu_result **out) {
 
     mu_layout_block blocks[256];
     int n_blocks = mu_parse_layout_markup(raw, blocks, 256);
+    mu_timing_log_stage(timing, "layout_decode_parse", stage_start);
     char **contents = NULL;
     const char *skip_content = getenv("MU_SKIP_CONTENT");
     if (!e->opt.skip_content &&
@@ -5588,6 +5645,7 @@ int mu_parse_image_file(mu_engine *e, const char *path, mu_result **out) {
             long v = strtol(content_env, NULL, 10);
             if (v > 0 && v < 4096) content_max = (int)v;
         }
+        double content_start = mu_time_now_seconds();
         for (int i = 0; i < n_blocks; i++) {
             const char *task = "\nText Recognition:";
             if (!strcmp(blocks[i].type, "table")) task = "\nTable Recognition:";
@@ -5599,6 +5657,7 @@ int mu_parse_image_file(mu_engine *e, const char *path, mu_result **out) {
                        !strcmp(blocks[i].type, "chart")) {
                 task = "\nImage Analysis:";
             }
+            stage_start = mu_time_now_seconds();
             contents[i] = mu_generate_image_region_text(e, path, blocks[i].bbox, task, content_max);
             if (contents[i] && !strcmp(blocks[i].type, "table")) {
                 char *html = mu_otsl_to_html(contents[i]);
@@ -5607,9 +5666,12 @@ int mu_parse_image_file(mu_engine *e, const char *path, mu_result **out) {
                     contents[i] = html;
                 }
             }
+            mu_timing_log_stage(timing, "content_block_total", stage_start);
         }
+        mu_timing_log_stage(timing, "content_total", content_start);
     }
 
+    stage_start = mu_time_now_seconds();
     char *json = contents ? mu_layout_blocks_to_json_with_content(blocks, contents, n_blocks)
                           : mu_layout_blocks_to_json(blocks, n_blocks);
     char *markdown = contents ? mu_layout_contents_to_markdown(contents, n_blocks)
@@ -5634,6 +5696,8 @@ int mu_parse_image_file(mu_engine *e, const char *path, mu_result **out) {
     result->json = json;
     result->markdown = markdown;
     *out = result;
+    mu_timing_log_stage(timing, "result_build", stage_start);
+    mu_timing_log_stage(timing, "page_total", total_start);
 
     if (contents) {
         for (int i = 0; i < n_blocks; i++) free(contents[i]);

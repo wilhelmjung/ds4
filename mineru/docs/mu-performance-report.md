@@ -430,3 +430,60 @@ Interpretation:
   bottleneck. The next implementation target remains persistent Metal buffers
   for weights/intermediates and fewer per-kernel host-device copies, followed by
   KV-cache decode.
+
+## Stage Timing Checkpoint
+
+Date: 2026-06-19
+Branch: `codex/mineru-metal-backend`
+
+The benchmark harness now supports `--timing`, which sets `MU_TIMING=1` for the
+`mu` subprocess and records `mu_timing stage=... seconds=...` rows from stderr
+into each benchmark row as `stage_timings`.
+
+Timing smoke commands:
+
+```text
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_benchmark_pages.py \
+  --backend cpu \
+  --pages 224 \
+  --max-new-tokens 1 \
+  --skip-content \
+  --timing \
+  --timeout 900 \
+  --out /tmp/mu-benchmark-cpu-page224-token1-timing.json
+
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_benchmark_pages.py \
+  --backend metal \
+  --pages 224 \
+  --max-new-tokens 1 \
+  --skip-content \
+  --timing \
+  --timeout 1200 \
+  --out /tmp/mu-benchmark-metal-page224-token1-timing.json
+```
+
+Page 224, 1-token layout smoke stage timings:
+
+| Stage | CPU s | Metal s | Metal / CPU |
+| --- | ---: | ---: | ---: |
+| layout_preprocess | 0.0273 | 0.0393 | 1.44x |
+| layout_patch_embed | 0.0227 | 0.0261 | 1.15x |
+| layout_rotary | 0.0001 | 0.0001 | 1.03x |
+| layout_vision_encode | 39.5267 | 101.0340 | 2.56x |
+| layout_prompt_tokenize | 3.7702 | 3.8659 | 1.03x |
+| layout_generate | 4.6844 | 7.6832 | 1.64x |
+| layout_decode_parse | 0.0000 | 0.0000 | 0.25x |
+| result_build | 0.0000 | 0.0000 | 3.50x |
+| page_total | 48.0315 | 112.6486 | 2.35x |
+
+Interpretation:
+
+- The 1-token timing smoke isolates the front half of the pipeline. It is not a
+  full-content benchmark, but it directly shows where the fixed per-page cost is
+  concentrated.
+- Full-page `layout_vision_encode` dominates both CPU and Metal time. On this
+  run, Metal spends `101.03s` in layout vision encode versus `39.53s` on CPU.
+- Prompt tokenization and result building are not meaningful bottlenecks at this
+  stage.
+- The next performance experiment should instrument and reduce Metal buffer
+  churn inside vision encode before broadening full-content runs.

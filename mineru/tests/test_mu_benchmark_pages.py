@@ -67,6 +67,39 @@ class MuBenchmarkPagesTest(unittest.TestCase):
         env = run_mock.call_args.kwargs["env"]
         self.assertEqual(env["MU_CONTENT_MAX_NEW_TOKENS"], "512")
 
+    def test_run_one_records_stage_timings_from_stderr(self) -> None:
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout="[]",
+            stderr=(
+                "mu_timing stage=layout_preprocess seconds=0.125\n"
+                "mu_timing stage=vision_encode seconds=4.5\n"
+                "mu_timing stage=content_region_generate seconds=1.25\n"
+                "mu_timing stage=content_region_generate seconds=2.5\n"
+            ),
+        )
+        with mock.patch.object(mu_benchmark_pages.subprocess, "run",
+                               return_value=completed) as run_mock:
+            row = mu_benchmark_pages.run_one(
+                "metal",
+                Path("/tmp/page.png"),
+                max_new_tokens=1,
+                skip_content=True,
+                timeout=10,
+                timing=True,
+            )
+
+        self.assertEqual(
+            row["stage_timings"],
+            {
+                "layout_preprocess": 0.125,
+                "vision_encode": 4.5,
+                "content_region_generate": 3.75,
+            },
+        )
+        env = run_mock.call_args.kwargs["env"]
+        self.assertEqual(env["MU_TIMING"], "1")
+
 
 if __name__ == "__main__":
     unittest.main()
