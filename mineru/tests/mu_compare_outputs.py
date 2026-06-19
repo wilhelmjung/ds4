@@ -89,8 +89,8 @@ def table_cells(content: str | None) -> list[str]:
     return parser.cells
 
 
-def table_exact_cell_recall(ref_blocks: list[dict[str, Any]],
-                            pred_blocks: list[dict[str, Any]]) -> float | None:
+def table_exact_cell_counts(ref_blocks: list[dict[str, Any]],
+                            pred_blocks: list[dict[str, Any]]) -> tuple[int, int]:
     ref_cells: list[str] = []
     pred_cells: list[str] = []
     for ref, pred in zip(ref_blocks, pred_blocks):
@@ -98,13 +98,19 @@ def table_exact_cell_recall(ref_blocks: list[dict[str, Any]],
             continue
         ref_cells.extend(table_cells(ref.get("content")))
         pred_cells.extend(table_cells(pred.get("content")))
-    if not ref_cells:
-        return None
     matched = 0
     for i, cell in enumerate(ref_cells):
         if i < len(pred_cells) and pred_cells[i] == cell:
             matched += 1
-    return matched / len(ref_cells)
+    return matched, len(ref_cells)
+
+
+def table_exact_cell_recall(ref_blocks: list[dict[str, Any]],
+                            pred_blocks: list[dict[str, Any]]) -> float | None:
+    matched, total = table_exact_cell_counts(ref_blocks, pred_blocks)
+    if total == 0:
+        return None
+    return matched / total
 
 
 def compare_blocks(ref: list[dict[str, Any]],
@@ -138,6 +144,69 @@ def compare_blocks(ref: list[dict[str, Any]],
     }
 
 
+def compare_pages(
+    pages: list[tuple[int, list[dict[str, Any]], list[dict[str, Any]]]]
+) -> dict[str, Any]:
+    per_page: list[dict[str, Any]] = []
+    type_matches: list[float] = []
+    bbox_ious: list[float] = []
+    content_f1s: list[float] = []
+    block_count_exact_pages = 0
+    total_ref_blocks = 0
+    total_pred_blocks = 0
+    table_pages = 0
+    table_matched = 0
+    table_total = 0
+
+    for page, ref, pred in pages:
+        metrics = compare_blocks(ref, pred)
+        per_page.append({"page": page, **metrics})
+        if metrics["block_count_exact"]:
+            block_count_exact_pages += 1
+        total_ref_blocks += len(ref)
+        total_pred_blocks += len(pred)
+        n = min(len(ref), len(pred))
+        for i in range(n):
+            type_matches.append(
+                1.0 if ref[i].get("type") == pred[i].get("type") else 0.0
+            )
+            bbox_ious.append(
+                bbox_iou(
+                    list(ref[i].get("bbox") or [0, 0, 0, 0]),
+                    list(pred[i].get("bbox") or [0, 0, 0, 0]),
+                )
+            )
+            content_f1s.append(token_f1(ref[i].get("content"), pred[i].get("content")))
+        matched, total = table_exact_cell_counts(ref, pred)
+        if total:
+            table_pages += 1
+            table_matched += matched
+            table_total += total
+
+    page_count = len(pages)
+    return {
+        "page_count": page_count,
+        "total_ref_blocks": total_ref_blocks,
+        "total_pred_blocks": total_pred_blocks,
+        "total_ordered_blocks": len(type_matches),
+        "block_count_exact_pages": block_count_exact_pages,
+        "block_count_exact_rate": (
+            block_count_exact_pages / page_count if page_count else 1.0
+        ),
+        "ordered_type_accuracy": mean(type_matches) if type_matches else 1.0,
+        "ordered_mean_bbox_iou": mean(bbox_ious) if bbox_ious else 1.0,
+        "ordered_median_bbox_iou": median(bbox_ious) if bbox_ious else 1.0,
+        "mean_content_token_f1": mean(content_f1s) if content_f1s else 1.0,
+        "table_pages": table_pages,
+        "table_exact_cells_matched": table_matched,
+        "table_exact_cells_total": table_total,
+        "table_exact_cell_recall": (
+            table_matched / table_total if table_total else None
+        ),
+        "pages": per_page,
+    }
+
+
 def load_blocks_json(path: Path) -> list[dict[str, Any]]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, list):
@@ -164,12 +233,41 @@ def main() -> None:
     parser.add_argument("--ref-json", type=Path)
     parser.add_argument("--ref-pages-jsonl", type=Path)
     parser.add_argument("--page", type=int)
-    parser.add_argument("--pred-json", type=Path, required=True)
+    parser.add_argument("--pages")
+    parser.add_argument("--pred-json", type=Path)
+    parser.add_argument("--pred-json-template")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
 
     if bool(args.ref_json) == bool(args.ref_pages_jsonl):
         raise SystemExit("provide exactly one of --ref-json or --ref-pages-jsonl")
+    if args.pages or args.pred_json_template:
+        if not args.ref_pages_jsonl:
+            raise SystemExit("--pages requires --ref-pages-jsonl")
+        if not args.pages or not args.pred_json_template:
+            raise SystemExit("provide both --pages and --pred-json-template")
+        page_numbers = [
+            int(part.strip())
+            for part in args.pages.split(",")
+            if part.strip()
+        ]
+        pages = [
+            (
+                page,
+                load_blocks_from_pages_jsonl(args.ref_pages_jsonl, page),
+                load_blocks_json(Path(args.pred_json_template.format(page=page))),
+            )
+            for page in page_numbers
+        ]
+        metrics = compare_pages(pages)
+        text = json.dumps(metrics, indent=2, ensure_ascii=False)
+        if args.out:
+            args.out.write_text(text + "\n", encoding="utf-8")
+        print(text)
+        return
+
+    if not args.pred_json:
+        raise SystemExit("--pred-json is required")
     if args.ref_pages_jsonl and args.page is None:
         raise SystemExit("--ref-pages-jsonl requires --page")
 

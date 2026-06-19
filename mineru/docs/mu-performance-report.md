@@ -722,3 +722,100 @@ Interpretation:
   `content_region_generate` (`133.56s`), and `content_region_vision_encode`
   (`97.49s`). The next optimization should keep K/V cache and dense/norm
   intermediates in persistent Metal buffers.
+
+## 10-page Full-content512 Metal E2E Validation
+
+Date: 2026-06-19
+Branch: `codex/mineru-metal-backend`
+
+After page 224 passed full-content512 validation, the remaining 9 sampled pages
+were run with the same pure Metal no-fallback mode and the same layout/content
+token limits. The 10-page result combines page 224 with pages
+`234, 237, 241, 244, 247, 258, 281, 303, 334`.
+
+Artifacts:
+
+```text
+/tmp/mu-benchmark-metal-page224-fullcontent512-kvcache.json
+/tmp/mu-benchmark-metal-9remaining-fullcontent512-kvcache.json
+/tmp/mu-fullcontent512-kvcache-page224/metal_page_0224.json
+/tmp/mu-fullcontent512-kvcache-10/metal_page_*.json
+/tmp/mu-fullcontent512-kvcache-10-combined/transformers120-vs-metal.metrics.json
+/Users/will/github/mineru-model/runs/nasa_systems_engineering_handbook_rev2_full_mps/pages.jsonl
+```
+
+Accuracy, Transformers/MPS 120dpi versus Metal full-content512:
+
+| Metric | Value |
+| --- | ---: |
+| Pages | 10 |
+| Total ordered blocks | 34 |
+| Exact block-count pages | 10 / 10 |
+| Ordered type accuracy | 1.0000 |
+| Ordered mean bbox IoU | 0.9877 |
+| Ordered median bbox IoU | 1.0000 |
+| Mean content token F1 | 1.0000 |
+| Table pages | 6 |
+| Table exact cells | 104 / 104 |
+| Table exact cell recall | 1.0000 |
+
+Per-page accuracy:
+
+| Page | Blocks ref/pred | Type acc | BBox IoU | Content F1 | Table cell recall |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 224 | 3/3 | 1.000 | 0.9444 | 1.000 | 1.000 |
+| 234 | 3/3 | 1.000 | 1.0000 | 1.000 | 1.000 |
+| 237 | 3/3 | 1.000 | 0.9815 | 1.000 | 1.000 |
+| 241 | 3/3 | 1.000 | 0.9989 | 1.000 | 1.000 |
+| 244 | 3/3 | 1.000 | 1.0000 | 1.000 | 1.000 |
+| 247 | 3/3 | 1.000 | 0.9449 | 1.000 | 1.000 |
+| 258 | 4/4 | 1.000 | 0.9965 | 1.000 | n/a |
+| 281 | 4/4 | 1.000 | 1.0000 | 1.000 | n/a |
+| 303 | 4/4 | 1.000 | 0.9971 | 1.000 | n/a |
+| 334 | 4/4 | 1.000 | 0.9997 | 1.000 | n/a |
+
+Performance:
+
+| Backend | Total s | Mean s/page | Completed pages | Fallback rows |
+| --- | ---: | ---: | ---: | ---: |
+| Transformers/MPS 120dpi reference | 385.77 | 38.58 | 10 / 10 | n/a |
+| Metal no-fallback after KV-cache | 2720.83 | 272.08 | 10 / 10 | 0 |
+
+Metal per-page timing:
+
+| Page | Transformers s | Metal s | Metal blocks/types |
+| ---: | ---: | ---: | --- |
+| 224 | 51.73 | 423.85 | 3 table/footer/page_number |
+| 234 | 51.00 | 329.27 | 3 table/footer/page_number |
+| 237 | 51.05 | 332.21 | 3 table/footer/page_number |
+| 241 | 51.36 | 332.36 | 3 table/footer/page_number |
+| 244 | 51.18 | 329.94 | 3 table/footer/page_number |
+| 247 | 43.06 | 323.77 | 3 table/footer/page_number |
+| 258 | 26.33 | 164.55 | 4 title/text/footer/page_number |
+| 281 | 19.19 | 158.90 | 4 title/text/footer/page_number |
+| 303 | 17.56 | 160.96 | 4 title/text/footer/page_number |
+| 334 | 23.31 | 165.03 | 4 text/text/footer/page_number |
+
+Mean Metal stage timings across the 10 pages:
+
+| Stage | Mean s/page |
+| --- | ---: |
+| layout_vision_encode | 105.94 |
+| layout_generate | 27.57 |
+| content_region_vision_encode | 51.74 |
+| content_region_generate | 82.69 |
+| content_total | 134.61 |
+| page_total | 271.94 |
+
+Interpretation:
+
+- The pure Metal full-content512 path now has 10-page end-to-end validation
+  against the local Transformers/MPS 120dpi reference with zero CPU fallback.
+- Accuracy is strong on this smoke corpus: all 34 ordered blocks match type,
+  all content token F1 scores are 1.0, and all 104 table cells match exactly.
+- Performance is still not production-competitive. Across the 10 pages, Metal
+  is about `7.05x` slower than Transformers/MPS.
+- CPU remains the precision reference. CPU-vs-Metal exactness after KV-cache is
+  proven for page 224 full-content512; the 10-page aggregate above is measured
+  against Transformers/MPS because the remaining full-content512 CPU rerun was
+  not required for this checkpoint.

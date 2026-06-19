@@ -10,14 +10,17 @@ The current branch has a pure Metal correctness bridge for `mineru/mu.c` behind
 `--backend metal --no-cpu-fallback`. CPU remains the default backend and the
 precision reference.
 
-The branch has now reached a stage-level validation point:
+The branch has now reached a 10-page full-content validation point:
 
 - 10 sampled pages complete layout-only generation in pure Metal no-fallback
   mode with zero fallback rows.
-- Page 224 completes full-content extraction in pure Metal no-fallback mode
-  with zero fallback rows.
-- Page 224 Metal full-content output matches CPU exactly and matches the local
-  Transformers/MPS 120dpi reference on table/footer/page-number content.
+- 10 sampled pages complete full-content512 extraction in pure Metal
+  no-fallback mode with zero fallback rows.
+- The 10-page Metal full-content512 output matches the local Transformers/MPS
+  120dpi reference on block counts, ordered block types, content token F1, and
+  all table cells in the smoke corpus.
+- Page 224 Metal full-content512 output also matches CPU exactly, so CPU
+  remains the precision reference.
 - Stage timing is available through `MU_TIMING=1` and the benchmark harness
   `--timing` flag.
 - Performance is still much slower than CPU and Transformers/MPS, so the Metal
@@ -26,12 +29,13 @@ The branch has now reached a stage-level validation point:
 Latest relevant commit:
 
 ```text
-1cc1e0f perf: record mu metal full content page224
+f6bd048 perf: record mu metal kv-cache content512
 ```
 
 Do not treat this as the final optimized Metal engine. The next stage should be
-performance work, especially reducing Metal buffer creation and host/device
-copies in the vision tower and then adding KV-cache decode.
+performance work, especially persistent Metal buffers for weights,
+intermediates, K/V cache, and logits to reduce buffer creation and host/device
+copies.
 
 ## Worktree State
 
@@ -59,7 +63,8 @@ The Metal path currently covers enough of the MinerU page pipeline to run:
 
 - Qwen2-VL image preprocessing and vision encode through the native Metal path.
 - Layout generation through `--backend metal --no-cpu-fallback`.
-- Content crop extraction and block-specific generation for page 224.
+- Content crop extraction and block-specific generation for the 10-page
+  full-content512 smoke corpus.
 - JSON output for parsed layout/content blocks.
 - CPU fallback accounting and benchmark rejection of fallback via
   `--no-cpu-fallback`.
@@ -84,6 +89,46 @@ Detailed numbers are in:
 ```text
 mineru/docs/mu-performance-report.md
 ```
+
+### 10-page Full-content512 E2E
+
+Artifacts:
+
+```text
+/tmp/mu-benchmark-metal-page224-fullcontent512-kvcache.json
+/tmp/mu-benchmark-metal-9remaining-fullcontent512-kvcache.json
+/tmp/mu-fullcontent512-kvcache-10-combined/transformers120-vs-metal.metrics.json
+```
+
+Result:
+
+| Metric | Value |
+| --- | ---: |
+| Pages | 10 |
+| Metal completed pages | 10 / 10 |
+| Metal fallback rows | 0 |
+| Exact block-count pages | 10 / 10 |
+| Ordered type accuracy | 1.0000 |
+| Ordered mean bbox IoU | 0.9877 |
+| Mean content token F1 | 1.0000 |
+| Table exact cells | 104 / 104 |
+| Table exact cell recall | 1.0000 |
+| Metal total time | 2720.83s |
+| Metal mean time | 272.08s/page |
+| Transformers/MPS total time | 385.77s |
+| Transformers/MPS mean time | 38.58s/page |
+| Metal / Transformers speed gap | 7.05x slower |
+
+Pages:
+
+```text
+224, 234, 237, 241, 244, 247, 258, 281, 303, 334
+```
+
+This is the current strongest end-to-end validation evidence. CPU-vs-Metal
+exactness after KV-cache is proven for page 224 full-content512; the 10-page
+full-content512 aggregate is measured against the local Transformers/MPS
+reference.
 
 ### 10-page Layout-only Parity
 
@@ -425,10 +470,12 @@ slower than Transformers/MPS.
 
 The current branch has not proven all desirable final-state properties:
 
-- Full-content pure Metal validation has only been run for page 224. The
-  10-page sample has layout-only parity, not full-content parity.
+- CPU-vs-Metal exactness after KV-cache has only been re-run for page 224
+  full-content512. The 10-page full-content512 aggregate is against
+  Transformers/MPS, not a fresh 10-page CPU rerun.
 - Metal is still slower than CPU and Transformers/MPS. Page 224
-  full-content128 is now about 3.27x slower than CPU after KV-cache decode.
+  full-content512 is about 4.55x slower than CPU, and the 10-page
+  full-content512 run is about 7.05x slower than Transformers/MPS.
 - The implementation still has repeated host/device transfers and does not own
   persistent Metal buffers for weights, intermediate activations, K/V cache, or
   logits.
@@ -455,14 +502,17 @@ The current branch has not proven all desirable final-state properties:
      crop extraction, and content generation.
    - Record host/device bytes moved if practical.
 
-4. Re-run page 224 full-content after each optimization.
+4. Re-run page 224 full-content512 after each optimization.
    - Preserve CPU exactness first.
    - Compare against Transformers 120dpi page 224.
    - Update `mineru/docs/mu-performance-report.md` after meaningful changes.
 
-5. After page 224 performance improves further, expand to the 10-page sample.
-   - First layout-only parity/performance.
-   - Then full-content for the table-heavy pages if runtime becomes reasonable.
+5. After page 224 performance improves further, re-run the 10-page
+   full-content512 sample.
+   - Require `--backend metal --no-cpu-fallback`.
+   - Compare against the existing Transformers/MPS reference.
+   - Optionally run a fresh 10-page CPU full-content512 pass if CPU/Metal
+     exactness beyond page 224 is needed.
 
 ## Safety Rules For Next Operator
 
