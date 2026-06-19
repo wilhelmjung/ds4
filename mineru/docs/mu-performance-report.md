@@ -209,7 +209,7 @@ baseline to beat.
 
 Date: 2026-06-19
 Branch: `codex/mineru-metal-backend`
-Commit: `60dc6ee`
+Commits: `60dc6ee`, `50cf405`, `c3c8312`
 
 The first full-page Metal correctness bridge is now available behind
 `--backend metal --no-cpu-fallback`. CPU remains the reference backend and is
@@ -243,7 +243,31 @@ Stage timing artifacts:
 /tmp/mu-benchmark-cpu-page224-smoke.json
 /tmp/mu-benchmark-metal-page224-smoke.json
 /tmp/mu-benchmark-cpu-page224-layout.json
+/tmp/mu-benchmark-cpu-10-smoke.json
+/tmp/mu-benchmark-metal-10-smoke.json
 ```
+
+10-page quick E2E smoke, `--max-new-tokens 4 --skip-content`:
+
+| Backend | Total s | Mean s/page | Completed pages | CPU fallback rows |
+| --- | ---: | ---: | ---: | ---: |
+| CPU reference | 506.40 | 50.64 | 10 / 10 | 0 |
+| Metal no-fallback | 1568.66 | 156.87 | 10 / 10 | 0 |
+
+Per-page quick timing:
+
+| Page | CPU s | Metal s | Metal fallback |
+| ---: | ---: | ---: | ---: |
+| 224 | 55.23 | 170.24 | 0 |
+| 234 | 53.05 | 133.15 | 0 |
+| 237 | 50.27 | 131.02 | 0 |
+| 241 | 49.46 | 132.80 | 0 |
+| 244 | 48.90 | 131.81 | 0 |
+| 247 | 49.23 | 197.38 | 0 |
+| 258 | 49.90 | 201.94 | 0 |
+| 281 | 48.28 | 202.46 | 0 |
+| 303 | 48.98 | 129.65 | 0 |
+| 334 | 53.11 | 138.21 | 0 |
 
 Page 224 quick smoke, `--max-new-tokens 4 --skip-content`:
 
@@ -260,11 +284,12 @@ Page 224 layout-only CPU reference, `--max-new-tokens 128 --skip-content`:
 
 Interpretation:
 
-- Metal no-fallback is functionally wired through full-page vision encode, but
-  the current correctness bridge is slower than CPU on the quick page224 smoke
-  by about 3.8x.
-- The 4-token smoke is useful for fallback and process timing, but not for
-  accuracy, because it stops before layout blocks are emitted.
+- Metal no-fallback is functionally wired through the 10 sampled pages, but the
+  current correctness bridge is slower than CPU on this quick benchmark by about
+  3.1x.
+- The 4-token smoke is useful for end-to-end process timing and fallback
+  detection across the sampled corpus, but not for accuracy, because it stops
+  before layout blocks are emitted.
 - The 128-token page224 CPU run confirms that the layout-only setting can emit
   the expected 3 blocks. The matching Metal 128-token run was interrupted after
   several minutes because repeated full-prefill decode made it too slow for an
