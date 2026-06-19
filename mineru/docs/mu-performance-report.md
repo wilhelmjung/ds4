@@ -738,11 +738,30 @@ Artifacts:
 ```text
 /tmp/mu-benchmark-metal-page224-fullcontent512-kvcache.json
 /tmp/mu-benchmark-metal-9remaining-fullcontent512-kvcache.json
+/tmp/mu-benchmark-cpu-page224-fullcontent512-kvcache-baseline.json
+/tmp/mu-benchmark-cpu-9remaining-fullcontent512-kvcache-baseline.json
 /tmp/mu-fullcontent512-kvcache-page224/metal_page_0224.json
 /tmp/mu-fullcontent512-kvcache-10/metal_page_*.json
 /tmp/mu-fullcontent512-kvcache-10-combined/transformers120-vs-metal.metrics.json
+/tmp/mu-fullcontent512-kvcache-10-combined/cpu-vs-metal.metrics.json
+/tmp/mu-fullcontent512-kvcache-10-cpu-combined/transformers120-vs-cpu.metrics.json
 /Users/will/github/mineru-model/runs/nasa_systems_engineering_handbook_rev2_full_mps/pages.jsonl
 ```
+
+Accuracy, CPU reference versus Metal full-content512:
+
+| Metric | Value |
+| --- | ---: |
+| Pages | 10 |
+| Total ordered blocks | 34 |
+| Exact block-count pages | 10 / 10 |
+| Ordered type accuracy | 1.0000 |
+| Ordered mean bbox IoU | 1.0000 |
+| Ordered median bbox IoU | 1.0000 |
+| Mean content token F1 | 1.0000 |
+| Table pages | 6 |
+| Table exact cells | 104 / 104 |
+| Table exact cell recall | 1.0000 |
 
 Accuracy, Transformers/MPS 120dpi versus Metal full-content512:
 
@@ -779,43 +798,54 @@ Performance:
 | Backend | Total s | Mean s/page | Completed pages | Fallback rows |
 | --- | ---: | ---: | ---: | ---: |
 | Transformers/MPS 120dpi reference | 385.77 | 38.58 | 10 / 10 | n/a |
+| CPU reference | 930.73 | 93.07 | 10 / 10 | 0 |
 | Metal no-fallback after KV-cache | 2720.83 | 272.08 | 10 / 10 | 0 |
 
-Metal per-page timing:
+Speed ratios:
 
-| Page | Transformers s | Metal s | Metal blocks/types |
-| ---: | ---: | ---: | --- |
-| 224 | 51.73 | 423.85 | 3 table/footer/page_number |
-| 234 | 51.00 | 329.27 | 3 table/footer/page_number |
-| 237 | 51.05 | 332.21 | 3 table/footer/page_number |
-| 241 | 51.36 | 332.36 | 3 table/footer/page_number |
-| 244 | 51.18 | 329.94 | 3 table/footer/page_number |
-| 247 | 43.06 | 323.77 | 3 table/footer/page_number |
-| 258 | 26.33 | 164.55 | 4 title/text/footer/page_number |
-| 281 | 19.19 | 158.90 | 4 title/text/footer/page_number |
-| 303 | 17.56 | 160.96 | 4 title/text/footer/page_number |
-| 334 | 23.31 | 165.03 | 4 text/text/footer/page_number |
-
-Mean Metal stage timings across the 10 pages:
-
-| Stage | Mean s/page |
+| Comparison | Ratio |
 | --- | ---: |
-| layout_vision_encode | 105.94 |
-| layout_generate | 27.57 |
-| content_region_vision_encode | 51.74 |
-| content_region_generate | 82.69 |
-| content_total | 134.61 |
-| page_total | 271.94 |
+| CPU / Transformers | 2.41x slower |
+| Metal / CPU | 2.92x slower |
+| Metal / Transformers | 7.05x slower |
+
+Per-page timing:
+
+| Page | Transformers s | CPU s | Metal s | Metal / CPU | Blocks/types |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 224 | 51.73 | 93.13 | 423.85 | 4.55x | 3 table/footer/page_number |
+| 234 | 51.00 | 100.06 | 329.27 | 3.29x | 3 table/footer/page_number |
+| 237 | 51.05 | 116.78 | 332.21 | 2.84x | 3 table/footer/page_number |
+| 241 | 51.36 | 132.15 | 332.36 | 2.52x | 3 table/footer/page_number |
+| 244 | 51.18 | 122.21 | 329.94 | 2.70x | 3 table/footer/page_number |
+| 247 | 43.06 | 108.51 | 323.77 | 2.98x | 3 table/footer/page_number |
+| 258 | 26.33 | 70.80 | 164.55 | 2.32x | 4 title/text/footer/page_number |
+| 281 | 19.19 | 63.10 | 158.90 | 2.52x | 4 title/text/footer/page_number |
+| 303 | 17.56 | 62.67 | 160.96 | 2.57x | 4 title/text/footer/page_number |
+| 334 | 23.31 | 61.34 | 165.03 | 2.69x | 4 text/text/footer/page_number |
+
+Mean stage timings across the 10 pages:
+
+| Stage | CPU mean s/page | Metal mean s/page | Metal / CPU |
+| --- | ---: | ---: | ---: |
+| layout_vision_encode | 42.24 | 105.94 | 2.51x |
+| layout_generate | 8.51 | 27.57 | 3.24x |
+| content_region_vision_encode | 19.81 | 51.74 | 2.61x |
+| content_region_generate | 18.17 | 82.69 | 4.55x |
+| content_total | 38.17 | 134.61 | 3.53x |
+| page_total | 92.95 | 271.94 | 2.93x |
 
 Interpretation:
 
 - The pure Metal full-content512 path now has 10-page end-to-end validation
-  against the local Transformers/MPS 120dpi reference with zero CPU fallback.
+  against both CPU and the local Transformers/MPS 120dpi reference with zero
+  CPU fallback.
 - Accuracy is strong on this smoke corpus: all 34 ordered blocks match type,
   all content token F1 scores are 1.0, and all 104 table cells match exactly.
+  Against CPU, bbox IoU is also exactly 1.0 on all ordered blocks.
 - Performance is still not production-competitive. Across the 10 pages, Metal
-  is about `7.05x` slower than Transformers/MPS.
-- CPU remains the precision reference. CPU-vs-Metal exactness after KV-cache is
-  proven for page 224 full-content512; the 10-page aggregate above is measured
-  against Transformers/MPS because the remaining full-content512 CPU rerun was
-  not required for this checkpoint.
+  is about `2.92x` slower than CPU and `7.05x` slower than Transformers/MPS.
+- CPU remains the precision reference. The CPU 10-page baseline should not be
+  rerun for every Metal-only optimization; reuse this checkpoint unless CPU
+  code, parsing semantics, token limits, model weights, or comparison logic
+  change.

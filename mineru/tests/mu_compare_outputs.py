@@ -228,10 +228,31 @@ def load_blocks_from_pages_jsonl(path: Path, page: int) -> list[dict[str, Any]]:
     raise ValueError(f"page {page} not found in {path}")
 
 
+def load_page_pairs(
+    pages: list[int],
+    *,
+    pred_json_template: str,
+    ref_pages_jsonl: Path | None = None,
+    ref_json_template: str | None = None,
+) -> list[tuple[int, list[dict[str, Any]], list[dict[str, Any]]]]:
+    if bool(ref_pages_jsonl) == bool(ref_json_template):
+        raise ValueError("provide exactly one reference source")
+    pairs = []
+    for page in pages:
+        if ref_pages_jsonl:
+            ref = load_blocks_from_pages_jsonl(ref_pages_jsonl, page)
+        else:
+            ref = load_blocks_json(Path(ref_json_template.format(page=page)))
+        pred = load_blocks_json(Path(pred_json_template.format(page=page)))
+        pairs.append((page, ref, pred))
+    return pairs
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ref-json", type=Path)
     parser.add_argument("--ref-pages-jsonl", type=Path)
+    parser.add_argument("--ref-json-template")
     parser.add_argument("--page", type=int)
     parser.add_argument("--pages")
     parser.add_argument("--pred-json", type=Path)
@@ -239,11 +260,15 @@ def main() -> None:
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
 
-    if bool(args.ref_json) == bool(args.ref_pages_jsonl):
-        raise SystemExit("provide exactly one of --ref-json or --ref-pages-jsonl")
+    ref_sources = [args.ref_json, args.ref_pages_jsonl, args.ref_json_template]
+    if sum(1 for source in ref_sources if source) != 1:
+        raise SystemExit(
+            "provide exactly one of --ref-json, --ref-pages-jsonl, "
+            "or --ref-json-template"
+        )
     if args.pages or args.pred_json_template:
-        if not args.ref_pages_jsonl:
-            raise SystemExit("--pages requires --ref-pages-jsonl")
+        if args.ref_json:
+            raise SystemExit("--pages requires --ref-pages-jsonl or --ref-json-template")
         if not args.pages or not args.pred_json_template:
             raise SystemExit("provide both --pages and --pred-json-template")
         page_numbers = [
@@ -251,14 +276,12 @@ def main() -> None:
             for part in args.pages.split(",")
             if part.strip()
         ]
-        pages = [
-            (
-                page,
-                load_blocks_from_pages_jsonl(args.ref_pages_jsonl, page),
-                load_blocks_json(Path(args.pred_json_template.format(page=page))),
-            )
-            for page in page_numbers
-        ]
+        pages = load_page_pairs(
+            page_numbers,
+            ref_pages_jsonl=args.ref_pages_jsonl,
+            ref_json_template=args.ref_json_template,
+            pred_json_template=args.pred_json_template,
+        )
         metrics = compare_pages(pages)
         text = json.dumps(metrics, indent=2, ensure_ascii=False)
         if args.out:
@@ -270,6 +293,10 @@ def main() -> None:
         raise SystemExit("--pred-json is required")
     if args.ref_pages_jsonl and args.page is None:
         raise SystemExit("--ref-pages-jsonl requires --page")
+    if args.ref_json_template:
+        if args.page is None:
+            raise SystemExit("--ref-json-template requires --page")
+        args.ref_json = Path(args.ref_json_template.format(page=args.page))
 
     ref = (load_blocks_json(args.ref_json) if args.ref_json
            else load_blocks_from_pages_jsonl(args.ref_pages_jsonl, args.page))

@@ -91,6 +91,28 @@ class MuCompareOutputsTest(unittest.TestCase):
         self.assertEqual(metrics["table_exact_cell_recall"], 0.5)
         self.assertEqual(metrics["pages"][1]["page"], 11)
 
+    def test_load_page_pairs_supports_json_templates(self) -> None:
+        tmp = Path("/tmp/mu-compare-outputs-test")
+        tmp.mkdir(exist_ok=True)
+        (tmp / "ref_0001.json").write_text(
+            '[{"type":"text","bbox":[0,0,1,1],"content":"hello"}]\n',
+            encoding="utf-8",
+        )
+        (tmp / "pred_0001.json").write_text(
+            '[{"type":"text","bbox":[0,0,1,1],"content":"hello"}]\n',
+            encoding="utf-8",
+        )
+
+        pairs = mu_compare_outputs.load_page_pairs(
+            [1],
+            ref_json_template=str(tmp / "ref_{page:04d}.json"),
+            pred_json_template=str(tmp / "pred_{page:04d}.json"),
+        )
+
+        self.assertEqual(pairs[0][0], 1)
+        self.assertEqual(pairs[0][1][0]["content"], "hello")
+        self.assertEqual(pairs[0][2][0]["content"], "hello")
+
 
 if __name__ == "__main__":
     unittest.main()

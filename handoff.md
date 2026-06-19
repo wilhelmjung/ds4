@@ -16,11 +16,11 @@ The branch has now reached a 10-page full-content validation point:
   mode with zero fallback rows.
 - 10 sampled pages complete full-content512 extraction in pure Metal
   no-fallback mode with zero fallback rows.
-- The 10-page Metal full-content512 output matches the local Transformers/MPS
-  120dpi reference on block counts, ordered block types, content token F1, and
-  all table cells in the smoke corpus.
-- Page 224 Metal full-content512 output also matches CPU exactly, so CPU
-  remains the precision reference.
+- The 10-page Metal full-content512 output matches CPU exactly: block counts,
+  ordered block types, bbox IoU, content token F1, and all table cells.
+- The same outputs also match the local Transformers/MPS 120dpi reference on
+  block counts, ordered block types, content token F1, and all table cells in
+  the smoke corpus.
 - Stage timing is available through `MU_TIMING=1` and the benchmark harness
   `--timing` flag.
 - Performance is still much slower than CPU and Transformers/MPS, so the Metal
@@ -97,6 +97,9 @@ Artifacts:
 ```text
 /tmp/mu-benchmark-metal-page224-fullcontent512-kvcache.json
 /tmp/mu-benchmark-metal-9remaining-fullcontent512-kvcache.json
+/tmp/mu-benchmark-cpu-page224-fullcontent512-kvcache-baseline.json
+/tmp/mu-benchmark-cpu-9remaining-fullcontent512-kvcache-baseline.json
+/tmp/mu-fullcontent512-kvcache-10-combined/cpu-vs-metal.metrics.json
 /tmp/mu-fullcontent512-kvcache-10-combined/transformers120-vs-metal.metrics.json
 ```
 
@@ -107,16 +110,22 @@ Result:
 | Pages | 10 |
 | Metal completed pages | 10 / 10 |
 | Metal fallback rows | 0 |
-| Exact block-count pages | 10 / 10 |
-| Ordered type accuracy | 1.0000 |
-| Ordered mean bbox IoU | 0.9877 |
+| CPU-vs-Metal exact block-count pages | 10 / 10 |
+| CPU-vs-Metal ordered type accuracy | 1.0000 |
+| CPU-vs-Metal ordered mean bbox IoU | 1.0000 |
+| CPU-vs-Metal mean content token F1 | 1.0000 |
+| CPU-vs-Metal table exact cells | 104 / 104 |
+| Transformers-vs-Metal ordered mean bbox IoU | 0.9877 |
 | Mean content token F1 | 1.0000 |
 | Table exact cells | 104 / 104 |
 | Table exact cell recall | 1.0000 |
+| CPU total time | 930.73s |
+| CPU mean time | 93.07s/page |
 | Metal total time | 2720.83s |
 | Metal mean time | 272.08s/page |
 | Transformers/MPS total time | 385.77s |
 | Transformers/MPS mean time | 38.58s/page |
+| Metal / CPU speed gap | 2.92x slower |
 | Metal / Transformers speed gap | 7.05x slower |
 
 Pages:
@@ -125,10 +134,11 @@ Pages:
 224, 234, 237, 241, 244, 247, 258, 281, 303, 334
 ```
 
-This is the current strongest end-to-end validation evidence. CPU-vs-Metal
-exactness after KV-cache is proven for page 224 full-content512; the 10-page
-full-content512 aggregate is measured against the local Transformers/MPS
-reference.
+This is the current strongest end-to-end validation evidence. CPU remains the
+precision reference and is now proven exact against Metal for the 10-page
+full-content512 sample. Do not rerun this full CPU baseline for every Metal-only
+optimization; reuse it unless CPU code, parsing semantics, token limits, model
+weights, or comparison logic change.
 
 ### 10-page Layout-only Parity
 
@@ -470,12 +480,9 @@ slower than Transformers/MPS.
 
 The current branch has not proven all desirable final-state properties:
 
-- CPU-vs-Metal exactness after KV-cache has only been re-run for page 224
-  full-content512. The 10-page full-content512 aggregate is against
-  Transformers/MPS, not a fresh 10-page CPU rerun.
 - Metal is still slower than CPU and Transformers/MPS. Page 224
-  full-content512 is about 4.55x slower than CPU, and the 10-page
-  full-content512 run is about 7.05x slower than Transformers/MPS.
+  full-content512 is about 4.55x slower than CPU. The 10-page full-content512
+  run is about 2.92x slower than CPU and 7.05x slower than Transformers/MPS.
 - The implementation still has repeated host/device transfers and does not own
   persistent Metal buffers for weights, intermediate activations, K/V cache, or
   logits.
@@ -511,8 +518,8 @@ The current branch has not proven all desirable final-state properties:
    full-content512 sample.
    - Require `--backend metal --no-cpu-fallback`.
    - Compare against the existing Transformers/MPS reference.
-   - Optionally run a fresh 10-page CPU full-content512 pass if CPU/Metal
-     exactness beyond page 224 is needed.
+   - Reuse the existing CPU full-content512 baseline unless CPU code, parsing
+     semantics, token limits, model weights, or comparison logic changed.
 
 ## Safety Rules For Next Operator
 
