@@ -247,6 +247,7 @@ Stage timing artifacts:
 /tmp/mu-benchmark-metal-10-smoke.json
 /tmp/mu-benchmark-cpu-page224-token1.json
 /tmp/mu-benchmark-metal-page224-token1.json
+/tmp/mu-benchmark-metal-page224-layout128.json
 ```
 
 10-page quick E2E smoke, `--max-new-tokens 4 --skip-content`:
@@ -285,11 +286,12 @@ Page 224 1-token diagnostic, `--max-new-tokens 1 --skip-content`:
 | CPU reference | 52.29 | 0 | 0 |
 | Metal no-fallback | 137.26 | 0 | 0 |
 
-Page 224 layout-only CPU reference, `--max-new-tokens 128 --skip-content`:
+Page 224 layout-only parity, `--max-new-tokens 128 --skip-content`:
 
-| Backend | Seconds | Blocks | Ordered types |
-| --- | ---: | ---: | --- |
+| Backend | Seconds | Blocks | Ordered types | CPU fallback rows |
+| --- | ---: | ---: | --- | ---: |
 | CPU reference | 54.09 | 3 | table, footer, page_number |
+| Metal no-fallback | 610.99 | 3 | table, footer, page_number | 0 |
 
 Interpretation:
 
@@ -299,11 +301,10 @@ Interpretation:
 - The 4-token smoke is useful for end-to-end process timing and fallback
   detection across the sampled corpus, but not for accuracy, because it stops
   before layout blocks are emitted.
-- The 128-token page224 CPU run confirms that the layout-only setting can emit
-  the expected 3 blocks. The matching Metal 128-token run was interrupted after
-  several minutes because repeated full-prefill decode made it too slow for an
-  interactive checkpoint; it must be rerun as a long benchmark after decoder
-  optimization or in a background run.
+- The 128-token page224 layout-only run is the first page-level accuracy result
+  for the pure Metal path: Metal no-fallback matches CPU block count and ordered
+  block types (`table`, `footer`, `page_number`) with zero fallback. It is still
+  about 11.3x slower than CPU for this page.
 - The 1-token diagnostic shows that most current Metal time is already spent
   before token generation has much room to accumulate. The next optimization
   target is therefore full-page vision encode: keep intermediate tensors and

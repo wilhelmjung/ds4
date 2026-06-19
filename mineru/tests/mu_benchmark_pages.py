@@ -55,15 +55,34 @@ def run_one(
     cmd.extend(["--image", str(image), "--json"])
 
     start = time.perf_counter()
-    result = subprocess.run(
-        cmd,
-        cwd=ROOT,
-        check=False,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=ROOT,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.perf_counter() - start
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(stdout, bytes):
+            stdout = stdout.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        return {
+            "seconds": elapsed,
+            "command": cmd,
+            "returncode": None,
+            "timeout_seconds": timeout,
+            "fallback_detected": "fallback" in stderr.lower(),
+            "stderr_tail": stderr[-4000:],
+            "stdout_tail": stdout[-4000:],
+            "error": f"mu timed out after {timeout}s",
+        }
     elapsed = time.perf_counter() - start
     fallback_detected = "fallback" in result.stderr.lower()
     row = {
