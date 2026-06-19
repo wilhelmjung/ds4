@@ -192,6 +192,11 @@ Useful artifacts from the current validation stage:
 /tmp/mu-fullcontent-page224-content512/transformers120-vs-metal.metrics.json
 /tmp/mu-benchmark-cpu-page224-token1-timing.json
 /tmp/mu-benchmark-metal-page224-token1-timing.json
+/tmp/mu-benchmark-cpu-page224-fullcontent128-timing.json
+/tmp/mu-benchmark-metal-page224-fullcontent128-timing.json
+/tmp/mu-fullcontent128-timing-page224/cpu_page_0224.json
+/tmp/mu-fullcontent128-timing-page224/metal_page_0224.json
+/tmp/mu-fullcontent128-timing-page224/cpu-vs-metal.metrics.json
 ```
 
 The Transformers reference used for page 224:
@@ -271,6 +276,34 @@ full-page vision encode dominates the fixed per-page cost. Optimize Metal buffer
 reuse and host/device transfers there before spending time on broad
 full-content sampling.
 
+A second timing run used page 224 full-content mode with layout
+`--max-new-tokens 128` and `--content-max-new-tokens 128`. This is not the
+content-completeness reference, because 128 content tokens truncate the table,
+but CPU and Metal remain exactly equal and it exercises the full three-block
+content loop.
+
+Key full-content128 numbers:
+
+| Stage | CPU s | Metal s | Metal / CPU |
+| --- | ---: | ---: | ---: |
+| layout_vision_encode | 49.1435 | 135.5313 | 2.76x |
+| layout_generate | 8.2231 | 494.9236 | 60.19x |
+| content_region_vision_encode | 32.2100 | 70.3365 | 2.18x |
+| content_region_generate | 11.9075 | 680.4337 | 57.14x |
+| content_total | 44.2390 | 750.9101 | 16.97x |
+| page_total | 105.5664 | 1385.3995 | 13.12x |
+
+Revised performance conclusion:
+
+- For fixed per-page cost, `layout_vision_encode` is still the main front-half
+  bottleneck.
+- For full-content extraction, repeated full-prefill generation is now the
+  largest measured Metal cost. `layout_generate + content_region_generate` is
+  about `1175.36s` out of `1385.40s` total.
+- The next optimization path should include both persistent Metal buffers for
+  vision encode and KV-cache decode or an equivalent strategy to avoid repeated
+  full-prefill generation.
+
 ## Known Gaps
 
 The current branch has not proven all desirable final-state properties:
@@ -293,23 +326,28 @@ The current branch has not proven all desirable final-state properties:
    - Avoid repeated `newBufferWithBytes` and CPU-side `memcpy` per dense/norm
      kernel.
 
-2. Profile and reduce full-page vision encode cost.
+2. Add a KV-cache decode path or equivalent generation reuse.
+   - Full-content timing shows Metal generation dominates page 224 content128.
+   - Keep the current full-prefill path as the correctness comparison path.
+   - Compare generated ids against CPU before using it for page benchmarks.
+
+3. Profile and reduce full-page vision encode cost.
    - Start with page 224 because the current report has CPU, Metal, and
      Transformers reference numbers.
    - Keep `--backend metal --no-cpu-fallback` as the only benchmark mode that
      counts.
 
-3. Add or improve timing instrumentation.
+4. Add or improve timing instrumentation.
    - Split page time into image preprocess, vision encode, layout generation,
      crop extraction, and content generation.
    - Record host/device bytes moved if practical.
 
-4. Re-run page 224 full-content after each optimization.
+5. Re-run page 224 full-content after each optimization.
    - Preserve CPU exactness first.
    - Compare against Transformers 120dpi page 224.
    - Update `mineru/docs/mu-performance-report.md` after meaningful changes.
 
-5. After page 224 performance improves, expand to the 10-page sample.
+6. After page 224 performance improves, expand to the 10-page sample.
    - First layout-only parity/performance.
    - Then full-content for the table-heavy pages if runtime becomes reasonable.
 

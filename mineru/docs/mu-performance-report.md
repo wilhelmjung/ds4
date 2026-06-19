@@ -487,3 +487,73 @@ Interpretation:
   stage.
 - The next performance experiment should instrument and reduce Metal buffer
   churn inside vision encode before broadening full-content runs.
+
+## Full-content Stage Timing Checkpoint
+
+Date: 2026-06-19
+Branch: `codex/mineru-metal-backend`
+
+After the 1-token timing smoke isolated fixed page costs, a page 224
+full-content timing run was executed with layout `--max-new-tokens 128` and
+`--content-max-new-tokens 128`. This run is still a truncation diagnostic for
+content completeness, but it exercises the full layout plus three content-block
+passes and preserves CPU/Metal exact parity.
+
+Artifacts:
+
+```text
+/tmp/mu-benchmark-cpu-page224-fullcontent128-timing.json
+/tmp/mu-benchmark-metal-page224-fullcontent128-timing.json
+/tmp/mu-fullcontent128-timing-page224/cpu_page_0224.json
+/tmp/mu-fullcontent128-timing-page224/metal_page_0224.json
+/tmp/mu-fullcontent128-timing-page224/cpu-vs-metal.metrics.json
+```
+
+Command shape:
+
+```text
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_benchmark_pages.py \
+  --backend metal \
+  --pages 224 \
+  --max-new-tokens 128 \
+  --content-max-new-tokens 128 \
+  --timing \
+  --timeout 3600 \
+  --out /tmp/mu-benchmark-metal-page224-fullcontent128-timing.json \
+  --save-output-dir /tmp/mu-fullcontent128-timing-page224
+```
+
+Accuracy, CPU versus Metal:
+
+| Metric | Value |
+| --- | ---: |
+| Block count exact | true |
+| Ordered type accuracy | 1.0000 |
+| Ordered mean bbox IoU | 1.0000 |
+| Ordered median bbox IoU | 1.0000 |
+| Mean content token F1 | 1.0000 |
+| Table exact cell recall | 1.0000 |
+
+Page 224 full-content128 stage timings:
+
+| Stage | CPU s | Metal s | Metal / CPU |
+| --- | ---: | ---: | ---: |
+| layout_vision_encode | 49.1435 | 135.5313 | 2.76x |
+| layout_generate | 8.2231 | 494.9236 | 60.19x |
+| content_region_vision_encode | 32.2100 | 70.3365 | 2.18x |
+| content_region_generate | 11.9075 | 680.4337 | 57.14x |
+| content_total | 44.2390 | 750.9101 | 16.97x |
+| page_total | 105.5664 | 1385.3995 | 13.12x |
+
+Interpretation:
+
+- The earlier 1-token timing smoke correctly identified full-page vision encode
+  as the dominant fixed per-page cost.
+- In full-content mode, repeated full-prefill generation dominates Metal wall
+  time: `layout_generate` plus `content_region_generate` accounts for about
+  `1175.36s` of the `1385.40s` page total.
+- Vision encode still matters: layout plus content-region vision encode accounts
+  for about `205.87s` on Metal.
+- The next optimization split should therefore be explicit: first keep reducing
+  vision encode buffer churn, but the largest full-content win requires a
+  KV-cache decode path or equivalent removal of repeated full-prefill generation.
