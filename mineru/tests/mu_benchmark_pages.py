@@ -44,7 +44,7 @@ def run_one(
     max_new_tokens: int | None,
     skip_content: bool,
     timeout: int,
-) -> tuple[float, list[dict], bool]:
+) -> dict:
     cmd = [str(MU), "--backend", backend]
     if backend == "metal":
         cmd.append("--no-cpu-fallback")
@@ -58,7 +58,7 @@ def run_one(
     result = subprocess.run(
         cmd,
         cwd=ROOT,
-        check=True,
+        check=False,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -66,9 +66,64 @@ def run_one(
     )
     elapsed = time.perf_counter() - start
     fallback_detected = "fallback" in result.stderr.lower()
+    row = {
+        "seconds": elapsed,
+        "command": cmd,
+        "returncode": result.returncode,
+        "fallback_detected": fallback_detected,
+        "stderr_tail": result.stderr[-4000:],
+    }
+    if result.returncode != 0:
+        row["error"] = f"mu exited with {result.returncode}"
+        row["stdout_tail"] = result.stdout[-4000:]
+        return row
     if backend == "metal" and fallback_detected:
-        raise RuntimeError(f"metal fallback appeared in stderr:\n{result.stderr}")
-    return elapsed, json.loads(result.stdout), fallback_detected
+        row["error"] = "metal fallback appeared in stderr"
+        row["stdout_tail"] = result.stdout[-4000:]
+        return row
+    blocks = json.loads(result.stdout)
+    row["blocks"] = len(blocks)
+    row["types"] = [b.get("type") for b in blocks]
+    return row
+
+
+def summarize(args: argparse.Namespace, rows: list[dict]) -> dict:
+    completed = [r for r in rows if r.get("returncode") == 0 and "error" not in r]
+    total = sum(float(r["seconds"]) for r in completed)
+    mean = total / len(completed) if completed else 0.0
+    return {
+        "backend": args.backend,
+        "pages": args.pages,
+        "max_new_tokens": args.max_new_tokens,
+        "skip_content": args.skip_content,
+        "total_seconds": total,
+        "mean_seconds": mean,
+        "completed_pages": len(completed),
+        "failed_pages": len(rows) - len(completed),
+        "fallback_rows": sum(1 for r in rows if r.get("fallback_detected")),
+        "rows": rows,
+    }
+
+
+def write_summary(args: argparse.Namespace, rows: list[dict]) -> None:
+    Path(args.out).write_text(
+        json.dumps(summarize(args, rows), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def load_resume_rows(args: argparse.Namespace) -> list[dict]:
+    path = Path(args.out)
+    if not args.resume or not path.exists():
+        return []
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if data.get("backend") != args.backend:
+        raise SystemExit(f"cannot resume {path}: backend mismatch")
+    if data.get("max_new_tokens") != args.max_new_tokens:
+        raise SystemExit(f"cannot resume {path}: max_new_tokens mismatch")
+    if data.get("skip_content") != args.skip_content:
+        raise SystemExit(f"cannot resume {path}: skip_content mismatch")
+    return list(data.get("rows", []))
 
 
 def main() -> None:
@@ -80,46 +135,37 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int)
     parser.add_argument("--skip-content", action="store_true")
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--keep-going", action="store_true")
     args = parser.parse_args()
 
-    rows = []
+    rows = load_resume_rows(args)
+    done_pages = {
+        int(r["page"])
+        for r in rows
+        if r.get("returncode") == 0 and "error" not in r and "page" in r
+    }
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
         for page in args.pages:
+            if page in done_pages:
+                continue
             image = tmp / f"page_{page:04d}.png"
             render_page(page, image)
-            seconds, blocks, fallback_detected = run_one(
+            row = run_one(
                 args.backend,
                 image,
                 max_new_tokens=args.max_new_tokens,
                 skip_content=args.skip_content,
                 timeout=args.timeout,
             )
-            row = {
-                "page": page,
-                "seconds": seconds,
-                "blocks": len(blocks),
-                "types": [b.get("type") for b in blocks],
-                "fallback_detected": fallback_detected,
-            }
+            row["page"] = page
             rows.append(row)
             print(json.dumps(row, ensure_ascii=False), flush=True)
-
-    total = sum(r["seconds"] for r in rows)
-    output = {
-        "backend": args.backend,
-        "pages": args.pages,
-        "max_new_tokens": args.max_new_tokens,
-        "skip_content": args.skip_content,
-        "total_seconds": total,
-        "mean_seconds": total / len(rows),
-        "fallback_rows": sum(1 for r in rows if r["fallback_detected"]),
-        "rows": rows,
-    }
-    Path(args.out).write_text(
-        json.dumps(output, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+            write_summary(args, rows)
+            if "error" in row and not args.keep_going:
+                raise SystemExit(row["error"])
+    write_summary(args, rows)
 
 
 if __name__ == "__main__":
