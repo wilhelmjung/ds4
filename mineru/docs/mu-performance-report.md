@@ -641,3 +641,84 @@ Interpretation:
 - The next largest remaining cost is vision encode plus per-token/per-layer
   host/device buffer churn. Persistent Metal buffers for weights, K/V cache,
   intermediate activations, and logits are now the highest-value optimization.
+
+## Full-content512 KV-cache Checkpoint
+
+Date: 2026-06-19
+Branch: `codex/mineru-metal-backend`
+
+After the cache-backed decode path was committed, page 224 was re-run with
+`--content-max-new-tokens 512` to validate non-truncated table extraction.
+
+Artifacts:
+
+```text
+/tmp/mu-benchmark-cpu-page224-fullcontent512-kvcache-baseline.json
+/tmp/mu-benchmark-metal-page224-fullcontent512-kvcache.json
+/tmp/mu-fullcontent512-kvcache-page224/cpu_page_0224.json
+/tmp/mu-fullcontent512-kvcache-page224/metal_page_0224.json
+/tmp/mu-fullcontent512-kvcache-page224/cpu-vs-metal.metrics.json
+/tmp/mu-fullcontent512-kvcache-page224/transformers120-vs-metal.metrics.json
+```
+
+Page 224 full-content512 timing:
+
+| Stage | CPU s | Metal s | Metal / CPU |
+| --- | ---: | ---: | ---: |
+| layout_vision_encode | 37.1779 | 153.2136 | 4.12x |
+| layout_generate | 6.7742 | 35.3128 | 5.21x |
+| content_region_vision_encode | 24.1663 | 97.4937 | 4.03x |
+| content_region_generate | 20.8911 | 133.5595 | 6.39x |
+| content_total | 45.2789 | 231.3019 | 5.11x |
+| page_total | 93.0259 | 423.7176 | 4.55x |
+
+End-to-end timing summary:
+
+| Backend | Seconds | Blocks/types | CPU fallback rows |
+| --- | ---: | --- | ---: |
+| Transformers/MPS 120dpi reference | 52.93 | 3 table/footer/page_number | n/a |
+| CPU reference | 93.13 | 3 table/footer/page_number | 0 |
+| Metal no-fallback after KV-cache | 423.85 | 3 table/footer/page_number | 0 |
+| Metal no-fallback before KV-cache | 3437.83 | 3 table/footer/page_number | 0 |
+
+Speed ratios:
+
+| Comparison | Ratio |
+| --- | ---: |
+| Metal after KV-cache / CPU | 4.55x slower |
+| Metal after KV-cache / Transformers | 8.01x slower |
+| Metal before KV-cache / Metal after KV-cache | 8.11x faster after KV-cache |
+
+Accuracy, CPU versus Metal after KV-cache:
+
+| Metric | Value |
+| --- | ---: |
+| Block count exact | true |
+| Ordered type accuracy | 1.0000 |
+| Ordered mean bbox IoU | 1.0000 |
+| Ordered median bbox IoU | 1.0000 |
+| Mean content token F1 | 1.0000 |
+| Table exact cell recall | 1.0000 |
+
+Accuracy, Transformers/MPS 120dpi versus Metal after KV-cache:
+
+| Metric | Value |
+| --- | ---: |
+| Block count exact | true |
+| Ordered type accuracy | 1.0000 |
+| Ordered mean bbox IoU | 0.9444 |
+| Ordered median bbox IoU | 0.9412 |
+| Mean content token F1 | 1.0000 |
+| Table exact cell recall | 1.0000 |
+
+Interpretation:
+
+- The cache-backed decode path preserves full-content page 224 accuracy at the
+  512-token content limit.
+- The old page 224 content512 Metal no-fallback run took `3437.83s`; the new
+  run takes `423.85s`, an `8.11x` improvement.
+- Metal remains slower than CPU and Transformers. The largest remaining
+  full-content512 Metal stages are `layout_vision_encode` (`153.21s`),
+  `content_region_generate` (`133.56s`), and `content_region_vision_encode`
+  (`97.49s`). The next optimization should keep K/V cache and dense/norm
+  intermediates in persistent Metal buffers.

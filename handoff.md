@@ -371,6 +371,56 @@ Updated performance conclusion:
   K/V cache, intermediate activations, and logits to remove per-kernel
   `newBufferWithBytes` and host/device copies.
 
+## Full-content512 KV-cache Validation
+
+Date: 2026-06-19
+
+Page 224 was re-run with `--content-max-new-tokens 512` after commit
+`46d7841`.
+
+Artifacts:
+
+```text
+/tmp/mu-benchmark-metal-page224-fullcontent512-kvcache.json
+/tmp/mu-benchmark-cpu-page224-fullcontent512-kvcache-baseline.json
+/tmp/mu-fullcontent512-kvcache-page224/cpu_page_0224.json
+/tmp/mu-fullcontent512-kvcache-page224/metal_page_0224.json
+/tmp/mu-fullcontent512-kvcache-page224/cpu-vs-metal.metrics.json
+/tmp/mu-fullcontent512-kvcache-page224/transformers120-vs-metal.metrics.json
+```
+
+Timing:
+
+| Backend | Seconds | Blocks/types | Fallback rows |
+| --- | ---: | --- | ---: |
+| Transformers/MPS 120dpi reference | 52.93 | 3 table/footer/page_number | n/a |
+| CPU reference | 93.13 | 3 table/footer/page_number | 0 |
+| Metal no-fallback after KV-cache | 423.85 | 3 table/footer/page_number | 0 |
+| Metal no-fallback before KV-cache | 3437.83 | 3 table/footer/page_number | 0 |
+
+Stage highlights:
+
+| Stage | CPU s | Metal s | Metal / CPU |
+| --- | ---: | ---: | ---: |
+| layout_vision_encode | 37.1779 | 153.2136 | 4.12x |
+| layout_generate | 6.7742 | 35.3128 | 5.21x |
+| content_region_vision_encode | 24.1663 | 97.4937 | 4.03x |
+| content_region_generate | 20.8911 | 133.5595 | 6.39x |
+| content_total | 45.2789 | 231.3019 | 5.11x |
+| page_total | 93.0259 | 423.7176 | 4.55x |
+
+Accuracy:
+
+| Comparison | Content F1 | Table exact cell recall | BBox mean IoU |
+| --- | ---: | ---: | ---: |
+| CPU vs Metal | 1.0000 | 1.0000 | 1.0000 |
+| Transformers/MPS 120dpi vs Metal | 1.0000 | 1.0000 | 0.9444 |
+
+The full-content512 Metal no-fallback path is now validated for page 224 with
+complete table content. It is about `8.11x` faster than the pre-KV-cache
+content512 Metal run, but still about `4.55x` slower than CPU and `8.01x`
+slower than Transformers/MPS.
+
 ## Known Gaps
 
 The current branch has not proven all desirable final-state properties:
