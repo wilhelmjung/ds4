@@ -1837,12 +1837,73 @@ static int check_trace_file(mu_engine *engine, const char *path) {
     return 0;
 }
 
+static char *result_json_string(const mu_result *result) {
+    FILE *fp = tmpfile();
+    if (!fp) return NULL;
+    if (mu_result_write_json(result, fp) != 0 ||
+        fflush(fp) != 0 ||
+        fseek(fp, 0, SEEK_END) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    long len = ftell(fp);
+    if (len < 0 || fseek(fp, 0, SEEK_SET) != 0) {
+        fclose(fp);
+        return NULL;
+    }
+    char *buf = (char *)malloc((size_t)len + 1);
+    if (!buf) {
+        fclose(fp);
+        return NULL;
+    }
+    size_t got = fread(buf, 1, (size_t)len, fp);
+    fclose(fp);
+    if (got != (size_t)len) {
+        free(buf);
+        return NULL;
+    }
+    buf[len] = 0;
+    return buf;
+}
+
+static int parse_image_json_with_backend(const mu_engine_options *base_opt,
+                                         mu_backend backend,
+                                         bool allow_cpu_fallback,
+                                         const char *image_path,
+                                         char **json_out,
+                                         int *fallback_count_out) {
+    if (!base_opt || !image_path || !json_out || !fallback_count_out) return -1;
+    *json_out = NULL;
+    *fallback_count_out = 0;
+
+    mu_engine_options opt = *base_opt;
+    opt.backend = backend;
+    opt.allow_cpu_fallback = allow_cpu_fallback;
+    opt.inspect_only = false;
+
+    mu_engine *engine = NULL;
+    int rc = mu_engine_open(&engine, &opt);
+    if (rc) return -10 + rc;
+
+    mu_result *result = NULL;
+    rc = mu_parse_image_file(engine, image_path, &result);
+    if (rc == 0) {
+        *json_out = result_json_string(result);
+        if (!*json_out) rc = -20;
+    }
+    *fallback_count_out = mu_engine_cpu_fallback_count(engine);
+    mu_result_free(result);
+    mu_engine_close(engine);
+    return rc;
+}
+
 int main(int argc, char **argv) {
     mu_engine_options opt = mu_engine_options_default();
     const char *trace_path = NULL;
     const char *image_path = NULL;
     int write_json = 0;
     int write_markdown = 0;
+    int compare_backends = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model-dir") && i + 1 < argc) {
             opt.model_dir = argv[++i];
@@ -1868,6 +1929,8 @@ int main(int argc, char **argv) {
             opt.max_new_tokens = (int)v;
         } else if (!strcmp(argv[i], "--skip-content")) {
             opt.skip_content = true;
+        } else if (!strcmp(argv[i], "--compare-backends")) {
+            compare_backends = 1;
         } else if (!strcmp(argv[i], "--inspect")) {
             opt.inspect_only = true;
         } else if (!strcmp(argv[i], "--check-trace") && i + 1 < argc) {
@@ -1879,25 +1942,69 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--markdown")) {
             write_markdown = 1;
         } else {
-            fprintf(stderr, "usage: %s [--model-dir PATH] [--backend cpu|metal] [--no-cpu-fallback] [--max-new-tokens N] [--skip-content] [--inspect] [--check-trace PATH] [--image PATH (--json|--markdown)]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--model-dir PATH] [--backend cpu|metal] [--no-cpu-fallback] [--max-new-tokens N] [--skip-content] [--compare-backends] [--inspect] [--check-trace PATH] [--image PATH (--json|--markdown)]\n", argv[0]);
             return 2;
         }
     }
-    if (trace_path && image_path) {
-        fprintf(stderr, "--check-trace and --image are mutually exclusive\n");
+    if (trace_path && (image_path || compare_backends)) {
+        fprintf(stderr, "--check-trace is mutually exclusive with --image/--compare-backends\n");
         return 2;
     }
     if (write_json && write_markdown) {
         fprintf(stderr, "--json and --markdown are mutually exclusive\n");
         return 2;
     }
+    if (compare_backends && !image_path) {
+        fprintf(stderr, "--compare-backends requires --image PATH\n");
+        return 2;
+    }
+    if (compare_backends && (write_json || write_markdown)) {
+        fprintf(stderr, "--compare-backends writes its own JSON summary\n");
+        return 2;
+    }
     if ((write_json || write_markdown) && !image_path) {
         fprintf(stderr, "--json/--markdown require --image PATH\n");
         return 2;
     }
-    if (image_path && !write_json && !write_markdown) {
+    if (image_path && !write_json && !write_markdown && !compare_backends) {
         fprintf(stderr, "--image requires --json or --markdown\n");
         return 2;
+    }
+
+    if (compare_backends) {
+        char *cpu_json = NULL;
+        char *metal_json = NULL;
+        int cpu_fallback = 0;
+        int metal_fallback = 0;
+        int cpu_rc = parse_image_json_with_backend(&opt, MU_BACKEND_CPU, true,
+                                                   image_path, &cpu_json,
+                                                   &cpu_fallback);
+        if (cpu_rc) {
+            fprintf(stderr, "cpu backend parse failed: %d\n", cpu_rc);
+            free(cpu_json);
+            return 1;
+        }
+        int metal_rc = parse_image_json_with_backend(&opt, MU_BACKEND_METAL, false,
+                                                     image_path, &metal_json,
+                                                     &metal_fallback);
+        if (metal_rc) {
+            fprintf(stderr, "metal backend parse failed: %d\n", metal_rc);
+            free(cpu_json);
+            free(metal_json);
+            return 1;
+        }
+        int equal = cpu_json && metal_json && strcmp(cpu_json, metal_json) == 0;
+        printf("{\"block_count_equal\":%s,\"type_equal\":%s,"
+               "\"content_equal\":%s,\"json_equal\":%s,"
+               "\"cpu_fallback_count\":%d,\"metal_cpu_fallback_count\":%d}\n",
+               equal ? "true" : "false",
+               equal ? "true" : "false",
+               equal ? "true" : "false",
+               equal ? "true" : "false",
+               cpu_fallback, metal_fallback);
+        free(cpu_json);
+        free(metal_json);
+        return (equal && metal_fallback == 0) ? 0 : 1;
     }
 
     mu_engine *engine = NULL;

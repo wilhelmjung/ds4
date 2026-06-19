@@ -204,3 +204,73 @@ Most likely optimization order:
 experiments. It is not yet the faster production path. The native engine should
 now be optimized around Metal execution, with this report serving as the first
 baseline to beat.
+
+## Metal Backend Checkpoint
+
+Date: 2026-06-19
+Branch: `codex/mineru-metal-backend`
+Commit: `60dc6ee`
+
+The first full-page Metal correctness bridge is now available behind
+`--backend metal --no-cpu-fallback`. CPU remains the reference backend and is
+still the default. The current Metal path is intentionally conservative: it
+keeps C-side orchestration, uses unoptimized row-wise vision attention kernels,
+and still pays repeated full-prefill generation costs in the text decoder.
+
+Fresh validation before this checkpoint:
+
+```text
+make -B mu
+make mu-test
+./mu --backend cpu --check-trace mineru/tests/mu-traces/text.json
+./mu --backend cpu --check-trace mineru/tests/mu-traces/layout.json
+./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/text.json
+./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/layout.json
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_metal_vision_encode_smoke.py
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_metal_vision_smoke.py
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_metal_page_smoke.py
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_compare_backends.py
+git diff --check
+```
+
+The backend comparison smoke used `--compare-backends --skip-content
+--max-new-tokens 4` on `/Users/will/github/mineru-model/sample_page.png`; CPU
+and Metal produced identical JSON and Metal reported zero fallback.
+
+Stage timing artifacts:
+
+```text
+/tmp/mu-benchmark-cpu-page224-smoke.json
+/tmp/mu-benchmark-metal-page224-smoke.json
+/tmp/mu-benchmark-cpu-page224-layout.json
+```
+
+Page 224 quick smoke, `--max-new-tokens 4 --skip-content`:
+
+| Backend | Seconds | Blocks | CPU fallback rows |
+| --- | ---: | ---: | ---: |
+| CPU reference | 50.56 | 0 | 0 |
+| Metal no-fallback | 194.05 | 0 | 0 |
+
+Page 224 layout-only CPU reference, `--max-new-tokens 128 --skip-content`:
+
+| Backend | Seconds | Blocks | Ordered types |
+| --- | ---: | ---: | --- |
+| CPU reference | 54.09 | 3 | table, footer, page_number |
+
+Interpretation:
+
+- Metal no-fallback is functionally wired through full-page vision encode, but
+  the current correctness bridge is slower than CPU on the quick page224 smoke
+  by about 3.8x.
+- The 4-token smoke is useful for fallback and process timing, but not for
+  accuracy, because it stops before layout blocks are emitted.
+- The 128-token page224 CPU run confirms that the layout-only setting can emit
+  the expected 3 blocks. The matching Metal 128-token run was interrupted after
+  several minutes because repeated full-prefill decode made it too slow for an
+  interactive checkpoint; it must be rerun as a long benchmark after decoder
+  optimization or in a background run.
+- The next performance work should target reusable Metal buffers, fused vision
+  attention, dense-kernel batching, and KV-cache decode. Until then, Metal
+  numbers should be reported as correctness-bridge numbers, not production
+  acceleration.
