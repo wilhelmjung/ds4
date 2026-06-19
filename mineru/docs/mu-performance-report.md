@@ -331,3 +331,102 @@ Interpretation:
   attention, dense-kernel batching, and KV-cache decode. Until then, Metal
   numbers should be reported as correctness-bridge numbers, not production
   acceleration.
+
+## Full-content Page 224 E2E Checkpoint
+
+Date: 2026-06-19
+Branch: `codex/mineru-metal-backend`
+
+This checkpoint extends the pure Metal validation from layout-only generation to
+full page extraction on page 224. The run uses Metal with CPU fallback disabled:
+
+```text
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_benchmark_pages.py \
+  --backend metal \
+  --pages 224 \
+  --max-new-tokens 128 \
+  --content-max-new-tokens 512 \
+  --timeout 7200 \
+  --resume \
+  --out /tmp/mu-benchmark-metal-page224-fullcontent-content512.json \
+  --save-output-dir /tmp/mu-fullcontent-page224-content512
+```
+
+The matching CPU reference command used the same layout/content token limits and
+saved `/tmp/mu-fullcontent-page224-content512/cpu_page_0224.json`.
+
+Reference artifacts:
+
+```text
+/Users/will/github/mineru-model/runs/nasa_systems_engineering_handbook_rev2_page224_mps_120dpi_test/pages.jsonl
+/tmp/mu-benchmark-cpu-page224-fullcontent-content512.json
+/tmp/mu-benchmark-metal-page224-fullcontent-content512.json
+/tmp/mu-fullcontent-page224-content512/cpu_page_0224.json
+/tmp/mu-fullcontent-page224-content512/metal_page_0224.json
+/tmp/mu-fullcontent-page224-content512/cpu-vs-metal.metrics.json
+/tmp/mu-fullcontent-page224-content512/transformers120-vs-cpu.metrics.json
+/tmp/mu-fullcontent-page224-content512/transformers120-vs-metal.metrics.json
+```
+
+Performance:
+
+| Backend | Seconds | Blocks/types | CPU fallback rows |
+| --- | ---: | --- | ---: |
+| Transformers/MPS 120dpi reference | 52.93 | 3 table/footer/page_number | n/a |
+| CPU reference | 109.63 | 3 table/footer/page_number | 0 |
+| Metal no-fallback | 3437.83 | 3 table/footer/page_number | 0 |
+
+Speed ratios:
+
+| Comparison | Ratio |
+| --- | ---: |
+| CPU / Transformers | 2.07x slower |
+| Metal / CPU | 31.36x slower |
+| Metal / Transformers | 64.95x slower |
+
+Accuracy, CPU versus Metal:
+
+| Metric | Value |
+| --- | ---: |
+| Block count exact | true |
+| Ordered type accuracy | 1.0000 |
+| Ordered mean bbox IoU | 1.0000 |
+| Ordered median bbox IoU | 1.0000 |
+| Mean content token F1 | 1.0000 |
+| Table exact cell recall | 1.0000 |
+
+Accuracy, Transformers/MPS 120dpi versus Metal:
+
+| Metric | Value |
+| --- | ---: |
+| Block count exact | true |
+| Ordered type accuracy | 1.0000 |
+| Ordered mean bbox IoU | 0.9444 |
+| Ordered median bbox IoU | 0.9412 |
+| Mean content token F1 | 1.0000 |
+| Table exact cell recall | 1.0000 |
+
+Diagnostic note:
+
+- With `--content-max-new-tokens` unset and `--max-new-tokens 128`, CPU and
+  Metal are still exactly identical, but the table content is truncated after
+  the third row. Against the 512-token Transformers reference, that diagnostic
+  run reports content F1 `0.8302` and table cell recall `0.3182`. It is useful
+  for CPU/Metal parity and fallback detection, but not for content-completeness
+  accuracy.
+- With `--content-max-new-tokens 512`, Metal matches CPU exactly and matches the
+  Transformers page-224 table/footer/page-number content. This is the first
+  full-content pure Metal no-fallback E2E validation.
+
+Interpretation:
+
+- Pure Metal execution is now functionally complete for this page-level
+  full-content case: vision encode, layout generation, crop extraction, table
+  recognition, footer recognition, page-number recognition, JSON writing, and
+  fallback detection all run with `--no-cpu-fallback`.
+- Performance is not production-ready. The 1-token and layout-only diagnostics
+  already pointed at vision encode and repeated host/device buffer work; the
+  content512 result confirms that full-content extraction amplifies the same
+  bottleneck. The next implementation target remains persistent Metal buffers
+  for weights/intermediates and fewer per-kernel host-device copies, followed by
+  KV-cache decode.

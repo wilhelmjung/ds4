@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import tempfile
 import time
@@ -44,6 +45,9 @@ def run_one(
     max_new_tokens: int | None,
     skip_content: bool,
     timeout: int,
+    output_dir: Path | None = None,
+    page: int | None = None,
+    content_max_new_tokens: int | None = None,
 ) -> dict:
     cmd = [str(MU), "--backend", backend]
     if backend == "metal":
@@ -55,6 +59,10 @@ def run_one(
     cmd.extend(["--image", str(image), "--json"])
 
     start = time.perf_counter()
+    env = None
+    if content_max_new_tokens is not None:
+        env = os.environ.copy()
+        env["MU_CONTENT_MAX_NEW_TOKENS"] = str(content_max_new_tokens)
     try:
         result = subprocess.run(
             cmd,
@@ -64,6 +72,7 @@ def run_one(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         elapsed = time.perf_counter() - start
@@ -78,6 +87,7 @@ def run_one(
             "command": cmd,
             "returncode": None,
             "timeout_seconds": timeout,
+            "content_max_new_tokens": content_max_new_tokens,
             "fallback_detected": "fallback" in stderr.lower(),
             "stderr_tail": stderr[-4000:],
             "stdout_tail": stdout[-4000:],
@@ -89,6 +99,7 @@ def run_one(
         "seconds": elapsed,
         "command": cmd,
         "returncode": result.returncode,
+        "content_max_new_tokens": content_max_new_tokens,
         "fallback_detected": fallback_detected,
         "stderr_tail": result.stderr[-4000:],
     }
@@ -103,6 +114,15 @@ def run_one(
     blocks = json.loads(result.stdout)
     row["blocks"] = len(blocks)
     row["types"] = [b.get("type") for b in blocks]
+    if output_dir is not None:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"{backend}_page_{page:04d}" if page is not None else f"{backend}_output"
+        out_path = output_dir / f"{stem}.json"
+        out_path.write_text(
+            json.dumps(blocks, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        row["output_json"] = str(out_path)
     return row
 
 
@@ -114,6 +134,7 @@ def summarize(args: argparse.Namespace, rows: list[dict]) -> dict:
         "backend": args.backend,
         "pages": args.pages,
         "max_new_tokens": args.max_new_tokens,
+        "content_max_new_tokens": args.content_max_new_tokens,
         "skip_content": args.skip_content,
         "total_seconds": total,
         "mean_seconds": mean,
@@ -140,6 +161,8 @@ def load_resume_rows(args: argparse.Namespace) -> list[dict]:
         raise SystemExit(f"cannot resume {path}: backend mismatch")
     if data.get("max_new_tokens") != args.max_new_tokens:
         raise SystemExit(f"cannot resume {path}: max_new_tokens mismatch")
+    if data.get("content_max_new_tokens") != args.content_max_new_tokens:
+        raise SystemExit(f"cannot resume {path}: content_max_new_tokens mismatch")
     if data.get("skip_content") != args.skip_content:
         raise SystemExit(f"cannot resume {path}: skip_content mismatch")
     return list(data.get("rows", []))
@@ -152,10 +175,12 @@ def main() -> None:
     parser.add_argument("--pages", type=parse_pages,
                         default=DEFAULT_PAGES)
     parser.add_argument("--max-new-tokens", type=int)
+    parser.add_argument("--content-max-new-tokens", type=int)
     parser.add_argument("--skip-content", action="store_true")
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--keep-going", action="store_true")
+    parser.add_argument("--save-output-dir", type=Path)
     args = parser.parse_args()
 
     rows = load_resume_rows(args)
@@ -177,6 +202,9 @@ def main() -> None:
                 max_new_tokens=args.max_new_tokens,
                 skip_content=args.skip_content,
                 timeout=args.timeout,
+                output_dir=args.save_output_dir,
+                page=page,
+                content_max_new_tokens=args.content_max_new_tokens,
             )
             row["page"] = page
             rows.append(row)
