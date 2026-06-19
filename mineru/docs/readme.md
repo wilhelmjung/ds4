@@ -1,7 +1,7 @@
 # ds4.c 架构和原理
 
 > MinerU 相关文档：
-> [设计](mu-design.md)，[Metal 化设计](mu-metal-design.md)，[Metal 执行计划](mu-metal-plan.md)，[计划](mu-plan.md)，[性能测试报告](mu-performance-report.md)。
+> [设计](mu-design.md)，[Metal 化设计](mu-metal-design.md)，[Metal 执行计划](mu-metal-plan.md)，[计划](mu-plan.md)，[性能测试报告](mu-performance-report.md)，[MU Skills](mu-skills.md)。
 
 `ds4.c` 是 DwarfStar 的核心推理引擎。它不是通用 GGUF runner，也不是对其他推理库的包装，而是一条为 DeepSeek V4 Flash / Pro 固化的本地推理管线。
 

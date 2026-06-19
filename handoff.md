@@ -476,6 +476,71 @@ complete table content. It is about `8.11x` faster than the pre-KV-cache
 content512 Metal run, but still about `4.55x` slower than CPU and `8.01x`
 slower than Transformers/MPS.
 
+## Metal Performance Interpretation
+
+Metal being slower than CPU is expected for the current branch stage, but it is
+not acceptable as the final performance target.
+
+Current status:
+
+| Comparison | Current result |
+| --- | ---: |
+| 10-page Metal / CPU | 2.92x slower |
+| 10-page Metal / Transformers/MPS | 7.05x slower |
+| Page 224 Metal / CPU | 4.55x slower |
+
+Interpretation:
+
+- The current Metal path should be treated as a pure Metal correctness bridge,
+  not a production accelerator.
+- CPU is already reasonably strong because it uses Accelerate/CBLAS and avoids
+  much of the current Metal buffer churn.
+- The Metal path still spends too much time creating buffers, copying data, and
+  synchronizing between host and GPU.
+- Many kernels are still stage-by-stage ports of the CPU pipeline rather than
+  fully GPU-shaped tiled, batched, or fused kernels.
+- Unified memory on Apple Silicon reduces copy penalties, but it does not make
+  repeated `newBufferWithBytes`, `memcpy`, command-buffer submission, or logits
+  readback free.
+
+Highest-value next measures:
+
+1. Add memory and dispatch diagnostics.
+   - Count `MTLBuffer` creations per page and per stage.
+   - Record bytes copied host-to-device and device-to-host.
+   - Count command buffers, kernel dispatches, and logits readbacks.
+
+2. Add persistent Metal buffer ownership.
+   - Keep weights in reusable `MTLBuffer`s.
+   - Reuse intermediate activation buffers.
+   - Keep K/V cache and logits on GPU where possible.
+
+3. Keep K/V cache fully GPU-resident during decode.
+   - The existing KV-cache decode already removed the worst repeated full
+     prefill cost.
+   - The remaining work is reducing cache slice copies, one-token buffer churn,
+     and CPU-side decode bookkeeping.
+
+4. Optimize the vision tower.
+   - The 10-page mean `layout_vision_encode` is `105.94s/page` on Metal versus
+     `42.24s/page` on CPU.
+   - Start with reusable buffers, then tiled dense kernels and attention fusion.
+
+5. Optimize content generation.
+   - The 10-page mean `content_region_generate` is `82.69s/page` on Metal
+     versus `18.17s/page` on CPU.
+   - Reduce kernel count, avoid logits readback where possible, and move
+     argmax/top-k onto Metal.
+
+Operational rule:
+
+- Do not rerun the full 10-page CPU baseline for Metal-only optimization.
+- Use page 224 full-content512 as the first performance regression gate.
+- Re-run the 10-page Metal no-fallback sample only after page 224 improves and
+  remains CPU-exact.
+- Rerun CPU only when CPU code, parsing semantics, token limits, model weights,
+  or comparison logic changed.
+
 ## Known Gaps
 
 The current branch has not proven all desirable final-state properties:
