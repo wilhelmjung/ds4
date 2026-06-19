@@ -209,7 +209,7 @@ baseline to beat.
 
 Date: 2026-06-19
 Branch: `codex/mineru-metal-backend`
-Commits: `60dc6ee`, `50cf405`, `c3c8312`
+Measurement code commits: `60dc6ee` through `a8d8d43`
 
 The first full-page Metal correctness bridge is now available behind
 `--backend metal --no-cpu-fallback`. CPU remains the reference backend and is
@@ -250,6 +250,8 @@ Stage timing artifacts:
 /tmp/mu-benchmark-cpu-10-layout128.json
 /tmp/mu-benchmark-metal-page224-layout128.json
 /tmp/mu-benchmark-metal-layout128-batch1.json
+/tmp/mu-benchmark-metal-layout128-batch2.json
+/tmp/mu-benchmark-metal-layout128-batch3.json
 ```
 
 10-page quick E2E smoke, `--max-new-tokens 4 --skip-content`:
@@ -288,7 +290,12 @@ Page 224 1-token diagnostic, `--max-new-tokens 1 --skip-content`:
 | CPU reference | 52.29 | 0 | 0 |
 | Metal no-fallback | 137.26 | 0 | 0 |
 
-Layout-only parity sample, `--max-new-tokens 128 --skip-content`:
+10-page layout-only parity, `--max-new-tokens 128 --skip-content`:
+
+| Backend | Total s | Mean s/page | Completed pages | CPU fallback rows |
+| --- | ---: | ---: | ---: | ---: |
+| CPU reference | 511.64 | 51.16 | 10 / 10 | 0 |
+| Metal no-fallback | 7435.68 | 743.57 | 10 / 10 | 0 |
 
 | Page | CPU s | Metal s | CPU blocks/types | Metal blocks/types | Match | Metal fallback |
 | ---: | ---: | ---: | --- | --- | ---: | ---: |
@@ -296,10 +303,12 @@ Layout-only parity sample, `--max-new-tokens 128 --skip-content`:
 | 234 | 51.02 | 788.66 | 3 table/footer/page_number | 3 table/footer/page_number | yes | 0 |
 | 237 | 50.92 | 742.55 | 3 table/footer/page_number | 3 table/footer/page_number | yes | 0 |
 | 241 | 50.49 | 574.56 | 3 table/footer/page_number | 3 table/footer/page_number | yes | 0 |
-
-The CPU reference completed all 10 sampled pages in this configuration:
-511.64s total, 51.16s/page mean, zero fallback rows. The Metal no-fallback
-layout-only sample currently covers 4 of 10 pages.
+| 244 | 50.10 | 583.62 | 3 table/footer/page_number | 3 table/footer/page_number | yes | 0 |
+| 247 | 50.44 | 569.31 | 3 table/footer/page_number | 3 table/footer/page_number | yes | 0 |
+| 258 | 51.38 | 748.50 | 4 title/text/footer/page_number | 4 title/text/footer/page_number | yes | 0 |
+| 281 | 51.76 | 739.76 | 4 title/text/footer/page_number | 4 title/text/footer/page_number | yes | 0 |
+| 303 | 51.51 | 793.89 | 4 title/text/footer/page_number | 4 title/text/footer/page_number | yes | 0 |
+| 334 | 51.59 | 1283.85 | 4 text/text/footer/page_number | 4 text/text/footer/page_number | yes | 0 |
 
 Interpretation:
 
@@ -309,10 +318,10 @@ Interpretation:
 - The 4-token smoke is useful for end-to-end process timing and fallback
   detection across the sampled corpus, but not for accuracy, because it stops
   before layout blocks are emitted.
-- The 128-token layout-only runs are the first page-level accuracy results for
-  the pure Metal path. Metal no-fallback matches CPU block count and ordered
-  block types on the 4 measured pages with zero fallback. These pages are still
-  about 11.8x to 15.5x slower than CPU, depending on page.
+- The 128-token layout-only run completes all 10 sampled pages in pure Metal
+  no-fallback mode. Metal matches CPU block count and ordered block types on all
+  10 pages with zero fallback. It is still about 14.5x slower than CPU on this
+  layout-only benchmark.
 - The 1-token diagnostic shows that most current Metal time is already spent
   before token generation has much room to accumulate. The next optimization
   target is therefore full-page vision encode: keep intermediate tensors and
