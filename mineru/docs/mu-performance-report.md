@@ -245,6 +245,8 @@ Stage timing artifacts:
 /tmp/mu-benchmark-cpu-page224-layout.json
 /tmp/mu-benchmark-cpu-10-smoke.json
 /tmp/mu-benchmark-metal-10-smoke.json
+/tmp/mu-benchmark-cpu-page224-token1.json
+/tmp/mu-benchmark-metal-page224-token1.json
 ```
 
 10-page quick E2E smoke, `--max-new-tokens 4 --skip-content`:
@@ -276,6 +278,13 @@ Page 224 quick smoke, `--max-new-tokens 4 --skip-content`:
 | CPU reference | 50.56 | 0 | 0 |
 | Metal no-fallback | 194.05 | 0 | 0 |
 
+Page 224 1-token diagnostic, `--max-new-tokens 1 --skip-content`:
+
+| Backend | Seconds | Blocks | CPU fallback rows |
+| --- | ---: | ---: | ---: |
+| CPU reference | 52.29 | 0 | 0 |
+| Metal no-fallback | 137.26 | 0 | 0 |
+
 Page 224 layout-only CPU reference, `--max-new-tokens 128 --skip-content`:
 
 | Backend | Seconds | Blocks | Ordered types |
@@ -295,6 +304,11 @@ Interpretation:
   several minutes because repeated full-prefill decode made it too slow for an
   interactive checkpoint; it must be rerun as a long benchmark after decoder
   optimization or in a background run.
+- The 1-token diagnostic shows that most current Metal time is already spent
+  before token generation has much room to accumulate. The next optimization
+  target is therefore full-page vision encode: keep intermediate tensors and
+  weights in reusable Metal buffers across the 32 vision blocks, then revisit
+  KV-cache decode.
 - The next performance work should target reusable Metal buffers, fused vision
   attention, dense-kernel batching, and KV-cache decode. Until then, Metal
   numbers should be reported as correctness-bridge numbers, not production
