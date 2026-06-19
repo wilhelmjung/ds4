@@ -557,3 +557,87 @@ Interpretation:
 - The next optimization split should therefore be explicit: first keep reducing
   vision encode buffer churn, but the largest full-content win requires a
   KV-cache decode path or equivalent removal of repeated full-prefill generation.
+
+## KV-cache Decode Checkpoint
+
+Date: 2026-06-19
+Branch: `codex/mineru-metal-backend`
+
+This checkpoint replaces the Metal generation loop's repeated full-prefill
+calls with a cache-backed decode path. The prefill still uses the existing
+Metal sequence kernels, but now records per-layer K/V cache rows. Subsequent
+decode tokens use one-token Metal dense/norm/MLP kernels plus the new
+`mu_text_attn_cached` Metal attention kernel. CPU remains the default backend
+and precision reference.
+
+New validation gates:
+
+```text
+make mu-test
+./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/text.json
+./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/layout.json
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_metal_text_generation_smoke.py
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_metal_layout_generation_smoke.py
+```
+
+The generation smoke tests now require `mu metal stage: text_cached_attn` in
+stderr, so they distinguish cached decode from the older repeated full-prefill
+path.
+
+Artifacts:
+
+```text
+/tmp/mu-benchmark-cpu-page224-layout128-kvcache-baseline.json
+/tmp/mu-benchmark-metal-page224-layout128-kvcache.json
+/tmp/mu-benchmark-cpu-page224-fullcontent128-kvcache-baseline.json
+/tmp/mu-benchmark-metal-page224-fullcontent128-kvcache.json
+/tmp/mu-fullcontent128-kvcache-page224/cpu_page_0224.json
+/tmp/mu-fullcontent128-kvcache-page224/metal_page_0224.json
+/tmp/mu-fullcontent128-kvcache-page224/cpu-vs-metal.metrics.json
+```
+
+Page 224 layout-only, `--max-new-tokens 128 --skip-content --timing`:
+
+| Stage | CPU s | Metal s | Metal / CPU |
+| --- | ---: | ---: | ---: |
+| layout_vision_encode | 40.9909 | 113.6929 | 2.77x |
+| layout_generate | 8.8269 | 29.0975 | 3.30x |
+| page_total | 54.2621 | 147.0423 | 2.71x |
+
+Page 224 full-content128, `--max-new-tokens 128
+--content-max-new-tokens 128 --timing`:
+
+| Stage | CPU s | Metal s | Metal / CPU |
+| --- | ---: | ---: | ---: |
+| layout_vision_encode | 39.9437 | 154.6549 | 3.87x |
+| layout_generate | 9.3871 | 28.4980 | 3.04x |
+| content_region_vision_encode | 28.4575 | 71.3370 | 2.51x |
+| content_region_generate | 10.2657 | 42.0095 | 4.09x |
+| content_total | 38.8465 | 113.4659 | 2.92x |
+| page_total | 92.0258 | 300.6242 | 3.27x |
+
+Previous page 224 full-content128 Metal timing was `1385.3995s` total, with
+`layout_generate + content_region_generate` accounting for about `1175.36s`.
+After cache-backed decode, the same generation stages account for about
+`70.51s` and page total is `300.6242s`.
+
+Accuracy, CPU versus Metal after KV-cache decode:
+
+| Metric | Value |
+| --- | ---: |
+| Block count exact | true |
+| Ordered type accuracy | 1.0000 |
+| Ordered mean bbox IoU | 1.0000 |
+| Ordered median bbox IoU | 1.0000 |
+| Mean content token F1 | 1.0000 |
+| Table exact cell recall | 1.0000 |
+
+Interpretation:
+
+- KV-cache decode removed the dominant repeated full-prefill cost. Page 224
+  full-content128 improved from `1385.40s` to `300.62s`, about `4.61x` faster.
+- Metal is still slower than CPU on this benchmark, now by about `3.27x`
+  instead of `13.12x`.
+- The next largest remaining cost is vision encode plus per-token/per-layer
+  host/device buffer churn. Persistent Metal buffers for weights, K/V cache,
+  intermediate activations, and logits are now the highest-value optimization.

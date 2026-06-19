@@ -40,6 +40,7 @@ def main() -> None:
     assert "trace layout logits ok" in result.stdout
     assert "trace layout generation ok" in result.stdout
     assert "mu metal stage: text_logits" in result.stderr
+    assert "mu metal stage: text_cached_attn" in result.stderr
     assert "mu metal stage: text_generate" in result.stderr
     assert "fallback" not in result.stderr
     print("mu_metal_layout_generation_smoke ok")

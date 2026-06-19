@@ -177,6 +177,56 @@ kernel void mu_text_attn_seq_pos(device const float *q [[buffer(0)]],
     for (int d = 0; d < head_dim; d++) oh[d] = acc[d];
 }
 
+kernel void mu_text_attn_cached(device const float *q [[buffer(0)]],
+                                device const float *k_cache [[buffer(1)]],
+                                device const float *v_cache [[buffer(2)]],
+                                device float *out [[buffer(3)]],
+                                constant int &cache_len [[buffer(4)]],
+                                uint head_gid [[thread_position_in_grid]]) {
+    const int n_heads = 14;
+    const int kv_group = 7;
+    const int head_dim = 64;
+    if (head_gid >= (uint)n_heads || cache_len <= 0) return;
+
+    int head = (int)head_gid;
+    int kvh = head / kv_group;
+    device const float *q_head = q + (size_t)head * head_dim;
+
+    float max_score = -3.402823466e38f;
+    for (int sidx = 0; sidx < cache_len; sidx++) {
+        device const float *k_head =
+            k_cache + ((size_t)sidx * 2u + (size_t)kvh) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) dot += q_head[d] * k_head[d];
+        float score = dot * 0.125f;
+        if (score > max_score) max_score = score;
+    }
+
+    float denom = 0.0f;
+    for (int sidx = 0; sidx < cache_len; sidx++) {
+        device const float *k_head =
+            k_cache + ((size_t)sidx * 2u + (size_t)kvh) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) dot += q_head[d] * k_head[d];
+        denom += exp(dot * 0.125f - max_score);
+    }
+
+    device float *oh = out + (size_t)head * head_dim;
+    float acc[64];
+    for (int d = 0; d < head_dim; d++) acc[d] = 0.0f;
+    for (int sidx = 0; sidx < cache_len; sidx++) {
+        device const float *k_head =
+            k_cache + ((size_t)sidx * 2u + (size_t)kvh) * head_dim;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) dot += q_head[d] * k_head[d];
+        float p = exp(dot * 0.125f - max_score) / denom;
+        device const float *v_head =
+            v_cache + ((size_t)sidx * 2u + (size_t)kvh) * head_dim;
+        for (int d = 0; d < head_dim; d++) acc[d] += p * v_head[d];
+    }
+    for (int d = 0; d < head_dim; d++) oh[d] = acc[d];
+}
+
 kernel void mu_add_f32(device const float *a [[buffer(0)]],
                        device const float *b [[buffer(1)]],
                        device float *out [[buffer(2)]],

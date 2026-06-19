@@ -304,50 +304,113 @@ Revised performance conclusion:
   vision encode and KV-cache decode or an equivalent strategy to avoid repeated
   full-prefill generation.
 
+## KV-cache Decode Checkpoint
+
+Date: 2026-06-19
+
+The Metal generation path now has a cache-backed decode implementation. Prefill
+still uses the existing Metal sequence kernels, but it records per-layer K/V
+cache rows. Decode tokens now use one-token Metal dense/norm/MLP kernels plus
+`mu_text_attn_cached`.
+
+Validation completed:
+
+```bash
+make mu-test
+make mu
+./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/text.json
+./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/layout.json
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_metal_text_generation_smoke.py
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_metal_layout_generation_smoke.py
+```
+
+The Metal generation smoke tests now assert `mu metal stage: text_cached_attn`
+so they catch regressions back to repeated full-prefill generation.
+
+Page 224 layout-only timing, `--max-new-tokens 128 --skip-content --timing`:
+
+| Backend | Seconds | layout_generate s | layout_vision_encode s |
+| --- | ---: | ---: | ---: |
+| CPU | 54.35 | 8.83 | 40.99 |
+| Metal no-fallback | 147.18 | 29.10 | 113.69 |
+
+Page 224 full-content128 timing:
+
+| Backend | Seconds | layout_generate s | content_region_generate s |
+| --- | ---: | ---: | ---: |
+| CPU | 92.11 | 9.39 | 10.27 |
+| Metal no-fallback | 300.76 | 28.50 | 42.01 |
+
+CPU versus Metal output metrics for
+`/tmp/mu-fullcontent128-kvcache-page224` remain exact:
+
+| Metric | Value |
+| --- | ---: |
+| Block count exact | true |
+| Ordered type accuracy | 1.0000 |
+| Ordered mean bbox IoU | 1.0000 |
+| Mean content token F1 | 1.0000 |
+| Table exact cell recall | 1.0000 |
+
+Key artifacts:
+
+```text
+/tmp/mu-benchmark-metal-page224-layout128-kvcache.json
+/tmp/mu-benchmark-cpu-page224-layout128-kvcache-baseline.json
+/tmp/mu-benchmark-metal-page224-fullcontent128-kvcache.json
+/tmp/mu-benchmark-cpu-page224-fullcontent128-kvcache-baseline.json
+/tmp/mu-fullcontent128-kvcache-page224/cpu-vs-metal.metrics.json
+```
+
+Updated performance conclusion:
+
+- KV-cache decode reduced page 224 full-content128 from `1385.40s` to
+  `300.62s`, about `4.61x` faster than the previous Metal timing.
+- Metal is still about `3.27x` slower than CPU for page 224 full-content128.
+- The next highest-value work is persistent Metal buffer ownership for weights,
+  K/V cache, intermediate activations, and logits to remove per-kernel
+  `newBufferWithBytes` and host/device copies.
+
 ## Known Gaps
 
 The current branch has not proven all desirable final-state properties:
 
 - Full-content pure Metal validation has only been run for page 224. The
   10-page sample has layout-only parity, not full-content parity.
-- The Metal path is much slower than CPU and Transformers/MPS. Page 224
-  content512 is about 31.36x slower than CPU and about 64.95x slower than the
-  Transformers/MPS 120dpi reference.
-- The implementation is still a correctness bridge with repeated host/device
-  transfers and repeated full-prefill generation.
-- KV-cache decode is not the performance path yet.
+- Metal is still slower than CPU and Transformers/MPS. Page 224
+  full-content128 is now about 3.27x slower than CPU after KV-cache decode.
+- The implementation still has repeated host/device transfers and does not own
+  persistent Metal buffers for weights, intermediate activations, K/V cache, or
+  logits.
 - Temporary benchmark artifacts live under `/tmp` and may disappear.
 
 ## Next Recommended Work
 
-1. Add persistent Metal buffer ownership for vision encode.
+1. Add persistent Metal buffer ownership.
    - Cache frequently reused weights as `MTLBuffer`s.
-   - Reuse intermediate activation buffers across the 32 vision blocks.
+   - Reuse intermediate activation buffers across text and vision kernels.
+   - Keep K/V cache in Metal buffers during decode instead of copying slices
+     through shared host memory.
    - Avoid repeated `newBufferWithBytes` and CPU-side `memcpy` per dense/norm
      kernel.
 
-2. Add a KV-cache decode path or equivalent generation reuse.
-   - Full-content timing shows Metal generation dominates page 224 content128.
-   - Keep the current full-prefill path as the correctness comparison path.
-   - Compare generated ids against CPU before using it for page benchmarks.
-
-3. Profile and reduce full-page vision encode cost.
+2. Profile and reduce full-page vision encode cost.
    - Start with page 224 because the current report has CPU, Metal, and
      Transformers reference numbers.
    - Keep `--backend metal --no-cpu-fallback` as the only benchmark mode that
      counts.
 
-4. Add or improve timing instrumentation.
+3. Add or improve timing instrumentation.
    - Split page time into image preprocess, vision encode, layout generation,
      crop extraction, and content generation.
    - Record host/device bytes moved if practical.
 
-5. Re-run page 224 full-content after each optimization.
+4. Re-run page 224 full-content after each optimization.
    - Preserve CPU exactness first.
    - Compare against Transformers 120dpi page 224.
    - Update `mineru/docs/mu-performance-report.md` after meaningful changes.
 
-6. After page 224 performance improves, expand to the 10-page sample.
+5. After page 224 performance improves further, expand to the 10-page sample.
    - First layout-only parity/performance.
    - Then full-content for the table-heavy pages if runtime becomes reasonable.
 

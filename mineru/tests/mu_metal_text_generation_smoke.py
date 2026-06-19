@@ -39,6 +39,7 @@ def main() -> None:
     assert "trace text logits ok" in result.stdout
     assert "trace text generation ok" in result.stdout
     assert "mu metal stage: text_logits" in result.stderr
+    assert "mu metal stage: text_cached_attn" in result.stderr
     assert "mu metal stage: text_generate" in result.stderr
     assert "fallback" not in result.stderr
     print("mu_metal_text_generation_smoke ok")

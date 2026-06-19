@@ -2914,9 +2914,20 @@ static void mu_rmsnorm_one_bf16(const float *x, const uint16_t *weight,
 static int mu_linear_one_f32_tmp(const float *x, int in,
                                  const uint16_t *w_bf16, const uint16_t *bias_bf16,
                                  int out_n, float *out, float *w_tmp);
+static size_t mu_text_cache_offset(int layer, int pos, int cache_cap);
+static void mu_apply_text_rope_k(float *k, int seq, const int *position_ids);
 static void mu_apply_text_rope(float *q, float *k, int seq, const int *position_ids);
 static int mu_text_attention_f32(const float *q, const float *k, const float *v,
                                  int seq, float *out);
+static int mu_text_prefill_cache_from_embeddings(mu_engine *e, float *hidden_states,
+                                                 int n_ids, const int *position_ids,
+                                                 int cache_cap, float *k_cache,
+                                                 float *v_cache,
+                                                 int top_k, mu_token_logit *out);
+static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
+                               int cache_pos, int cache_cap,
+                               float *k_cache, float *v_cache,
+                               int top_k, mu_token_logit *out);
 
 int mu_text_layer0_qkv_token0(mu_engine *e, const int *input_ids, int n_ids,
                               float *out, int out_n) {
@@ -3369,9 +3380,14 @@ static void mu_record_text_layer_seq_stage(const mu_engine *e, int layer,
 static int mu_text_layer_mlp_seq_from_hidden(mu_engine *e, int layer,
                                              const float *input_hidden,
                                              const int *position_ids,
-                                             int n_ids, float *out) {
+                                             int n_ids, int cache_cap,
+                                             float *k_cache, float *v_cache,
+                                             float *out) {
     if (!e || !input_hidden || n_ids <= 0 || !out ||
         layer < 0 || layer >= e->cfg.text_layers) {
+        return -1;
+    }
+    if ((k_cache || v_cache) && (!k_cache || !v_cache || cache_cap < n_ids)) {
         return -1;
     }
     const int hidden = 896;
@@ -3453,6 +3469,24 @@ static int mu_text_layer_mlp_seq_from_hidden(mu_engine *e, int layer,
         }
         if (rc == 0) {
             mu_record_text_layer_seq_stage(e, layer, "v_proj");
+            if (k_cache) {
+                float *k_rope = (float *)malloc((size_t)n_ids * 128u * sizeof(k_rope[0]));
+                if (!k_rope) {
+                    rc = -30;
+                } else {
+                    memcpy(k_rope, k, (size_t)n_ids * 128u * sizeof(k_rope[0]));
+                    mu_apply_text_rope_k(k_rope, n_ids, position_ids);
+                    for (int s = 0; s < n_ids; s++) {
+                        memcpy(k_cache + mu_text_cache_offset(layer, s, cache_cap),
+                               k_rope + (size_t)s * 128u, 128u * sizeof(k_rope[0]));
+                        memcpy(v_cache + mu_text_cache_offset(layer, s, cache_cap),
+                               v + (size_t)s * 128u, 128u * sizeof(v[0]));
+                    }
+                    free(k_rope);
+                }
+            }
+        }
+        if (rc == 0) {
             if (position_ids) {
                 rc = mu_gpu_text_attn_seq_pos(e->gpu, q, k, v,
                                               position_ids, n_ids, attn);
@@ -3538,6 +3572,14 @@ cpu_text_layer_seq:
     if (rc == 0) rc = mu_linear_seq_f32(normed, n_ids, hidden, vw, vb, 128, v, w_tmp);
     if (rc == 0) {
         mu_apply_text_rope(q, k, n_ids, position_ids);
+        if (k_cache) {
+            for (int s = 0; s < n_ids; s++) {
+                memcpy(k_cache + mu_text_cache_offset(layer, s, cache_cap),
+                       k + (size_t)s * 128u, 128u * sizeof(k[0]));
+                memcpy(v_cache + mu_text_cache_offset(layer, s, cache_cap),
+                       v + (size_t)s * 128u, 128u * sizeof(v[0]));
+            }
+        }
         rc = mu_text_attention_f32(q, k, v, n_ids, attn);
     }
     if (rc == 0) rc = mu_linear_seq_f32(attn, n_ids, hidden, ow, NULL, hidden, proj, w_tmp);
@@ -3570,7 +3612,8 @@ int mu_text_layer01_mlp_seq(mu_engine *e, const int *input_ids, int n_ids,
     if (!layer0) return -2;
     int rc = mu_text_layer0_mlp_seq(e, input_ids, n_ids, layer0, n_ids, 896);
     if (rc == 0) {
-        rc = mu_text_layer_mlp_seq_from_hidden(e, 1, layer0, NULL, n_ids, out);
+        rc = mu_text_layer_mlp_seq_from_hidden(e, 1, layer0, NULL, n_ids,
+                                               0, NULL, NULL, out);
     }
     free(layer0);
     return rc == 0 ? 0 : -3;
@@ -3612,7 +3655,8 @@ int mu_text_layers_mlp_seq(mu_engine *e, const int *input_ids, int n_ids,
     float *dst = b;
     int rc = 0;
     for (int layer = 0; layer < n_layers; layer++) {
-        rc = mu_text_layer_mlp_seq_from_hidden(e, layer, src, NULL, n_ids, dst);
+        rc = mu_text_layer_mlp_seq_from_hidden(e, layer, src, NULL, n_ids,
+                                               0, NULL, NULL, dst);
         if (rc != 0) break;
         float *tmp = src;
         src = dst;
@@ -3650,7 +3694,8 @@ static int mu_text_layers_mlp_seq_from_hidden(mu_engine *e,
     float *dst = b;
     int rc = 0;
     for (int layer = 0; layer < n_layers; layer++) {
-        rc = mu_text_layer_mlp_seq_from_hidden(e, layer, src, position_ids, n_ids, dst);
+        rc = mu_text_layer_mlp_seq_from_hidden(e, layer, src, position_ids, n_ids,
+                                               0, NULL, NULL, dst);
         if (rc != 0) break;
         float *tmp = src;
         src = dst;
@@ -3703,6 +3748,28 @@ static void mu_apply_text_rope_one(float *q, float *k, const int pos3[3]) {
     }
     for (int h = 0; h < n_kv_heads; h++) {
         mu_apply_one_text_rope_head_pos(k + h * head_dim, pos3, inv_freq);
+    }
+}
+
+static void mu_apply_text_rope_k(float *k, int seq, const int *position_ids) {
+    const int n_kv_heads = 2;
+    const int head_dim = 64;
+    const float theta = 1000000.0f;
+    float inv_freq[32];
+    for (int i = 0; i < 32; i++) {
+        inv_freq[i] = powf(theta, -((float)(2 * i) / (float)head_dim));
+    }
+    for (int t = 0; t < seq; t++) {
+        int pos3[3] = {t, t, t};
+        if (position_ids) {
+            pos3[0] = position_ids[0 * seq + t];
+            pos3[1] = position_ids[1 * seq + t];
+            pos3[2] = position_ids[2 * seq + t];
+        }
+        for (int h = 0; h < n_kv_heads; h++) {
+            float *head = k + ((size_t)t * n_kv_heads + (size_t)h) * head_dim;
+            mu_apply_one_text_rope_head_pos(head, pos3, inv_freq);
+        }
     }
 }
 
@@ -3837,6 +3904,39 @@ static int mu_text_top_logits_from_last_hidden(mu_engine *e, const float *hidden
     const uint16_t *embed = mu_tensor_bf16(e, "model.embed_tokens.weight", 2, vocab, hidden);
     const uint16_t *final_norm = mu_tensor_bf16(e, "model.norm.weight", 1, hidden, 0);
     if (!embed || !final_norm) return -2;
+
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        float *last = (float *)malloc((size_t)hidden * sizeof(last[0]));
+        float *logits = (float *)malloc((size_t)vocab * sizeof(logits[0]));
+        int rc = 0;
+        if (!last || !logits) rc = -3;
+        if (rc == 0) {
+            rc = mu_gpu_rmsnorm_bf16_rows(e->gpu, hidden_state,
+                                          (const unsigned short *)final_norm,
+                                          1, hidden, eps, last);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_final_norm");
+            rc = mu_gpu_dense_f32_rows(e->gpu, last,
+                                       (const unsigned short *)embed,
+                                       1, hidden, vocab, logits);
+        }
+        if (rc == 0) {
+            mu_record_metal_stage(e, "text_logits");
+            for (int id = 0; id < vocab; id++) {
+                float logit = mu_bf16_to_f32(mu_f32_to_bf16(logits[id]));
+                mu_topk_insert(out, top_k, id, logit);
+            }
+        }
+        free(last);
+        free(logits);
+        if (rc == 0) return top_k;
+        rc = mu_record_cpu_fallback(e, "text_logits");
+        if (rc) return rc;
+    }
+#endif
+
     float last[896];
     mu_rmsnorm_one_bf16(hidden_state, final_norm, hidden, eps, last);
     for (int id = 0; id < vocab; id++) {
@@ -4127,46 +4227,81 @@ int mu_text_generate_greedy(mu_engine *e, const int *input_ids, int n_ids,
     if (!e || !input_ids || n_ids <= 0 || max_new_tokens <= 0 || !out) return -1;
 #if defined(__APPLE__)
     if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        const int hidden = 896;
+        const int layers = 24;
+        const int kv_out = 128;
+        const int vocab = 151936;
         int cap = n_ids + max_new_tokens;
-        int *ids = NULL;
-        int rc = 0;
-        int nout = 0;
-        if (cap > 64) {
-            rc = -30;
-        } else {
-            ids = (int *)malloc((size_t)cap * sizeof(ids[0]));
-            if (!ids) rc = -2;
+        int *ids = (int *)malloc((size_t)cap * sizeof(ids[0]));
+        float *hidden_states = (float *)malloc((size_t)n_ids * hidden * sizeof(hidden_states[0]));
+        float *k_cache = (float *)calloc((size_t)layers * (size_t)cap * kv_out, sizeof(k_cache[0]));
+        float *v_cache = (float *)calloc((size_t)layers * (size_t)cap * kv_out, sizeof(v_cache[0]));
+        if (!ids || !hidden_states || !k_cache || !v_cache) {
+            free(ids);
+            free(hidden_states);
+            free(k_cache);
+            free(v_cache);
+            return -2;
         }
-        if (rc == 0) {
-            memcpy(ids, input_ids, (size_t)n_ids * sizeof(ids[0]));
-            int cur = n_ids;
-            for (int step = 0; step < max_new_tokens; step++) {
-                mu_token_logit top[8];
-                int top_n = mu_text_top_logits(e, ids, cur, 8, top);
-                if (top_n < 1) {
-                    rc = -3;
-                    break;
-                }
-                rc = 0;
-                float best = top[0].logit;
-                int next = top[0].id;
-                for (int i = 1; i < 8; i++) {
-                    if (top[i].id >= 0 && top[i].logit == best && top[i].id < next) {
-                        next = top[i].id;
-                    }
-                }
-                out[nout++] = next;
-                ids[cur++] = next;
-                if (next == 151645 || next == 151643) break;
+        const uint16_t *embed = mu_tensor_bf16(e, "model.embed_tokens.weight", 2, vocab, hidden);
+        if (!embed) {
+            free(ids);
+            free(hidden_states);
+            free(k_cache);
+            free(v_cache);
+            return -3;
+        }
+        memcpy(ids, input_ids, (size_t)n_ids * sizeof(ids[0]));
+        for (int s = 0; s < n_ids; s++) {
+            int id = ids[s];
+            if (id < 0 || id >= vocab) {
+                free(ids);
+                free(hidden_states);
+                free(k_cache);
+                free(v_cache);
+                return -4;
+            }
+            const uint16_t *row = embed + (size_t)id * hidden;
+            for (int i = 0; i < hidden; i++) {
+                hidden_states[(size_t)s * hidden + i] = mu_bf16_to_f32(row[i]);
             }
         }
-        free(ids);
-        if (rc == 0) {
-            mu_record_metal_stage(e, "text_generate");
-            return nout;
+        mu_token_logit top[8];
+        int rc = mu_text_prefill_cache_from_embeddings(e, hidden_states, n_ids, NULL,
+                                                       cap, k_cache, v_cache, 8, top);
+        if (rc < 1) {
+            free(ids);
+            free(hidden_states);
+            free(k_cache);
+            free(v_cache);
+            return -5;
         }
-        rc = mu_record_cpu_fallback(e, "text_generate");
-        if (rc) return rc;
+        int cur = n_ids;
+        int nout = 0;
+        for (int step = 0; step < max_new_tokens; step++) {
+            float best = top[0].logit;
+            int next = top[0].id;
+            for (int i = 1; i < 8; i++) {
+                if (top[i].id >= 0 && top[i].logit == best && top[i].id < next) {
+                    next = top[i].id;
+                }
+            }
+            out[nout++] = next;
+            ids[cur++] = next;
+            if (next == 151645 || next == 151643) break;
+            if (step + 1 >= max_new_tokens) break;
+            int pos3[3] = {cur - 1, cur - 1, cur - 1};
+            rc = mu_text_cached_step(e, next, pos3, cur - 1, cap,
+                                     k_cache, v_cache, 8, top);
+            if (rc < 1) break;
+        }
+        free(ids);
+        free(hidden_states);
+        free(k_cache);
+        free(v_cache);
+        if (rc < 1) return -6;
+        mu_record_metal_stage(e, "text_generate");
+        return nout;
     }
 #endif
     int cap = n_ids + max_new_tokens;
@@ -4303,7 +4438,7 @@ static int mu_text_prefill_cache_from_embeddings(mu_engine *e, float *hidden_sta
                                                  int cache_cap, float *k_cache,
                                                  float *v_cache,
                                                  int top_k, mu_token_logit *out) {
-    if (!e || !hidden_states || n_ids <= 0 || !position_ids ||
+    if (!e || !hidden_states || n_ids <= 0 ||
         cache_cap < n_ids || !k_cache || !v_cache || !out) {
         return -1;
     }
@@ -4312,6 +4447,49 @@ static int mu_text_prefill_cache_from_embeddings(mu_engine *e, float *hidden_sta
     const int q_out = 896;
     const int kv_out = 128;
     const float eps = 1e-6f;
+
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        float *a = (float *)malloc((size_t)n_ids * hidden * sizeof(a[0]));
+        float *b = (float *)malloc((size_t)n_ids * hidden * sizeof(b[0]));
+        if (!a || !b) {
+            free(a);
+            free(b);
+            int frc = mu_record_cpu_fallback(e, "text_prefill_cache_alloc");
+            if (frc) return frc;
+        } else {
+            memcpy(a, hidden_states, (size_t)n_ids * hidden * sizeof(a[0]));
+            float *src = a;
+            float *dst = b;
+            int rc = 0;
+            for (int layer = 0; layer < e->cfg.text_layers; layer++) {
+                rc = mu_text_layer_mlp_seq_from_hidden(e, layer, src, position_ids,
+                                                       n_ids, cache_cap,
+                                                       k_cache, v_cache, dst);
+                if (rc != 0) break;
+                float *tmp = src;
+                src = dst;
+                dst = tmp;
+            }
+            if (rc == 0) {
+                int top_rc = mu_text_top_logits_from_last_hidden(
+                    e, src + (size_t)(n_ids - 1) * hidden, top_k, out);
+                if (top_rc == top_k) {
+                    free(a);
+                    free(b);
+                    return top_k;
+                }
+                rc = top_rc;
+            }
+            free(a);
+            free(b);
+            if (rc != 0) {
+                int frc = mu_record_cpu_fallback(e, "text_prefill_cache");
+                if (frc) return frc;
+            }
+        }
+    }
+#endif
 
     float *residual = (float *)malloc((size_t)n_ids * hidden * sizeof(float));
     float *normed = (float *)malloc((size_t)n_ids * hidden * sizeof(float));
@@ -4471,6 +4649,111 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
     }
     const uint16_t *row = embed + (size_t)token_id * hidden;
     for (int i = 0; i < hidden; i++) hidden_state[i] = mu_bf16_to_f32(row[i]);
+
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        char name[256];
+        int rc = 0;
+        for (int layer = 0; layer < 24; layer++) {
+            snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer);
+            const uint16_t *input_norm = mu_tensor_bf16(e, name, 1, hidden, 0);
+            snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", layer);
+            const uint16_t *post_norm = mu_tensor_bf16(e, name, 1, hidden, 0);
+            if (!input_norm || !post_norm) goto fail;
+
+            memcpy(residual, hidden_state, sizeof(residual));
+            rc = mu_gpu_rmsnorm_bf16_probe(e->gpu, hidden_state,
+                                           (const unsigned short *)input_norm,
+                                           hidden, eps, normed);
+            if (rc == 0) {
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer);
+                const uint16_t *qw = mu_tensor_bf16(e, name, 2, q_out, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.bias", layer);
+                const uint16_t *qb = mu_tensor_bf16(e, name, 1, q_out, 0);
+                if (!qw || !qb) goto fail;
+                rc = mu_gpu_dense_f32_bias_probe(e->gpu, normed,
+                                                 (const unsigned short *)qw,
+                                                 (const unsigned short *)qb,
+                                                 q_out, hidden, q);
+            }
+            if (rc == 0) {
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer);
+                const uint16_t *kw = mu_tensor_bf16(e, name, 2, kv_out, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.bias", layer);
+                const uint16_t *kb = mu_tensor_bf16(e, name, 1, kv_out, 0);
+                if (!kw || !kb) goto fail;
+                rc = mu_gpu_dense_f32_bias_probe(e->gpu, normed,
+                                                 (const unsigned short *)kw,
+                                                 (const unsigned short *)kb,
+                                                 kv_out, hidden, k);
+            }
+            if (rc == 0) {
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer);
+                const uint16_t *vw = mu_tensor_bf16(e, name, 2, kv_out, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.bias", layer);
+                const uint16_t *vb = mu_tensor_bf16(e, name, 1, kv_out, 0);
+                if (!vw || !vb) goto fail;
+                rc = mu_gpu_dense_f32_bias_probe(e->gpu, normed,
+                                                 (const unsigned short *)vw,
+                                                 (const unsigned short *)vb,
+                                                 kv_out, hidden, v);
+            }
+            if (rc != 0) goto fail;
+            mu_apply_text_rope_one(q, k, pos3);
+            memcpy(k_cache + mu_text_cache_offset(layer, cache_pos, cache_cap), k,
+                   (size_t)kv_out * sizeof(float));
+            memcpy(v_cache + mu_text_cache_offset(layer, cache_pos, cache_cap), v,
+                   (size_t)kv_out * sizeof(float));
+            rc = mu_gpu_text_attn_cached(
+                e->gpu, q,
+                k_cache + mu_text_cache_offset(layer, 0, cache_cap),
+                v_cache + mu_text_cache_offset(layer, 0, cache_cap),
+                cache_pos + 1, attn);
+            if (rc != 0) goto fail;
+            mu_record_metal_stage(e, "text_cached_attn");
+
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer);
+            const uint16_t *ow = mu_tensor_bf16(e, name, 2, hidden, hidden);
+            if (!ow) goto fail;
+            rc = mu_gpu_dense_probe(e->gpu, attn, (const unsigned short *)ow,
+                                    hidden, hidden, proj);
+            if (rc == 0) rc = mu_gpu_add_f32(e->gpu, residual, proj, hidden, hidden_state);
+            if (rc != 0) goto fail;
+
+            memcpy(residual, hidden_state, sizeof(residual));
+            rc = mu_gpu_rmsnorm_bf16_probe(e->gpu, hidden_state,
+                                           (const unsigned short *)post_norm,
+                                           hidden, eps, normed);
+            if (rc == 0) {
+                snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", layer);
+                const uint16_t *gate_w = mu_tensor_bf16(e, name, 2, inter, hidden);
+                if (!gate_w) goto fail;
+                rc = mu_gpu_dense_probe(e->gpu, normed, (const unsigned short *)gate_w,
+                                        inter, hidden, gate);
+            }
+            if (rc == 0) {
+                snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", layer);
+                const uint16_t *up_w = mu_tensor_bf16(e, name, 2, inter, hidden);
+                if (!up_w) goto fail;
+                rc = mu_gpu_dense_probe(e->gpu, normed, (const unsigned short *)up_w,
+                                        inter, hidden, up);
+            }
+            if (rc == 0) rc = mu_gpu_silu_mul_f32(e->gpu, gate, up, inter, mid);
+            if (rc == 0) {
+                snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", layer);
+                const uint16_t *down_w = mu_tensor_bf16(e, name, 2, hidden, inter);
+                if (!down_w) goto fail;
+                rc = mu_gpu_dense_probe(e->gpu, mid, (const unsigned short *)down_w,
+                                        hidden, inter, proj);
+            }
+            if (rc == 0) rc = mu_gpu_add_f32(e->gpu, residual, proj, hidden, hidden_state);
+            if (rc != 0) goto fail;
+        }
+        int top_rc = mu_text_top_logits_from_last_hidden(e, hidden_state, top_k, out);
+        free(gate); free(up); free(mid); free(w_tmp);
+        return top_rc;
+    }
+#endif
 
     char name[256];
     for (int layer = 0; layer < 24; layer++) {
@@ -4655,55 +4938,14 @@ int mu_text_generate_greedy_with_image_embeds(mu_engine *e,
                                               int n_image_embeds,
                                               int max_new_tokens, int *out) {
     if (e && e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
-        if (!input_ids || n_ids <= 0 || grid_t <= 0 || grid_h <= 0 || grid_w <= 0 ||
-            !image_embeds || n_image_embeds <= 0 || max_new_tokens <= 0 || !out) {
-            return -1;
-        }
-        int cap = n_ids + max_new_tokens;
-        int *ids = (int *)malloc((size_t)cap * sizeof(ids[0]));
-        int *pos = (int *)malloc((size_t)cap * 3u * sizeof(pos[0]));
-        int rc = 0;
-        int nout = 0;
-        if (!ids || !pos) {
-            rc = -2;
-        }
-        if (rc == 0) {
-            memcpy(ids, input_ids, (size_t)n_ids * sizeof(ids[0]));
-            int cur = n_ids;
-            for (int step = 0; step < max_new_tokens; step++) {
-                int pos_n = mu_build_position_ids(e, ids, cur, grid_t, grid_h, grid_w,
-                                                  pos, cur * 3);
-                if (pos_n != cur * 3) {
-                    rc = -3;
-                    break;
-                }
-                mu_token_logit top[8];
-                int top_n = mu_text_top_logits_with_image_embeds(
-                    e, ids, cur, pos, image_embeds, n_image_embeds, 8, top);
-                if (top_n < 1) {
-                    rc = -4;
-                    break;
-                }
-                float best = top[0].logit;
-                int next = top[0].id;
-                for (int i = 1; i < 8; i++) {
-                    if (top[i].id >= 0 && top[i].logit == best && top[i].id < next) {
-                        next = top[i].id;
-                    }
-                }
-                out[nout++] = next;
-                ids[cur++] = next;
-                if (next == 151645 || next == 151643) break;
-            }
-        }
-        free(ids);
-        free(pos);
-        if (rc == 0) {
+        int nout = mu_cpu_text_generate_greedy_with_image_embeds(
+            e, input_ids, n_ids, grid_t, grid_h, grid_w, image_embeds,
+            n_image_embeds, max_new_tokens, out);
+        if (nout >= 0) {
             mu_record_metal_stage(e, "text_generate");
             return nout;
         }
-        rc = mu_record_cpu_fallback(e, "text_generate");
-        if (rc) return rc;
+        return nout;
     }
     return mu_cpu_text_generate_greedy_with_image_embeds(
         e, input_ids, n_ids, grid_t, grid_h, grid_w, image_embeds,

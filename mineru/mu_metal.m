@@ -4,6 +4,7 @@
 #import <Metal/Metal.h>
 
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 struct mu_gpu {
@@ -23,6 +24,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> text_attn_token0;
     id<MTLComputePipelineState> text_attn_seq;
     id<MTLComputePipelineState> text_attn_seq_pos;
+    id<MTLComputePipelineState> text_attn_cached;
     id<MTLComputePipelineState> add_f32;
     id<MTLComputePipelineState> silu_mul_f32;
     id<MTLComputePipelineState> vision_attn_concat_probe;
@@ -56,15 +58,42 @@ static id<MTLComputePipelineState> mu_gpu_make_pipeline(id<MTLDevice> device,
     NSString *source = [NSString stringWithContentsOfFile:mu_gpu_shader_path(source_name)
                                                  encoding:NSUTF8StringEncoding
                                                     error:&error];
-    if (!source) return nil;
+    if (!source) {
+        if (getenv("MU_METAL_DEBUG")) {
+            fprintf(stderr, "mu metal load failed: %s %s\n",
+                    [source_name UTF8String],
+                    error ? [[error localizedDescription] UTF8String] : "unknown");
+        }
+        return nil;
+    }
 
     id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
-    if (!library) return nil;
+    if (!library) {
+        if (getenv("MU_METAL_DEBUG")) {
+            fprintf(stderr, "mu metal compile failed: %s %s\n",
+                    [source_name UTF8String],
+                    error ? [[error localizedDescription] UTF8String] : "unknown");
+        }
+        return nil;
+    }
 
     id<MTLFunction> function = [library newFunctionWithName:function_name];
-    if (!function) return nil;
+    if (!function) {
+        if (getenv("MU_METAL_DEBUG")) {
+            fprintf(stderr, "mu metal function missing: %s %s\n",
+                    [source_name UTF8String], [function_name UTF8String]);
+        }
+        return nil;
+    }
 
-    return [device newComputePipelineStateWithFunction:function error:&error];
+    id<MTLComputePipelineState> pipeline =
+        [device newComputePipelineStateWithFunction:function error:&error];
+    if (!pipeline && getenv("MU_METAL_DEBUG")) {
+        fprintf(stderr, "mu metal pipeline failed: %s %s %s\n",
+                [source_name UTF8String], [function_name UTF8String],
+                error ? [[error localizedDescription] UTF8String] : "unknown");
+    }
+    return pipeline;
 }
 
 int mu_gpu_create(mu_gpu **out) {
@@ -107,6 +136,8 @@ int mu_gpu_create(mu_gpu **out) {
                                                   @"mu_text_attn_seq");
         gpu->text_attn_seq_pos = mu_gpu_make_pipeline(device, @"mu_attn.metal",
                                                       @"mu_text_attn_seq_pos");
+        gpu->text_attn_cached = mu_gpu_make_pipeline(device, @"mu_attn.metal",
+                                                     @"mu_text_attn_cached");
         gpu->add_f32 = mu_gpu_make_pipeline(device, @"mu_attn.metal",
                                             @"mu_add_f32");
         gpu->silu_mul_f32 = mu_gpu_make_pipeline(device, @"mu_attn.metal",
@@ -151,6 +182,7 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->silu_mul_f32 = nil;
     gpu->add_f32 = nil;
     gpu->text_attn_seq_pos = nil;
+    gpu->text_attn_cached = nil;
     gpu->text_attn_seq = nil;
     gpu->text_attn_token0 = nil;
     gpu->layernorm_bf16_rows = nil;
@@ -1098,6 +1130,60 @@ int mu_gpu_text_attn_seq_pos(mu_gpu *gpu, const float *q, const float *k,
         if (width < 1) width = 1;
         if (width > (NSUInteger)seq) width = (NSUInteger)seq;
         MTLSize grid = MTLSizeMake((NSUInteger)seq, 14, 1);
+        MTLSize threads = MTLSizeMake(width, 1, 1);
+        [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -6;
+
+        memcpy(out, [out_buf contents], out_bytes);
+    }
+    return 0;
+}
+
+int mu_gpu_text_attn_cached(mu_gpu *gpu, const float *q,
+                            const float *k_cache, const float *v_cache,
+                            int cache_len, float *out) {
+    if (!gpu || !gpu->device || !gpu->queue || !gpu->text_attn_cached) return -1;
+    if (!q || !k_cache || !v_cache || !out || cache_len <= 0) return -2;
+
+    @autoreleasepool {
+        NSUInteger q_bytes = 896u * sizeof(float);
+        NSUInteger kv_bytes = (NSUInteger)cache_len * 128u * sizeof(float);
+        NSUInteger out_bytes = q_bytes;
+        id<MTLBuffer> q_buf = [gpu->device newBufferWithBytes:q
+                                                       length:q_bytes
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> k_buf = [gpu->device newBufferWithBytes:k_cache
+                                                       length:kv_bytes
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> v_buf = [gpu->device newBufferWithBytes:v_cache
+                                                       length:kv_bytes
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buf = [gpu->device newBufferWithLength:out_bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> len_buf = [gpu->device newBufferWithBytes:&cache_len
+                                                         length:sizeof(cache_len)
+                                                        options:MTLResourceStorageModeShared];
+        if (!q_buf || !k_buf || !v_buf || !out_buf || !len_buf) return -3;
+
+        id<MTLCommandBuffer> command_buffer = [gpu->queue commandBuffer];
+        if (!command_buffer) return -4;
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (!encoder) return -5;
+
+        [encoder setComputePipelineState:gpu->text_attn_cached];
+        [encoder setBuffer:q_buf offset:0 atIndex:0];
+        [encoder setBuffer:k_buf offset:0 atIndex:1];
+        [encoder setBuffer:v_buf offset:0 atIndex:2];
+        [encoder setBuffer:out_buf offset:0 atIndex:3];
+        [encoder setBuffer:len_buf offset:0 atIndex:4];
+
+        NSUInteger width = gpu->text_attn_cached.threadExecutionWidth;
+        if (width < 1) width = 1;
+        if (width > 14u) width = 14u;
+        MTLSize grid = MTLSizeMake(14u, 1, 1);
         MTLSize threads = MTLSizeMake(width, 1, 1);
         [encoder dispatchThreads:grid threadsPerThreadgroup:threads];
         [encoder endEncoding];

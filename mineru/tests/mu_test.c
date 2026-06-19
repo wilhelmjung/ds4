@@ -342,6 +342,41 @@ static int test_mu_gpu_text_attn_seq(void) {
     return 0;
 }
 
+static int test_mu_gpu_text_attn_cached(void) {
+#if defined(__APPLE__)
+    mu_gpu *gpu = NULL;
+    if (mu_gpu_create(&gpu) != 0) return 0;
+    float *q = (float *)calloc(896u, sizeof(q[0]));
+    float *k_cache = (float *)calloc(3u * 128u, sizeof(k_cache[0]));
+    float *v_cache = (float *)calloc(3u * 128u, sizeof(v_cache[0]));
+    float *out = (float *)calloc(896u, sizeof(out[0]));
+    if (!q || !k_cache || !v_cache || !out) {
+        free(q); free(k_cache); free(v_cache); free(out);
+        mu_gpu_destroy(gpu);
+        return 260;
+    }
+    for (int i = 0; i < 128; i++) {
+        v_cache[i] = 1.0f;
+        v_cache[128 + i] = 3.0f;
+        v_cache[256 + i] = 5.0f;
+    }
+    int rc = mu_gpu_text_attn_cached(gpu, q, k_cache, v_cache, 3, out);
+    mu_gpu_destroy(gpu);
+    if (rc != 0) {
+        free(q); free(k_cache); free(v_cache); free(out);
+        return 261;
+    }
+    for (int d = 0; d < 896; d++) {
+        if (!close_enough(out[d], 3.0f, 1e-4f)) {
+            free(q); free(k_cache); free(v_cache); free(out);
+            return 262;
+        }
+    }
+    free(q); free(k_cache); free(v_cache); free(out);
+#endif
+    return 0;
+}
+
 static int test_mu_gpu_add_f32(void) {
 #if defined(__APPLE__)
     mu_gpu *gpu = NULL;
@@ -646,6 +681,11 @@ int main(void) {
     rc = test_mu_gpu_text_attn_seq();
     if (rc) {
         fprintf(stderr, "test_mu_gpu_text_attn_seq failed: %d\n", rc);
+        return rc;
+    }
+    rc = test_mu_gpu_text_attn_cached();
+    if (rc) {
+        fprintf(stderr, "test_mu_gpu_text_attn_cached failed: %d\n", rc);
         return rc;
     }
     rc = test_mu_gpu_add_f32();
