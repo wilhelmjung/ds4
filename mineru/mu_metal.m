@@ -26,6 +26,9 @@ struct mu_gpu {
     id<MTLComputePipelineState> add_f32;
     id<MTLComputePipelineState> silu_mul_f32;
     id<MTLComputePipelineState> vision_attn_concat_probe;
+    id<MTLComputePipelineState> vision_qk_scores_head;
+    id<MTLComputePipelineState> vision_softmax_bf16_rows;
+    id<MTLComputePipelineState> vision_pv_head;
     id<MTLComputePipelineState> vision_add_bf16;
     id<MTLComputePipelineState> vision_quick_gelu_bf16;
     id<MTLComputePipelineState> vision_gelu_bf16;
@@ -110,6 +113,12 @@ int mu_gpu_create(mu_gpu **out) {
                                                  @"mu_silu_mul_f32");
         gpu->vision_attn_concat_probe = mu_gpu_make_pipeline(device, @"mu_vision.metal",
                                                              @"mu_vision_attn_concat_probe");
+        gpu->vision_qk_scores_head = mu_gpu_make_pipeline(device, @"mu_vision.metal",
+                                                          @"mu_vision_qk_scores_head");
+        gpu->vision_softmax_bf16_rows = mu_gpu_make_pipeline(device, @"mu_vision.metal",
+                                                             @"mu_vision_softmax_bf16_rows");
+        gpu->vision_pv_head = mu_gpu_make_pipeline(device, @"mu_vision.metal",
+                                                   @"mu_vision_pv_head");
         gpu->vision_add_bf16 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
                                                     @"mu_vision_add_bf16");
         gpu->vision_quick_gelu_bf16 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
@@ -135,6 +144,9 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->vision_gelu_bf16 = nil;
     gpu->vision_quick_gelu_bf16 = nil;
     gpu->vision_add_bf16 = nil;
+    gpu->vision_pv_head = nil;
+    gpu->vision_softmax_bf16_rows = nil;
+    gpu->vision_qk_scores_head = nil;
     gpu->vision_attn_concat_probe = nil;
     gpu->silu_mul_f32 = nil;
     gpu->add_f32 = nil;
@@ -842,6 +854,104 @@ int mu_gpu_vision_attn_concat_probe(mu_gpu *gpu, const float *q0,
         [command_buffer commit];
         [command_buffer waitUntilCompleted];
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -6;
+
+        memcpy(out, [out_buf contents], out_bytes);
+    }
+    return 0;
+}
+
+int mu_gpu_vision_attn_rows(mu_gpu *gpu, const float *q,
+                            const float *kv, const float *rotary,
+                            int rows, float *out) {
+    if (!gpu || !gpu->device || !gpu->queue ||
+        !gpu->vision_qk_scores_head ||
+        !gpu->vision_softmax_bf16_rows ||
+        !gpu->vision_pv_head) {
+        return -1;
+    }
+    if (!q || !kv || !rotary || !out || rows <= 0) return -2;
+
+    @autoreleasepool {
+        NSUInteger q_bytes = (NSUInteger)rows * 1280u * sizeof(float);
+        NSUInteger kv_bytes = (NSUInteger)rows * 2560u * sizeof(float);
+        NSUInteger rotary_bytes = (NSUInteger)rows * 40u * sizeof(float);
+        NSUInteger scores_bytes = (NSUInteger)rows * (NSUInteger)rows * sizeof(float);
+        NSUInteger out_bytes = (NSUInteger)rows * 1280u * sizeof(float);
+        id<MTLBuffer> q_buf = [gpu->device newBufferWithBytes:q
+                                                       length:q_bytes
+                                                      options:MTLResourceStorageModeShared];
+        id<MTLBuffer> kv_buf = [gpu->device newBufferWithBytes:kv
+                                                        length:kv_bytes
+                                                       options:MTLResourceStorageModeShared];
+        id<MTLBuffer> rotary_buf = [gpu->device newBufferWithBytes:rotary
+                                                            length:rotary_bytes
+                                                           options:MTLResourceStorageModeShared];
+        id<MTLBuffer> scores_buf = [gpu->device newBufferWithLength:scores_bytes
+                                                            options:MTLResourceStorageModeShared];
+        id<MTLBuffer> out_buf = [gpu->device newBufferWithLength:out_bytes
+                                                         options:MTLResourceStorageModeShared];
+        id<MTLBuffer> rows_buf = [gpu->device newBufferWithBytes:&rows
+                                                          length:sizeof(rows)
+                                                         options:MTLResourceStorageModeShared];
+        if (!q_buf || !kv_buf || !rotary_buf || !scores_buf || !out_buf || !rows_buf) {
+            return -3;
+        }
+
+        for (int head = 0; head < 16; head++) {
+            id<MTLBuffer> head_buf = [gpu->device newBufferWithBytes:&head
+                                                              length:sizeof(head)
+                                                             options:MTLResourceStorageModeShared];
+            if (!head_buf) return -4;
+            id<MTLCommandBuffer> command_buffer = [gpu->queue commandBuffer];
+            if (!command_buffer) return -5;
+
+            id<MTLComputeCommandEncoder> qk = [command_buffer computeCommandEncoder];
+            if (!qk) return -6;
+            [qk setComputePipelineState:gpu->vision_qk_scores_head];
+            [qk setBuffer:q_buf offset:0 atIndex:0];
+            [qk setBuffer:kv_buf offset:0 atIndex:1];
+            [qk setBuffer:rotary_buf offset:0 atIndex:2];
+            [qk setBuffer:scores_buf offset:0 atIndex:3];
+            [qk setBuffer:rows_buf offset:0 atIndex:4];
+            [qk setBuffer:head_buf offset:0 atIndex:5];
+            NSUInteger qk_width = gpu->vision_qk_scores_head.threadExecutionWidth;
+            if (qk_width < 1) qk_width = 1;
+            if (qk_width > 16u) qk_width = 16u;
+            [qk dispatchThreads:MTLSizeMake((NSUInteger)rows, (NSUInteger)rows, 1)
+           threadsPerThreadgroup:MTLSizeMake(qk_width, 1, 1)];
+            [qk endEncoding];
+
+            id<MTLComputeCommandEncoder> softmax = [command_buffer computeCommandEncoder];
+            if (!softmax) return -7;
+            [softmax setComputePipelineState:gpu->vision_softmax_bf16_rows];
+            [softmax setBuffer:scores_buf offset:0 atIndex:0];
+            [softmax setBuffer:rows_buf offset:0 atIndex:1];
+            NSUInteger sm_width = gpu->vision_softmax_bf16_rows.threadExecutionWidth;
+            if (sm_width < 1) sm_width = 1;
+            if (sm_width > (NSUInteger)rows) sm_width = (NSUInteger)rows;
+            [softmax dispatchThreads:MTLSizeMake((NSUInteger)rows, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(sm_width, 1, 1)];
+            [softmax endEncoding];
+
+            id<MTLComputeCommandEncoder> pv = [command_buffer computeCommandEncoder];
+            if (!pv) return -8;
+            [pv setComputePipelineState:gpu->vision_pv_head];
+            [pv setBuffer:scores_buf offset:0 atIndex:0];
+            [pv setBuffer:kv_buf offset:0 atIndex:1];
+            [pv setBuffer:out_buf offset:0 atIndex:2];
+            [pv setBuffer:rows_buf offset:0 atIndex:3];
+            [pv setBuffer:head_buf offset:0 atIndex:4];
+            NSUInteger pv_width = gpu->vision_pv_head.threadExecutionWidth;
+            if (pv_width < 1) pv_width = 1;
+            if (pv_width > 80u) pv_width = 80u;
+            [pv dispatchThreads:MTLSizeMake(80u, (NSUInteger)rows, 1)
+           threadsPerThreadgroup:MTLSizeMake(pv_width, 1, 1)];
+            [pv endEncoding];
+
+            [command_buffer commit];
+            [command_buffer waitUntilCompleted];
+            if (command_buffer.status != MTLCommandBufferStatusCompleted) return -9;
+        }
 
         memcpy(out, [out_buf contents], out_bytes);
     }

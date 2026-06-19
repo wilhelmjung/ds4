@@ -42,6 +42,7 @@ typedef struct {
     bool inspect_only;
     bool image_analysis;
     bool allow_cpu_fallback;
+    bool skip_content;
 } mu_engine_options;
 
 mu_engine_options mu_engine_options_default(void);

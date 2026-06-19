@@ -2371,15 +2371,15 @@ static const uint16_t *mu_vision_block_tensor_bf16(const mu_engine *e, int layer
 }
 
 #if defined(__APPLE__)
-static int mu_vision_block_output_all_layer_metal_tiny(mu_engine *e, int layer,
-                                                       const float *patch_embeds,
-                                                       int rows, int cols,
-                                                       const float *rotary,
-                                                       int rotary_rows, int rotary_cols,
-                                                       float *out, int out_rows,
-                                                       int out_cols) {
+static int mu_vision_block_output_all_layer_metal(mu_engine *e, int layer,
+                                                  const float *patch_embeds,
+                                                  int rows, int cols,
+                                                  const float *rotary,
+                                                  int rotary_rows, int rotary_cols,
+                                                  float *out, int out_rows,
+                                                  int out_cols) {
     if (!e || !e->gpu || !patch_embeds || !rotary || !out ||
-        rows <= 0 || rows > 16 || cols != 1280 ||
+        rows <= 0 || cols != 1280 ||
         rotary_rows != rows || rotary_cols != 40 ||
         out_rows != rows || out_cols != 1280 ||
         layer < 0 || layer >= e->cfg.vision_layers) {
@@ -2447,11 +2447,15 @@ static int mu_vision_block_output_all_layer_metal_tiny(mu_engine *e, int layer,
             rows, 1280, 2560, kv);
     }
     if (rc == 0) mu_record_metal_stage(e, "vision_layer_kv");
-    for (int r = 0; rc == 0 && r < rows; r++) {
-        rc = mu_gpu_vision_attn_concat_probe(e->gpu,
-                                             q + (size_t)r * 1280u,
-                                             kv, rotary, rows, r,
-                                             attn + (size_t)r * 1280u);
+    if (rc == 0 && rows <= 16) {
+        for (int r = 0; rc == 0 && r < rows; r++) {
+            rc = mu_gpu_vision_attn_concat_probe(e->gpu,
+                                                 q + (size_t)r * 1280u,
+                                                 kv, rotary, rows, r,
+                                                 attn + (size_t)r * 1280u);
+        }
+    } else if (rc == 0) {
+        rc = mu_gpu_vision_attn_rows(e->gpu, q, kv, rotary, rows, attn);
     }
     if (rc == 0) mu_record_metal_stage(e, "vision_layer_attn");
     if (rc == 0) {
@@ -2537,8 +2541,8 @@ static int mu_vision_block_output_all_layer(mu_engine *e, int layer,
         mu_record_metal_stage(e, "vision_block0_output_all_rows");
         return 0;
     }
-    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available && rows <= 16) {
-        int rc = mu_vision_block_output_all_layer_metal_tiny(
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        int rc = mu_vision_block_output_all_layer_metal(
             e, layer, patch_embeds, rows, cols, rotary, rotary_rows, rotary_cols,
             out, out_rows, out_cols);
         if (rc == 0) return 0;
@@ -2667,7 +2671,7 @@ static int mu_vision_merger(mu_engine *e, const float *hidden,
 
     int groups = rows / 4;
 #if defined(__APPLE__)
-    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available && rows <= 16) {
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
         float *normed_m = (float *)malloc((size_t)rows * 1280u * sizeof(normed_m[0]));
         float *merged_m = (float *)malloc((size_t)groups * 5120u * sizeof(merged_m[0]));
         float *hidden5120_m = (float *)malloc((size_t)groups * 5120u * sizeof(hidden5120_m[0]));
@@ -2833,7 +2837,7 @@ int mu_vision_encode(mu_engine *e, const float *patch_embeds,
 #if defined(__APPLE__)
     if (e && e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
         if (patch_embeds && rotary && out &&
-            rows > 0 && rows <= 16 && cols == 1280 &&
+            rows > 0 && cols == 1280 &&
             rotary_rows == rows && rotary_cols == 40 &&
             rows % 4 == 0 && out_rows == rows / 4 && out_cols == 896) {
             float *hidden = (float *)malloc((size_t)rows * 1280u * sizeof(hidden[0]));
@@ -5566,7 +5570,8 @@ int mu_parse_image_file(mu_engine *e, const char *path, mu_result **out) {
     int n_blocks = mu_parse_layout_markup(raw, blocks, 256);
     char **contents = NULL;
     const char *skip_content = getenv("MU_SKIP_CONTENT");
-    if (!skip_content || strcmp(skip_content, "1") != 0) {
+    if (!e->opt.skip_content &&
+        (!skip_content || strcmp(skip_content, "1") != 0)) {
         contents = (char **)calloc((size_t)n_blocks, sizeof(contents[0]));
         if (!contents && n_blocks > 0) {
             free(raw);

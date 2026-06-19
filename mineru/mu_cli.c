@@ -1858,6 +1858,16 @@ int main(int argc, char **argv) {
             }
         } else if (!strcmp(argv[i], "--no-cpu-fallback")) {
             opt.allow_cpu_fallback = false;
+        } else if (!strcmp(argv[i], "--max-new-tokens") && i + 1 < argc) {
+            char *end = NULL;
+            long v = strtol(argv[++i], &end, 10);
+            if (!end || *end || v <= 0 || v >= 4096) {
+                fprintf(stderr, "--max-new-tokens must be an integer in 1..4095\n");
+                return 2;
+            }
+            opt.max_new_tokens = (int)v;
+        } else if (!strcmp(argv[i], "--skip-content")) {
+            opt.skip_content = true;
         } else if (!strcmp(argv[i], "--inspect")) {
             opt.inspect_only = true;
         } else if (!strcmp(argv[i], "--check-trace") && i + 1 < argc) {
@@ -1869,7 +1879,7 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--markdown")) {
             write_markdown = 1;
         } else {
-            fprintf(stderr, "usage: %s [--model-dir PATH] [--backend cpu|metal] [--no-cpu-fallback] [--inspect] [--check-trace PATH] [--image PATH (--json|--markdown)]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--model-dir PATH] [--backend cpu|metal] [--no-cpu-fallback] [--max-new-tokens N] [--skip-content] [--inspect] [--check-trace PATH] [--image PATH (--json|--markdown)]\n", argv[0]);
             return 2;
         }
     }
