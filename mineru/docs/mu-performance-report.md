@@ -247,7 +247,9 @@ Stage timing artifacts:
 /tmp/mu-benchmark-metal-10-smoke.json
 /tmp/mu-benchmark-cpu-page224-token1.json
 /tmp/mu-benchmark-metal-page224-token1.json
+/tmp/mu-benchmark-cpu-10-layout128.json
 /tmp/mu-benchmark-metal-page224-layout128.json
+/tmp/mu-benchmark-metal-layout128-batch1.json
 ```
 
 10-page quick E2E smoke, `--max-new-tokens 4 --skip-content`:
@@ -286,12 +288,18 @@ Page 224 1-token diagnostic, `--max-new-tokens 1 --skip-content`:
 | CPU reference | 52.29 | 0 | 0 |
 | Metal no-fallback | 137.26 | 0 | 0 |
 
-Page 224 layout-only parity, `--max-new-tokens 128 --skip-content`:
+Layout-only parity sample, `--max-new-tokens 128 --skip-content`:
 
-| Backend | Seconds | Blocks | Ordered types | CPU fallback rows |
-| --- | ---: | ---: | --- | ---: |
-| CPU reference | 54.09 | 3 | table, footer, page_number |
-| Metal no-fallback | 610.99 | 3 | table, footer, page_number | 0 |
+| Page | CPU s | Metal s | CPU blocks/types | Metal blocks/types | Match | Metal fallback |
+| ---: | ---: | ---: | --- | --- | ---: | ---: |
+| 224 | 52.44 | 610.99 | 3 table/footer/page_number | 3 table/footer/page_number | yes | 0 |
+| 234 | 51.02 | 788.66 | 3 table/footer/page_number | 3 table/footer/page_number | yes | 0 |
+| 237 | 50.92 | 742.55 | 3 table/footer/page_number | 3 table/footer/page_number | yes | 0 |
+| 241 | 50.49 | 574.56 | 3 table/footer/page_number | 3 table/footer/page_number | yes | 0 |
+
+The CPU reference completed all 10 sampled pages in this configuration:
+511.64s total, 51.16s/page mean, zero fallback rows. The Metal no-fallback
+layout-only sample currently covers 4 of 10 pages.
 
 Interpretation:
 
@@ -301,10 +309,10 @@ Interpretation:
 - The 4-token smoke is useful for end-to-end process timing and fallback
   detection across the sampled corpus, but not for accuracy, because it stops
   before layout blocks are emitted.
-- The 128-token page224 layout-only run is the first page-level accuracy result
-  for the pure Metal path: Metal no-fallback matches CPU block count and ordered
-  block types (`table`, `footer`, `page_number`) with zero fallback. It is still
-  about 11.3x slower than CPU for this page.
+- The 128-token layout-only runs are the first page-level accuracy results for
+  the pure Metal path. Metal no-fallback matches CPU block count and ordered
+  block types on the 4 measured pages with zero fallback. These pages are still
+  about 11.8x to 15.5x slower than CPU, depending on page.
 - The 1-token diagnostic shows that most current Metal time is already spent
   before token generation has much room to accumulate. The next optimization
   target is therefore full-page vision encode: keep intermediate tensors and
