@@ -113,3 +113,123 @@ kernel void mu_dense_bf16_bias_rows(device const float *x [[buffer(0)]],
     }
     out[(size_t)row * (size_t)out_cols + (size_t)out_col] = mu_round_bf16(acc);
 }
+
+kernel void mu_dense_mps_bias_round(device float *out [[buffer(0)]],
+                                    device const ushort *bias [[buffer(1)]],
+                                    constant int &out_cols [[buffer(2)]],
+                                    uint2 gid [[thread_position_in_grid]]) {
+    int out_col = (int)gid.x;
+    int row = (int)gid.y;
+    if (out_col >= out_cols) return;
+
+    size_t idx = (size_t)row * (size_t)out_cols + (size_t)out_col;
+    out[idx] = mu_round_bf16(out[idx] + mu_bf16_to_f32(bias[out_col]));
+}
+
+kernel void mu_dense_bf16_bias_rows_simd(device const float *x [[buffer(0)]],
+                                         device const ushort *w [[buffer(1)]],
+                                         device const ushort *bias [[buffer(2)]],
+                                         device float *out [[buffer(3)]],
+                                         constant int &cols [[buffer(4)]],
+                                         constant int &out_cols [[buffer(5)]],
+                                         uint2 gid [[thread_position_in_grid]],
+                                         uint lane [[thread_index_in_simdgroup]]) {
+    int out_col = (int)(gid.x / 32);
+    int row = (int)gid.y;
+    if (out_col >= out_cols) return;
+
+    device const float *xrow = x + (size_t)row * (size_t)cols;
+    device const ushort *wrow = w + (size_t)out_col * (size_t)cols;
+    float partial = 0.0f;
+    for (int c = (int)lane; c < cols; c += 32) {
+        partial += xrow[c] * mu_bf16_to_f32(wrow[c]);
+    }
+    float acc = simd_sum(partial);
+    if (lane == 0) {
+        acc += mu_bf16_to_f32(bias[out_col]);
+        out[(size_t)row * (size_t)out_cols + (size_t)out_col] =
+            mu_round_bf16(acc);
+    }
+}
+
+kernel void mu_dense_bf16_bias_rows_tiled(device const float *x [[buffer(0)]],
+                                          device const ushort *w [[buffer(1)]],
+                                          device const ushort *bias [[buffer(2)]],
+                                          device float *out [[buffer(3)]],
+                                          constant int &cols [[buffer(4)]],
+                                          constant int &out_cols [[buffer(5)]],
+                                          uint2 tg [[threadgroup_position_in_grid]],
+                                          uint lane [[thread_index_in_simdgroup]],
+                                          uint sg [[simdgroup_index_in_threadgroup]]) {
+    int out_col = (int)tg.x * 8 + (int)sg;
+    int row = (int)tg.y;
+    if (out_col >= out_cols) return;
+
+    device const float *xrow = x + (size_t)row * (size_t)cols;
+    device const ushort *wrow = w + (size_t)out_col * (size_t)cols;
+    float partial = 0.0f;
+    for (int c = (int)lane; c < cols; c += 32) {
+        partial += xrow[c] * mu_bf16_to_f32(wrow[c]);
+    }
+    float acc = simd_sum(partial);
+    if (lane == 0) {
+        acc += mu_bf16_to_f32(bias[out_col]);
+        out[(size_t)row * (size_t)out_cols + (size_t)out_col] =
+            mu_round_bf16(acc);
+    }
+}
+
+kernel void mu_dense_probe_simd(device const float *x [[buffer(0)]],
+                                device const ushort *w [[buffer(1)]],
+                                device float *out [[buffer(2)]],
+                                constant int &cols [[buffer(3)]],
+                                uint2 gid [[thread_position_in_grid]],
+                                uint simd_lane [[thread_index_in_simdgroup]]) {
+    uint row = gid.y;
+    float local_sum = 0.0f;
+    for (int c = (int)simd_lane; c < cols; c += 32) {
+        local_sum += x[c] * mu_bf16_to_f32(w[(size_t)row * (size_t)cols + c]);
+    }
+    float total_sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        out[row] = total_sum;
+    }
+}
+
+kernel void mu_dense_bf16_bias_probe_simd(device const float *x [[buffer(0)]],
+                                          device const ushort *w [[buffer(1)]],
+                                          device const ushort *bias [[buffer(2)]],
+                                          device float *out [[buffer(3)]],
+                                          constant int &cols [[buffer(4)]],
+                                          uint2 gid [[thread_position_in_grid]],
+                                          uint simd_lane [[thread_index_in_simdgroup]]) {
+    uint row = gid.y;
+    float local_sum = 0.0f;
+    for (int c = (int)simd_lane; c < cols; c += 32) {
+        local_sum += x[c] * mu_bf16_to_f32(w[(size_t)row * (size_t)cols + c]);
+    }
+    float total_sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        float bias_val = mu_bf16_to_f32(bias[row]);
+        out[row] = mu_round_bf16(total_sum + bias_val);
+    }
+}
+
+kernel void mu_dense_f32_bias_probe_simd(device const float *x [[buffer(0)]],
+                                         device const ushort *w [[buffer(1)]],
+                                         device const ushort *bias [[buffer(2)]],
+                                         device float *out [[buffer(3)]],
+                                         constant int &cols [[buffer(4)]],
+                                         uint2 gid [[thread_position_in_grid]],
+                                         uint simd_lane [[thread_index_in_simdgroup]]) {
+    uint row = gid.y;
+    float local_sum = 0.0f;
+    for (int c = (int)simd_lane; c < cols; c += 32) {
+        local_sum += x[c] * mu_bf16_to_f32(w[(size_t)row * (size_t)cols + c]);
+    }
+    float total_sum = simd_sum(local_sum);
+    if (simd_lane == 0) {
+        float bias_val = mu_bf16_to_f32(bias[row]);
+        out[row] = total_sum + bias_val;
+    }
+}

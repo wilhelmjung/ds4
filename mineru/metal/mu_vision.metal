@@ -109,6 +109,50 @@ kernel void mu_vision_qk_scores_head(device const float *q [[buffer(0)]],
     scores[(size_t)query_row * (size_t)rows + (size_t)key_row] = dot * rsqrt(80.0f);
 }
 
+kernel void mu_vision_rope_qk_rows(device const float *q [[buffer(0)]],
+                                   device const float *kv [[buffer(1)]],
+                                   device const float *rotary [[buffer(2)]],
+                                   device float *q_rot [[buffer(3)]],
+                                   device float *k_rot [[buffer(4)]],
+                                   constant int &rows [[buffer(5)]],
+                                   uint gid [[thread_position_in_grid]]) {
+    const int head_dim = 80;
+    const int hidden = 1280;
+    int idx = (int)gid;
+    int total = rows * hidden;
+    if (idx >= total) return;
+
+    int row = idx / hidden;
+    int col = idx - row * hidden;
+    int head = col / head_dim;
+    int dim = col - head * head_dim;
+    device const float *q_head = q + (size_t)row * 1280u + head * head_dim;
+    device const float *k_head = kv + (size_t)row * 2560u + head * head_dim;
+    device const float *rope = rotary + (size_t)row * 40u;
+    q_rot[(size_t)idx] = mu_rope_value(q_head, rope, dim);
+    k_rot[(size_t)idx] = mu_rope_value(k_head, rope, dim);
+}
+
+kernel void mu_vision_qk_scores_head_prerot(device const float *q_rot [[buffer(0)]],
+                                            device const float *k_rot [[buffer(1)]],
+                                            device float *scores [[buffer(2)]],
+                                            constant int &rows [[buffer(3)]],
+                                            constant int &head [[buffer(4)]],
+                                            uint2 gid [[thread_position_in_grid]]) {
+    int key_row = (int)gid.x;
+    int query_row = (int)gid.y;
+    if (key_row >= rows || query_row >= rows) return;
+
+    const int head_dim = 80;
+    device const float *q_head = q_rot + (size_t)query_row * 1280u + head * head_dim;
+    device const float *k_head = k_rot + (size_t)key_row * 1280u + head * head_dim;
+    float dot = 0.0f;
+    for (int d = 0; d < head_dim; d++) {
+        dot += q_head[d] * k_head[d];
+    }
+    scores[(size_t)query_row * (size_t)rows + (size_t)key_row] = dot * rsqrt(80.0f);
+}
+
 kernel void mu_vision_softmax_bf16_rows(device float *scores [[buffer(0)]],
                                         constant int &rows [[buffer(1)]],
                                         uint row_gid [[thread_position_in_grid]]) {
@@ -148,6 +192,109 @@ kernel void mu_vision_pv_head(device const float *scores [[buffer(0)]],
     }
     out[(size_t)query_row * 1280u + (size_t)head * head_dim + (size_t)dim] =
         mu_round_bf16(acc);
+}
+
+kernel void mu_vision_softmax_pv_head(device const float *scores [[buffer(0)]],
+                                      device const float *kv [[buffer(1)]],
+                                      device float *out [[buffer(2)]],
+                                      constant int &rows [[buffer(3)]],
+                                      constant int &head [[buffer(4)]],
+                                      uint query_gid [[thread_position_in_grid]]) {
+    int query_row = (int)query_gid;
+    const int head_dim = 80;
+    if (query_row >= rows) return;
+
+    device const float *score_row = scores + (size_t)query_row * (size_t)rows;
+    float max_score = -3.402823466e38f;
+    for (int key_row = 0; key_row < rows; key_row++) {
+        if (score_row[key_row] > max_score) max_score = score_row[key_row];
+    }
+
+    float denom = 0.0f;
+    for (int key_row = 0; key_row < rows; key_row++) {
+        denom += exp(score_row[key_row] - max_score);
+    }
+
+    float acc[80];
+    for (int d = 0; d < head_dim; d++) acc[d] = 0.0f;
+    for (int key_row = 0; key_row < rows; key_row++) {
+        float p = mu_round_bf16(exp(score_row[key_row] - max_score) / denom);
+        device const float *v_head =
+            kv + (size_t)key_row * 2560u + 1280u + head * head_dim;
+        for (int d = 0; d < head_dim; d++) {
+            acc[d] += p * v_head[d];
+        }
+    }
+
+    device float *out_head = out + (size_t)query_row * 1280u + head * head_dim;
+    for (int d = 0; d < head_dim; d++) {
+        out_head[d] = mu_round_bf16(acc[d]);
+    }
+}
+
+kernel void mu_vision_attn_rows_online(device const float *q [[buffer(0)]],
+                                       device const float *kv [[buffer(1)]],
+                                       device const float *rotary [[buffer(2)]],
+                                       device float *out [[buffer(3)]],
+                                       constant int &rows [[buffer(4)]],
+                                       uint2 gid [[thread_position_in_grid]]) {
+    int query_row = (int)gid.x;
+    int head = (int)gid.y;
+    if (query_row >= rows || head >= 16) return;
+
+    const int head_dim = 80;
+    device const float *q_head = q + (size_t)query_row * 1280u + head * head_dim;
+    device const float *q_rope = rotary + (size_t)query_row * 40u;
+    float qd[80];
+    for (int d = 0; d < head_dim; d++) {
+        qd[d] = mu_rope_value(q_head, q_rope, d);
+    }
+
+    float scale = rsqrt(80.0f);
+    float max_score = -3.402823466e38f;
+    for (int key_row = 0; key_row < rows; key_row++) {
+        device const float *k_head = kv + (size_t)key_row * 2560u + head * head_dim;
+        device const float *k_rope = rotary + (size_t)key_row * 40u;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += qd[d] * mu_rope_value(k_head, k_rope, d);
+        }
+        float score = dot * scale;
+        if (score > max_score) max_score = score;
+    }
+
+    float denom = 0.0f;
+    for (int key_row = 0; key_row < rows; key_row++) {
+        device const float *k_head = kv + (size_t)key_row * 2560u + head * head_dim;
+        device const float *k_rope = rotary + (size_t)key_row * 40u;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += qd[d] * mu_rope_value(k_head, k_rope, d);
+        }
+        denom += exp(dot * scale - max_score);
+    }
+
+    float acc[80];
+    for (int d = 0; d < head_dim; d++) acc[d] = 0.0f;
+    for (int key_row = 0; key_row < rows; key_row++) {
+        device const float *k_head = kv + (size_t)key_row * 2560u + head * head_dim;
+        device const float *k_rope = rotary + (size_t)key_row * 40u;
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; d++) {
+            dot += qd[d] * mu_rope_value(k_head, k_rope, d);
+        }
+        float p = mu_round_bf16(exp(dot * scale - max_score) / denom);
+        device const float *v_head =
+            kv + (size_t)key_row * 2560u + 1280u + head * head_dim;
+        for (int d = 0; d < head_dim; d++) {
+            acc[d] += p * v_head[d];
+        }
+    }
+
+    device float *out_head = out + (size_t)query_row * 1280u + head * head_dim;
+    for (int d = 0; d < head_dim; d++) {
+        out_head[d] = mu_round_bf16(acc[d]);
+    }
 }
 
 kernel void mu_vision_add_bf16(device const float *a [[buffer(0)]],

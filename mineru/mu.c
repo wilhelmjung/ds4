@@ -147,6 +147,47 @@ static void mu_timing_log_stage(int enabled, const char *stage, double start) {
             stage, mu_time_now_seconds() - start);
 }
 
+static void mu_timing_log_seconds(int enabled, const char *stage, double seconds) {
+    if (!enabled || !stage) return;
+    fprintf(stderr, "mu_timing stage=%s seconds=%.6f\n", stage, seconds);
+}
+
+typedef struct mu_text_decode_timing {
+    double cached_step;
+    double cached_qkv;
+    double cached_attn_mlp;
+    double cached_logits;
+    int steps;
+} mu_text_decode_timing;
+
+typedef struct mu_text_prefill_timing {
+    double qkv;
+    double attn;
+    double mlp;
+    double logits;
+    int layers;
+} mu_text_prefill_timing;
+
+static void mu_text_prefill_timing_add(mu_text_prefill_timing *dst,
+                                       const mu_text_prefill_timing *src) {
+    if (!dst || !src) return;
+    dst->qkv += src->qkv;
+    dst->attn += src->attn;
+    dst->mlp += src->mlp;
+    dst->logits += src->logits;
+    dst->layers += src->layers;
+}
+
+static void mu_text_decode_timing_add(mu_text_decode_timing *dst,
+                                      const mu_text_decode_timing *src) {
+    if (!dst || !src) return;
+    dst->cached_step += src->cached_step;
+    dst->cached_qkv += src->cached_qkv;
+    dst->cached_attn_mlp += src->cached_attn_mlp;
+    dst->cached_logits += src->cached_logits;
+    dst->steps += src->steps;
+}
+
 static uint64_t mu_read_u64_le(const unsigned char *p) {
     uint64_t v = 0;
     for (int i = 7; i >= 0; i--) {
@@ -2390,12 +2431,12 @@ static const uint16_t *mu_vision_block_tensor_bf16(const mu_engine *e, int layer
 
 #if defined(__APPLE__)
 static int mu_vision_block_output_all_layer_metal(mu_engine *e, int layer,
-                                                  const float *patch_embeds,
-                                                  int rows, int cols,
-                                                  const float *rotary,
-                                                  int rotary_rows, int rotary_cols,
-                                                  float *out, int out_rows,
-                                                  int out_cols) {
+                                                   const float *patch_embeds,
+                                                   int rows, int cols,
+                                                   const float *rotary,
+                                                   int rotary_rows, int rotary_cols,
+                                                   float *out, int out_rows,
+                                                   int out_cols) {
     if (!e || !e->gpu || !patch_embeds || !rotary || !out ||
         rows <= 0 || cols != 1280 ||
         rotary_rows != rows || rotary_cols != 40 ||
@@ -2420,18 +2461,126 @@ static int mu_vision_block_output_all_layer_metal(mu_engine *e, int layer,
         return -2;
     }
 
-    float *normed = (float *)malloc((size_t)rows * 1280u * sizeof(normed[0]));
-    float *q = (float *)malloc((size_t)rows * 1280u * sizeof(q[0]));
-    float *kv = (float *)malloc((size_t)rows * 2560u * sizeof(kv[0]));
-    float *attn = (float *)malloc((size_t)rows * 1280u * sizeof(attn[0]));
-    float *proj = (float *)malloc((size_t)rows * 1280u * sizeof(proj[0]));
-    float *residual1 = (float *)malloc((size_t)rows * 1280u * sizeof(residual1[0]));
-    float *norm2 = (float *)malloc((size_t)rows * 1280u * sizeof(norm2[0]));
-    float *fc1 = (float *)malloc((size_t)rows * 5120u * sizeof(fc1[0]));
-    float *fc1_act = (float *)malloc((size_t)rows * 5120u * sizeof(fc1_act[0]));
-    float *mlp = (float *)malloc((size_t)rows * 1280u * sizeof(mlp[0]));
-    if (!normed || !q || !kv || !attn || !proj || !residual1 || !norm2 ||
-        !fc1 || !fc1_act || !mlp) {
+    if (getenv("MU_VISION_BLOCK_TIMING")) {
+        float *normed = (float *)malloc((size_t)rows * 1280u * sizeof(normed[0]));
+        float *q = (float *)malloc((size_t)rows * 1280u * sizeof(q[0]));
+        float *kv = (float *)malloc((size_t)rows * 2560u * sizeof(kv[0]));
+        float *attn = (float *)malloc((size_t)rows * 1280u * sizeof(attn[0]));
+        float *proj = (float *)malloc((size_t)rows * 1280u * sizeof(proj[0]));
+        float *residual1 = (float *)malloc((size_t)rows * 1280u * sizeof(residual1[0]));
+        float *norm2 = (float *)malloc((size_t)rows * 1280u * sizeof(norm2[0]));
+        float *fc1 = (float *)malloc((size_t)rows * 5120u * sizeof(fc1[0]));
+        float *fc1_act = (float *)malloc((size_t)rows * 5120u * sizeof(fc1_act[0]));
+        if (!normed || !q || !kv || !attn || !proj || !residual1 ||
+            !norm2 || !fc1 || !fc1_act) {
+            free(normed);
+            free(q);
+            free(kv);
+            free(attn);
+            free(proj);
+            free(residual1);
+            free(norm2);
+            free(fc1);
+            free(fc1_act);
+            return -3;
+        }
+
+        int timing = mu_timing_enabled();
+        double norm_seconds = 0.0;
+        double dense_seconds = 0.0;
+        double attention_seconds = 0.0;
+        double other_seconds = 0.0;
+        double stage_start = mu_time_now_seconds();
+        int rc = mu_gpu_layernorm_bf16_rows(e->gpu, patch_embeds,
+                                            (const unsigned short *)norm1_w,
+                                            (const unsigned short *)norm1_b,
+                                            rows, 1280, 1e-6f, normed);
+        norm_seconds += mu_time_now_seconds() - stage_start;
+
+        if (rc == 0) {
+            stage_start = mu_time_now_seconds();
+            rc = mu_gpu_dense_bf16_bias_rows(e->gpu, normed,
+                                             (const unsigned short *)qkv_w,
+                                             (const unsigned short *)qkv_b,
+                                             rows, 1280, 1280, q);
+            if (rc == 0) {
+                rc = mu_gpu_dense_bf16_bias_rows(
+                    e->gpu, normed,
+                    (const unsigned short *)(qkv_w + (size_t)1280 * 1280),
+                    (const unsigned short *)(qkv_b + 1280),
+                    rows, 1280, 2560, kv);
+            }
+            dense_seconds += mu_time_now_seconds() - stage_start;
+        }
+
+        if (rc == 0) {
+            stage_start = mu_time_now_seconds();
+            if (rows <= 16) {
+                for (int r = 0; rc == 0 && r < rows; r++) {
+                    rc = mu_gpu_vision_attn_concat_probe(
+                        e->gpu, q + (size_t)r * 1280u, kv, rotary, rows, r,
+                        attn + (size_t)r * 1280u);
+                }
+            } else {
+                rc = mu_gpu_vision_attn_rows(e->gpu, q, kv, rotary, rows, attn);
+            }
+            attention_seconds += mu_time_now_seconds() - stage_start;
+        }
+
+        if (rc == 0) {
+            stage_start = mu_time_now_seconds();
+            rc = mu_gpu_dense_bf16_bias_rows(e->gpu, attn,
+                                             (const unsigned short *)proj_w,
+                                             (const unsigned short *)proj_b,
+                                             rows, 1280, 1280, proj);
+            dense_seconds += mu_time_now_seconds() - stage_start;
+        }
+        if (rc == 0) {
+            stage_start = mu_time_now_seconds();
+            rc = mu_gpu_vision_add_bf16(e->gpu, patch_embeds, proj,
+                                        rows * 1280, residual1);
+            other_seconds += mu_time_now_seconds() - stage_start;
+        }
+        if (rc == 0) {
+            stage_start = mu_time_now_seconds();
+            rc = mu_gpu_layernorm_bf16_rows(e->gpu, residual1,
+                                            (const unsigned short *)norm2_w,
+                                            (const unsigned short *)norm2_b,
+                                            rows, 1280, 1e-6f, norm2);
+            norm_seconds += mu_time_now_seconds() - stage_start;
+        }
+        if (rc == 0) {
+            stage_start = mu_time_now_seconds();
+            rc = mu_gpu_dense_bf16_bias_rows(e->gpu, norm2,
+                                             (const unsigned short *)fc1_w,
+                                             (const unsigned short *)fc1_b,
+                                             rows, 1280, 5120, fc1);
+            if (rc == 0) {
+                rc = mu_gpu_vision_quick_gelu_bf16(e->gpu, fc1,
+                                                   rows * 5120, fc1_act);
+            }
+            other_seconds += mu_time_now_seconds() - stage_start;
+        }
+        if (rc == 0) {
+            stage_start = mu_time_now_seconds();
+            rc = mu_gpu_dense_bf16_bias_rows(e->gpu, fc1_act,
+                                             (const unsigned short *)fc2_w,
+                                             (const unsigned short *)fc2_b,
+                                             rows, 5120, 1280, proj);
+            dense_seconds += mu_time_now_seconds() - stage_start;
+        }
+        if (rc == 0) {
+            stage_start = mu_time_now_seconds();
+            rc = mu_gpu_vision_add_bf16(e->gpu, residual1, proj,
+                                        rows * 1280, out);
+            other_seconds += mu_time_now_seconds() - stage_start;
+        }
+
+        mu_timing_log_seconds(timing, "vision_block_norm", norm_seconds);
+        mu_timing_log_seconds(timing, "vision_block_dense", dense_seconds);
+        mu_timing_log_seconds(timing, "vision_block_attention", attention_seconds);
+        mu_timing_log_seconds(timing, "vision_block_other", other_seconds);
+
         free(normed);
         free(q);
         free(kv);
@@ -2441,95 +2590,111 @@ static int mu_vision_block_output_all_layer_metal(mu_engine *e, int layer,
         free(norm2);
         free(fc1);
         free(fc1_act);
-        free(mlp);
+        return rc == 0 ? 0 : -4;
+    }
+
+    mu_gpu_cmd_ctx *ctx = NULL;
+    int rc = mu_gpu_cmd_begin(e->gpu, &ctx);
+    if (rc != 0) return rc;
+
+    unsigned long embed_bytes = (unsigned long)rows * 1280u * sizeof(float);
+    unsigned long kv_bytes = (unsigned long)rows * 2560u * sizeof(float);
+    unsigned long mlp_bytes = (unsigned long)rows * 5120u * sizeof(float);
+
+    mu_gpu_buf pe_buf = mu_gpu_scratch_alloc_a_ctx(ctx, embed_bytes);
+    mu_gpu_buf normed_buf = mu_gpu_scratch_alloc_b_ctx(ctx, embed_bytes);
+    mu_gpu_buf q_buf = mu_gpu_scratch_alloc_a_ctx(ctx, embed_bytes);
+    mu_gpu_buf kv_buf = mu_gpu_scratch_alloc_a_ctx(ctx, kv_bytes);
+    mu_gpu_buf attn_buf = mu_gpu_scratch_alloc_b_ctx(ctx, embed_bytes);
+    mu_gpu_buf proj_buf = mu_gpu_scratch_alloc_b_ctx(ctx, embed_bytes);
+    mu_gpu_buf res1_buf = mu_gpu_scratch_alloc_b_ctx(ctx, embed_bytes);
+    mu_gpu_buf norm2_buf = mu_gpu_scratch_alloc_a_ctx(ctx, embed_bytes);
+    mu_gpu_buf fc1_buf = mu_gpu_scratch_alloc_b_ctx(ctx, mlp_bytes);
+    mu_gpu_buf fc1_act_buf = mu_gpu_scratch_alloc_a_ctx(ctx, mlp_bytes);
+    mu_gpu_buf mlp_buf = mu_gpu_scratch_alloc_b_ctx(ctx, embed_bytes);
+    mu_gpu_buf out_buf = mu_gpu_scratch_alloc_a_ctx(ctx, embed_bytes);
+
+    mu_gpu_buf norm1_w_buf = mu_gpu_get_weight_buf(e->gpu, norm1_w, 1280 * sizeof(unsigned short));
+    mu_gpu_buf norm1_b_buf = mu_gpu_get_weight_buf(e->gpu, norm1_b, 1280 * sizeof(unsigned short));
+    mu_gpu_buf qkv_w_buf = mu_gpu_get_weight_buf(e->gpu, qkv_w, 3840 * 1280 * sizeof(unsigned short));
+    mu_gpu_buf qkv_b_buf = mu_gpu_get_weight_buf(e->gpu, qkv_b, 3840 * sizeof(unsigned short));
+    mu_gpu_buf proj_w_buf = mu_gpu_get_weight_buf(e->gpu, proj_w, 1280 * 1280 * sizeof(unsigned short));
+    mu_gpu_buf proj_b_buf = mu_gpu_get_weight_buf(e->gpu, proj_b, 1280 * sizeof(unsigned short));
+    mu_gpu_buf norm2_w_buf = mu_gpu_get_weight_buf(e->gpu, norm2_w, 1280 * sizeof(unsigned short));
+    mu_gpu_buf norm2_b_buf = mu_gpu_get_weight_buf(e->gpu, norm2_b, 1280 * sizeof(unsigned short));
+    mu_gpu_buf fc1_w_buf = mu_gpu_get_weight_buf(e->gpu, fc1_w, 5120 * 1280 * sizeof(unsigned short));
+    mu_gpu_buf fc1_b_buf = mu_gpu_get_weight_buf(e->gpu, fc1_b, 5120 * sizeof(unsigned short));
+    mu_gpu_buf fc2_w_buf = mu_gpu_get_weight_buf(e->gpu, fc2_w, 1280 * 5120 * sizeof(unsigned short));
+    mu_gpu_buf fc2_b_buf = mu_gpu_get_weight_buf(e->gpu, fc2_b, 1280 * sizeof(unsigned short));
+
+    if (!pe_buf.ptr || !normed_buf.ptr || !q_buf.ptr || !kv_buf.ptr || !attn_buf.ptr || !proj_buf.ptr ||
+        !res1_buf.ptr || !norm2_buf.ptr || !fc1_buf.ptr || !fc1_act_buf.ptr || !mlp_buf.ptr || !out_buf.ptr ||
+        !norm1_w_buf.ptr || !norm1_b_buf.ptr || !qkv_w_buf.ptr || !qkv_b_buf.ptr || !proj_w_buf.ptr || !proj_b_buf.ptr ||
+        !norm2_w_buf.ptr || !norm2_b_buf.ptr || !fc1_w_buf.ptr || !fc1_b_buf.ptr || !fc2_w_buf.ptr || !fc2_b_buf.ptr) {
+        mu_gpu_cmd_discard(ctx);
         return -3;
     }
 
-    int rc = mu_gpu_layernorm_bf16_rows(e->gpu, patch_embeds,
-                                        (const unsigned short *)norm1_w,
-                                        (const unsigned short *)norm1_b,
-                                        rows, 1280, 1e-6f, normed);
-    if (rc == 0) mu_record_metal_stage(e, "vision_layer_norm1");
+    mu_gpu_buf_copy_to(pe_buf, patch_embeds, embed_bytes);
+    rc = mu_gpu_layernorm_bf16_rows_ctx(ctx, pe_buf, norm1_w_buf, norm1_b_buf, rows, 1280, 1e-6f, normed_buf);
+
     if (rc == 0) {
-        rc = mu_gpu_dense_bf16_bias_rows(e->gpu, normed,
-                                         (const unsigned short *)qkv_w,
-                                         (const unsigned short *)qkv_b,
-                                         rows, 1280, 1280, q);
+        rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, normed_buf, qkv_w_buf, qkv_b_buf, rows, 1280, 1280, q_buf);
     }
-    if (rc == 0) mu_record_metal_stage(e, "vision_layer_q");
+
     if (rc == 0) {
-        rc = mu_gpu_dense_bf16_bias_rows(
-            e->gpu, normed,
-            (const unsigned short *)(qkv_w + (size_t)1280 * 1280),
-            (const unsigned short *)(qkv_b + 1280),
-            rows, 1280, 2560, kv);
+        mu_gpu_buf kv_w_buf = mu_gpu_get_weight_buf(e->gpu, qkv_w + (size_t)1280 * 1280, 2560 * 1280 * sizeof(unsigned short));
+        mu_gpu_buf kv_b_buf = mu_gpu_get_weight_buf(e->gpu, qkv_b + 1280, 2560 * sizeof(unsigned short));
+        if (!kv_w_buf.ptr || !kv_b_buf.ptr) {
+            mu_gpu_cmd_discard(ctx);
+            return -3;
+        }
+        rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, normed_buf, kv_w_buf, kv_b_buf, rows, 1280, 2560, kv_buf);
     }
-    if (rc == 0) mu_record_metal_stage(e, "vision_layer_kv");
+
     if (rc == 0 && rows <= 16) {
         for (int r = 0; rc == 0 && r < rows; r++) {
-            rc = mu_gpu_vision_attn_concat_probe(e->gpu,
-                                                 q + (size_t)r * 1280u,
-                                                 kv, rotary, rows, r,
-                                                 attn + (size_t)r * 1280u);
+            mu_gpu_buf q_r = q_buf;
+            q_r.offset += (size_t)r * 1280u * sizeof(float);
+            mu_gpu_buf attn_r = attn_buf;
+            attn_r.offset += (size_t)r * 1280u * sizeof(float);
+            rc = mu_gpu_vision_attn_concat_probe_ctx(ctx, q_r, kv_buf, rotary, rows, r, attn_r);
         }
     } else if (rc == 0) {
-        rc = mu_gpu_vision_attn_rows(e->gpu, q, kv, rotary, rows, attn);
+        rc = mu_gpu_vision_attn_rows_ctx(ctx, q_buf, kv_buf, rotary, rows, attn_buf);
     }
-    if (rc == 0) mu_record_metal_stage(e, "vision_layer_attn");
-    if (rc == 0) {
-        rc = mu_gpu_dense_bf16_bias_rows(e->gpu, attn,
-                                         (const unsigned short *)proj_w,
-                                         (const unsigned short *)proj_b,
-                                         rows, 1280, 1280, proj);
-    }
-    if (rc == 0) mu_record_metal_stage(e, "vision_layer_proj");
-    if (rc == 0) {
-        rc = mu_gpu_vision_add_bf16(e->gpu, patch_embeds, proj,
-                                    rows * 1280, residual1);
-    }
-    if (rc == 0) mu_record_metal_stage(e, "vision_layer_residual1");
-    if (rc == 0) {
-        rc = mu_gpu_layernorm_bf16_rows(e->gpu, residual1,
-                                        (const unsigned short *)norm2_w,
-                                        (const unsigned short *)norm2_b,
-                                        rows, 1280, 1e-6f, norm2);
-    }
-    if (rc == 0) mu_record_metal_stage(e, "vision_layer_norm2");
-    if (rc == 0) {
-        rc = mu_gpu_dense_bf16_bias_rows(e->gpu, norm2,
-                                         (const unsigned short *)fc1_w,
-                                         (const unsigned short *)fc1_b,
-                                         rows, 1280, 5120, fc1);
-    }
-    if (rc == 0) mu_record_metal_stage(e, "vision_layer_fc1");
-    if (rc == 0) {
-        rc = mu_gpu_vision_quick_gelu_bf16(e->gpu, fc1,
-                                           rows * 5120, fc1_act);
-    }
-    if (rc == 0) mu_record_metal_stage(e, "vision_layer_quick_gelu");
-    if (rc == 0) {
-        rc = mu_gpu_dense_bf16_bias_rows(e->gpu, fc1_act,
-                                         (const unsigned short *)fc2_w,
-                                         (const unsigned short *)fc2_b,
-                                         rows, 5120, 1280, mlp);
-    }
-    if (rc == 0) mu_record_metal_stage(e, "vision_layer_fc2");
-    if (rc == 0) {
-        rc = mu_gpu_vision_add_bf16(e->gpu, residual1, mlp,
-                                    rows * 1280, out);
-    }
-    if (rc == 0) mu_record_metal_stage(e, "vision_layer_residual2");
 
-    free(normed);
-    free(q);
-    free(kv);
-    free(attn);
-    free(proj);
-    free(residual1);
-    free(norm2);
-    free(fc1);
-    free(fc1_act);
-    free(mlp);
+    if (rc == 0) {
+        rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, attn_buf, proj_w_buf, proj_b_buf, rows, 1280, 1280, proj_buf);
+    }
+    if (rc == 0) {
+        rc = mu_gpu_vision_add_bf16_ctx(ctx, pe_buf, proj_buf, rows * 1280, res1_buf);
+    }
+    if (rc == 0) {
+        rc = mu_gpu_layernorm_bf16_rows_ctx(ctx, res1_buf, norm2_w_buf, norm2_b_buf, rows, 1280, 1e-6f, norm2_buf);
+    }
+    if (rc == 0) {
+        rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, norm2_buf, fc1_w_buf, fc1_b_buf, rows, 1280, 5120, fc1_buf);
+    }
+    if (rc == 0) {
+        rc = mu_gpu_vision_quick_gelu_bf16_ctx(ctx, fc1_buf, rows * 5120, fc1_act_buf);
+    }
+    if (rc == 0) {
+        rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, fc1_act_buf, fc2_w_buf, fc2_b_buf, rows, 5120, 1280, mlp_buf);
+    }
+    if (rc == 0) {
+        rc = mu_gpu_vision_add_bf16_ctx(ctx, res1_buf, mlp_buf, rows * 1280, out_buf);
+    }
+
+    if (rc == 0) {
+        rc = mu_gpu_cmd_commit_and_wait(ctx);
+        if (rc == 0) {
+            mu_gpu_buf_copy_from(out, out_buf, embed_bytes);
+        }
+    } else {
+        mu_gpu_cmd_discard(ctx);
+    }
+
     return rc == 0 ? 0 : -4;
 }
 #endif
@@ -2863,12 +3028,17 @@ int mu_vision_encode(mu_engine *e, const float *patch_embeds,
                 int frc = mu_record_cpu_fallback(e, "vision_encode_alloc");
                 if (frc) return frc;
             } else {
+                int timing = mu_timing_enabled();
+                double stage_start = mu_time_now_seconds();
                 int rc = mu_vision_encode_hidden(e, patch_embeds, rows, cols,
                                                  rotary, rotary_rows, rotary_cols,
                                                  hidden, rows, 1280);
+                mu_timing_log_stage(timing, "vision_encode_hidden", stage_start);
                 if (rc == 0) {
+                    stage_start = mu_time_now_seconds();
                     rc = mu_vision_merger(e, hidden, rows, 1280,
                                           out, out_rows, out_cols);
+                    mu_timing_log_stage(timing, "vision_encode_merger", stage_start);
                 }
                 free(hidden);
                 if (rc == 0) {
@@ -2923,11 +3093,15 @@ static int mu_text_prefill_cache_from_embeddings(mu_engine *e, float *hidden_sta
                                                  int n_ids, const int *position_ids,
                                                  int cache_cap, float *k_cache,
                                                  float *v_cache,
-                                                 int top_k, mu_token_logit *out);
+                                                 int top_k, mu_token_logit *out,
+                                                 mu_text_prefill_timing *timing_stats);
 static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                                int cache_pos, int cache_cap,
                                float *k_cache, float *v_cache,
-                               int top_k, mu_token_logit *out);
+                               mu_gpu_kv_cache *gpu_cache,
+                               int top_k, mu_token_logit *out,
+                               mu_text_decode_timing *timing_stats);
+
 
 int mu_text_layer0_qkv_token0(mu_engine *e, const int *input_ids, int n_ids,
                               float *out, int out_n) {
@@ -3382,7 +3556,8 @@ static int mu_text_layer_mlp_seq_from_hidden(mu_engine *e, int layer,
                                              const int *position_ids,
                                              int n_ids, int cache_cap,
                                              float *k_cache, float *v_cache,
-                                             float *out) {
+                                             float *out,
+                                             mu_text_prefill_timing *timing_stats) {
     if (!e || !input_hidden || n_ids <= 0 || !out ||
         layer < 0 || layer >= e->cfg.text_layers) {
         return -1;
@@ -3443,6 +3618,8 @@ static int mu_text_layer_mlp_seq_from_hidden(mu_engine *e, int layer,
             goto cpu_text_layer_seq;
         }
 
+        mu_text_prefill_timing local_timing = {0};
+        double stage_start = timing_stats ? mu_time_now_seconds() : 0.0;
         int rc = mu_gpu_rmsnorm_bf16_rows(e->gpu, input_hidden,
                                           (const unsigned short *)input_norm,
                                           n_ids, hidden, eps, normed);
@@ -3486,6 +3663,10 @@ static int mu_text_layer_mlp_seq_from_hidden(mu_engine *e, int layer,
                 }
             }
         }
+        if (rc == 0 && timing_stats) {
+            local_timing.qkv += mu_time_now_seconds() - stage_start;
+        }
+        stage_start = timing_stats ? mu_time_now_seconds() : 0.0;
         if (rc == 0) {
             if (position_ids) {
                 rc = mu_gpu_text_attn_seq_pos(e->gpu, q, k, v,
@@ -3506,6 +3687,10 @@ static int mu_text_layer_mlp_seq_from_hidden(mu_engine *e, int layer,
         }
         if (rc == 0) {
             mu_record_text_layer_seq_stage(e, layer, "attn_residual");
+            if (timing_stats) {
+                local_timing.attn += mu_time_now_seconds() - stage_start;
+                stage_start = mu_time_now_seconds();
+            }
             rc = mu_gpu_rmsnorm_bf16_rows(e->gpu, attn_residual,
                                           (const unsigned short *)post_norm,
                                           n_ids, hidden, eps, normed);
@@ -3537,6 +3722,11 @@ static int mu_text_layer_mlp_seq_from_hidden(mu_engine *e, int layer,
         free(attn_residual); free(gate); free(up); free(mid);
         if (rc == 0) {
             mu_record_text_layer_seq_stage(e, layer, "mlp_residual");
+            if (timing_stats) {
+                local_timing.mlp += mu_time_now_seconds() - stage_start;
+                local_timing.layers = 1;
+                mu_text_prefill_timing_add(timing_stats, &local_timing);
+            }
             return 0;
         }
         rc = mu_record_cpu_fallback(e, "text_layer_seq");
@@ -3566,10 +3756,16 @@ cpu_text_layer_seq:
     }
     memcpy(hidden_states, input_hidden, (size_t)n_ids * hidden * sizeof(hidden_states[0]));
     memcpy(residual, hidden_states, (size_t)n_ids * hidden * sizeof(residual[0]));
+    mu_text_prefill_timing local_timing = {0};
+    double stage_start = timing_stats ? mu_time_now_seconds() : 0.0;
     mu_rmsnorm_seq_bf16(hidden_states, input_norm, n_ids, hidden, eps, normed);
     int rc = mu_linear_seq_f32(normed, n_ids, hidden, qw, qb, hidden, q, w_tmp);
     if (rc == 0) rc = mu_linear_seq_f32(normed, n_ids, hidden, kw, kb, 128, k, w_tmp);
     if (rc == 0) rc = mu_linear_seq_f32(normed, n_ids, hidden, vw, vb, 128, v, w_tmp);
+    if (rc == 0 && timing_stats) {
+        local_timing.qkv += mu_time_now_seconds() - stage_start;
+    }
+    stage_start = timing_stats ? mu_time_now_seconds() : 0.0;
     if (rc == 0) {
         mu_apply_text_rope(q, k, n_ids, position_ids);
         if (k_cache) {
@@ -3585,6 +3781,10 @@ cpu_text_layer_seq:
     if (rc == 0) rc = mu_linear_seq_f32(attn, n_ids, hidden, ow, NULL, hidden, proj, w_tmp);
     if (rc == 0) {
         for (int i = 0; i < n_ids * hidden; i++) hidden_states[i] = residual[i] + proj[i];
+        if (timing_stats) {
+            local_timing.attn += mu_time_now_seconds() - stage_start;
+        }
+        stage_start = timing_stats ? mu_time_now_seconds() : 0.0;
         memcpy(residual, hidden_states, (size_t)n_ids * hidden * sizeof(residual[0]));
         mu_rmsnorm_seq_bf16(hidden_states, post_norm, n_ids, hidden, eps, normed);
         rc = mu_linear_seq_f32(normed, n_ids, hidden, gate_w, NULL, inter, gate, w_tmp);
@@ -3596,6 +3796,11 @@ cpu_text_layer_seq:
     }
     if (rc == 0) {
         for (int i = 0; i < n_ids * hidden; i++) out[i] = residual[i] + proj[i];
+        if (timing_stats) {
+            local_timing.mlp += mu_time_now_seconds() - stage_start;
+            local_timing.layers = 1;
+            mu_text_prefill_timing_add(timing_stats, &local_timing);
+        }
     }
     free(hidden_states); free(residual); free(normed); free(q); free(k); free(v);
     free(attn); free(proj); free(gate); free(up); free(mid); free(w_tmp);
@@ -3613,7 +3818,7 @@ int mu_text_layer01_mlp_seq(mu_engine *e, const int *input_ids, int n_ids,
     int rc = mu_text_layer0_mlp_seq(e, input_ids, n_ids, layer0, n_ids, 896);
     if (rc == 0) {
         rc = mu_text_layer_mlp_seq_from_hidden(e, 1, layer0, NULL, n_ids,
-                                               0, NULL, NULL, out);
+                                               0, NULL, NULL, out, NULL);
     }
     free(layer0);
     return rc == 0 ? 0 : -3;
@@ -3656,7 +3861,7 @@ int mu_text_layers_mlp_seq(mu_engine *e, const int *input_ids, int n_ids,
     int rc = 0;
     for (int layer = 0; layer < n_layers; layer++) {
         rc = mu_text_layer_mlp_seq_from_hidden(e, layer, src, NULL, n_ids,
-                                               0, NULL, NULL, dst);
+                                               0, NULL, NULL, dst, NULL);
         if (rc != 0) break;
         float *tmp = src;
         src = dst;
@@ -3695,7 +3900,7 @@ static int mu_text_layers_mlp_seq_from_hidden(mu_engine *e,
     int rc = 0;
     for (int layer = 0; layer < n_layers; layer++) {
         rc = mu_text_layer_mlp_seq_from_hidden(e, layer, src, position_ids, n_ids,
-                                               0, NULL, NULL, dst);
+                                               0, NULL, NULL, dst, NULL);
         if (rc != 0) break;
         float *tmp = src;
         src = dst;
@@ -3907,31 +4112,25 @@ static int mu_text_top_logits_from_last_hidden(mu_engine *e, const float *hidden
 
 #if defined(__APPLE__)
     if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
-        float *last = (float *)malloc((size_t)hidden * sizeof(last[0]));
-        float *logits = (float *)malloc((size_t)vocab * sizeof(logits[0]));
-        int rc = 0;
-        if (!last || !logits) rc = -3;
-        if (rc == 0) {
-            rc = mu_gpu_rmsnorm_bf16_rows(e->gpu, hidden_state,
-                                          (const unsigned short *)final_norm,
-                                          1, hidden, eps, last);
-        }
+        int best_id = -1;
+        float best_val = -FLT_MAX;
+        int rc = mu_gpu_text_logits_argmax(e->gpu, hidden_state,
+                                           (const unsigned short *)final_norm,
+                                           (const unsigned short *)embed,
+                                           eps, hidden, vocab,
+                                           &best_id, &best_val);
         if (rc == 0) {
             mu_record_metal_stage(e, "text_final_norm");
-            rc = mu_gpu_dense_f32_rows(e->gpu, last,
-                                       (const unsigned short *)embed,
-                                       1, hidden, vocab, logits);
-        }
-        if (rc == 0) {
             mu_record_metal_stage(e, "text_logits");
-            for (int id = 0; id < vocab; id++) {
-                float logit = mu_bf16_to_f32(mu_f32_to_bf16(logits[id]));
-                mu_topk_insert(out, top_k, id, logit);
+            mu_record_metal_stage(e, "text_argmax");
+            out[0].id = best_id;
+            out[0].logit = best_val;
+            for (int i = 1; i < top_k; i++) {
+                out[i].id = -1;
+                out[i].logit = -FLT_MAX;
             }
+            return top_k;
         }
-        free(last);
-        free(logits);
-        if (rc == 0) return top_k;
         rc = mu_record_cpu_fallback(e, "text_logits");
         if (rc) return rc;
     }
@@ -4231,16 +4430,21 @@ int mu_text_generate_greedy(mu_engine *e, const int *input_ids, int n_ids,
         const int layers = 24;
         const int kv_out = 128;
         const int vocab = 151936;
+        int timing = mu_timing_enabled();
         int cap = n_ids + max_new_tokens;
         int *ids = (int *)malloc((size_t)cap * sizeof(ids[0]));
         float *hidden_states = (float *)malloc((size_t)n_ids * hidden * sizeof(hidden_states[0]));
         float *k_cache = (float *)calloc((size_t)layers * (size_t)cap * kv_out, sizeof(k_cache[0]));
         float *v_cache = (float *)calloc((size_t)layers * (size_t)cap * kv_out, sizeof(v_cache[0]));
+        mu_gpu_kv_cache *gpu_cache = NULL;
+        mu_gpu_kv_cache_create(e->gpu, layers, cap, &gpu_cache);
+
         if (!ids || !hidden_states || !k_cache || !v_cache) {
             free(ids);
             free(hidden_states);
             free(k_cache);
             free(v_cache);
+            if (gpu_cache) mu_gpu_kv_cache_destroy(gpu_cache);
             return -2;
         }
         const uint16_t *embed = mu_tensor_bf16(e, "model.embed_tokens.weight", 2, vocab, hidden);
@@ -4249,6 +4453,7 @@ int mu_text_generate_greedy(mu_engine *e, const int *input_ids, int n_ids,
             free(hidden_states);
             free(k_cache);
             free(v_cache);
+            if (gpu_cache) mu_gpu_kv_cache_destroy(gpu_cache);
             return -3;
         }
         memcpy(ids, input_ids, (size_t)n_ids * sizeof(ids[0]));
@@ -4259,6 +4464,7 @@ int mu_text_generate_greedy(mu_engine *e, const int *input_ids, int n_ids,
                 free(hidden_states);
                 free(k_cache);
                 free(v_cache);
+                if (gpu_cache) mu_gpu_kv_cache_destroy(gpu_cache);
                 return -4;
             }
             const uint16_t *row = embed + (size_t)id * hidden;
@@ -4267,17 +4473,39 @@ int mu_text_generate_greedy(mu_engine *e, const int *input_ids, int n_ids,
             }
         }
         mu_token_logit top[8];
+        double stage_start = mu_time_now_seconds();
+        mu_text_prefill_timing prefill_timing = {0};
         int rc = mu_text_prefill_cache_from_embeddings(e, hidden_states, n_ids, NULL,
-                                                       cap, k_cache, v_cache, 8, top);
+                                                       cap, k_cache, v_cache, 8, top,
+                                                       timing ? &prefill_timing : NULL);
+        mu_timing_log_stage(timing, "text_generate_prefill", stage_start);
+        if (timing && prefill_timing.layers > 0) {
+            mu_timing_log_seconds(timing, "text_generate_prefill_qkv",
+                                  prefill_timing.qkv);
+            mu_timing_log_seconds(timing, "text_generate_prefill_attn",
+                                  prefill_timing.attn);
+            mu_timing_log_seconds(timing, "text_generate_prefill_mlp",
+                                  prefill_timing.mlp);
+            mu_timing_log_seconds(timing, "text_generate_prefill_logits",
+                                  prefill_timing.logits);
+        }
         if (rc < 1) {
             free(ids);
             free(hidden_states);
             free(k_cache);
             free(v_cache);
+            if (gpu_cache) mu_gpu_kv_cache_destroy(gpu_cache);
             return -5;
+        }
+        if (gpu_cache) {
+            stage_start = mu_time_now_seconds();
+            mu_gpu_kv_cache_upload_all(gpu_cache, k_cache, v_cache);
+            mu_timing_log_stage(timing, "text_generate_cache_upload", stage_start);
         }
         int cur = n_ids;
         int nout = 0;
+        mu_text_decode_timing decode_timing = {0};
+        double decode_start = mu_time_now_seconds();
         for (int step = 0; step < max_new_tokens; step++) {
             float best = top[0].logit;
             int next = top[0].id;
@@ -4292,13 +4520,28 @@ int mu_text_generate_greedy(mu_engine *e, const int *input_ids, int n_ids,
             if (step + 1 >= max_new_tokens) break;
             int pos3[3] = {cur - 1, cur - 1, cur - 1};
             rc = mu_text_cached_step(e, next, pos3, cur - 1, cap,
-                                     k_cache, v_cache, 8, top);
+                                     k_cache, v_cache, gpu_cache, 8, top,
+                                     timing ? &decode_timing : NULL);
             if (rc < 1) break;
+        }
+        mu_timing_log_stage(timing, "text_generate_decode", decode_start);
+        if (timing && decode_timing.steps > 0) {
+            mu_timing_log_seconds(timing, "text_generate_decode_cached_step",
+                                  decode_timing.cached_step);
+            mu_timing_log_seconds(timing, "text_generate_decode_cached_qkv",
+                                  decode_timing.cached_qkv);
+            mu_timing_log_seconds(timing, "text_generate_decode_cached_attn_mlp",
+                                  decode_timing.cached_attn_mlp);
+            mu_timing_log_seconds(timing, "text_generate_decode_cached_logits",
+                                  decode_timing.cached_logits);
         }
         free(ids);
         free(hidden_states);
         free(k_cache);
         free(v_cache);
+        if (gpu_cache) {
+            mu_gpu_kv_cache_destroy(gpu_cache);
+        }
         if (rc < 1) return -6;
         mu_record_metal_stage(e, "text_generate");
         return nout;
@@ -4437,7 +4680,8 @@ static int mu_text_prefill_cache_from_embeddings(mu_engine *e, float *hidden_sta
                                                  int n_ids, const int *position_ids,
                                                  int cache_cap, float *k_cache,
                                                  float *v_cache,
-                                                 int top_k, mu_token_logit *out) {
+                                                 int top_k, mu_token_logit *out,
+                                                 mu_text_prefill_timing *timing_stats) {
     if (!e || !hidden_states || n_ids <= 0 ||
         cache_cap < n_ids || !k_cache || !v_cache || !out) {
         return -1;
@@ -4465,15 +4709,20 @@ static int mu_text_prefill_cache_from_embeddings(mu_engine *e, float *hidden_sta
             for (int layer = 0; layer < e->cfg.text_layers; layer++) {
                 rc = mu_text_layer_mlp_seq_from_hidden(e, layer, src, position_ids,
                                                        n_ids, cache_cap,
-                                                       k_cache, v_cache, dst);
+                                                       k_cache, v_cache, dst,
+                                                       timing_stats);
                 if (rc != 0) break;
                 float *tmp = src;
                 src = dst;
                 dst = tmp;
             }
             if (rc == 0) {
+                double logits_start = timing_stats ? mu_time_now_seconds() : 0.0;
                 int top_rc = mu_text_top_logits_from_last_hidden(
                     e, src + (size_t)(n_ids - 1) * hidden, top_k, out);
+                if (timing_stats) {
+                    timing_stats->logits += mu_time_now_seconds() - logits_start;
+                }
                 if (top_rc == top_k) {
                     free(a);
                     free(b);
@@ -4511,6 +4760,8 @@ static int mu_text_prefill_cache_from_embeddings(mu_engine *e, float *hidden_sta
 
     char name[256];
     for (int layer = 0; layer < 24; layer++) {
+        mu_text_prefill_timing local_timing = {0};
+        double stage_start = timing_stats ? mu_time_now_seconds() : 0.0;
         snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer);
         const uint16_t *input_norm = mu_tensor_bf16(e, name, 1, hidden, 0);
         snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", layer);
@@ -4536,6 +4787,10 @@ static int mu_text_prefill_cache_from_embeddings(mu_engine *e, float *hidden_sta
         if (mu_linear_seq_f32(normed, n_ids, hidden, qw, qb, q_out, q, w_tmp) != 0) goto fail;
         if (mu_linear_seq_f32(normed, n_ids, hidden, kw, kb, kv_out, k, w_tmp) != 0) goto fail;
         if (mu_linear_seq_f32(normed, n_ids, hidden, vw, vb, kv_out, v, w_tmp) != 0) goto fail;
+        if (timing_stats) {
+            local_timing.qkv += mu_time_now_seconds() - stage_start;
+        }
+        stage_start = timing_stats ? mu_time_now_seconds() : 0.0;
         mu_apply_text_rope(q, k, n_ids, position_ids);
         for (int s = 0; s < n_ids; s++) {
             memcpy(k_cache + mu_text_cache_offset(layer, s, cache_cap),
@@ -4550,6 +4805,10 @@ static int mu_text_prefill_cache_from_embeddings(mu_engine *e, float *hidden_sta
         if (!ow) goto fail;
         if (mu_linear_seq_f32(attn, n_ids, hidden, ow, NULL, hidden, proj, w_tmp) != 0) goto fail;
         for (int i = 0; i < n_ids * hidden; i++) hidden_states[i] = residual[i] + proj[i];
+        if (timing_stats) {
+            local_timing.attn += mu_time_now_seconds() - stage_start;
+        }
+        stage_start = timing_stats ? mu_time_now_seconds() : 0.0;
 
         memcpy(residual, hidden_states, (size_t)n_ids * hidden * sizeof(float));
         mu_rmsnorm_seq_bf16(hidden_states, post_norm, n_ids, hidden, eps, normed);
@@ -4566,10 +4825,19 @@ static int mu_text_prefill_cache_from_embeddings(mu_engine *e, float *hidden_sta
         for (int i = 0; i < n_ids * inter; i++) mid[i] = mu_silu_f32(gate[i]) * up[i];
         if (mu_linear_seq_f32(mid, n_ids, inter, down_w, NULL, hidden, proj, w_tmp) != 0) goto fail;
         for (int i = 0; i < n_ids * hidden; i++) hidden_states[i] = residual[i] + proj[i];
+        if (timing_stats) {
+            local_timing.mlp += mu_time_now_seconds() - stage_start;
+            local_timing.layers = 1;
+            mu_text_prefill_timing_add(timing_stats, &local_timing);
+        }
     }
 
+    double logits_start = timing_stats ? mu_time_now_seconds() : 0.0;
     int rc = mu_text_top_logits_from_last_hidden(e, hidden_states + (size_t)(n_ids - 1) * hidden,
                                                  top_k, out);
+    if (timing_stats) {
+        timing_stats->logits += mu_time_now_seconds() - logits_start;
+    }
     free(residual); free(normed); free(q); free(k); free(v);
     free(attn); free(proj); free(gate); free(up); free(mid); free(w_tmp);
     return rc;
@@ -4621,7 +4889,9 @@ static int mu_text_attention_one_cached(const float *q, const float *k_cache,
 static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                                int cache_pos, int cache_cap,
                                float *k_cache, float *v_cache,
-                               int top_k, mu_token_logit *out) {
+                               mu_gpu_kv_cache *gpu_cache,
+                               int top_k, mu_token_logit *out,
+                               mu_text_decode_timing *timing_stats) {
     const int hidden = 896;
     const int inter = 4864;
     const int q_out = 896;
@@ -4630,6 +4900,8 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
     const int vocab = 151936;
     const uint16_t *embed = mu_tensor_bf16(e, "model.embed_tokens.weight", 2, vocab, hidden);
     if (!embed || token_id < 0 || token_id >= vocab) return -1;
+    mu_text_decode_timing local_timing = {0};
+    double step_start = timing_stats ? mu_time_now_seconds() : 0.0;
 
     float hidden_state[896];
     float residual[896];
@@ -4654,102 +4926,511 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
     if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
         char name[256];
         int rc = 0;
+        int use_gpu_rope = getenv("MU_TEXT_CACHED_ROPE_GPU") != NULL && gpu_cache;
+        int hidden_resident = getenv("MU_TEXT_CACHED_HIDDEN_RESIDENT") != NULL && gpu_cache;
+        int request_layer_resident = getenv("MU_TEXT_CACHED_LAYER_RESIDENT") != NULL;
+        int disable_layer_resident = getenv("MU_TEXT_CACHED_LAYER_RESIDENT_DISABLE") != NULL;
+        int layer_resident = gpu_cache && (request_layer_resident || !disable_layer_resident);
+        if (hidden_resident) {
+            unsigned long hidden_bytes = hidden * sizeof(float);
+            mu_gpu_buf hidden_ping[2] = {
+                mu_gpu_scratch_b_at(e->gpu, 0, hidden_bytes),
+                mu_gpu_scratch_b_at(e->gpu, hidden_bytes, hidden_bytes),
+            };
+            mu_gpu_buf q_resident = mu_gpu_scratch_b_at(e->gpu, hidden_bytes * 2u,
+                                                        q_out * sizeof(float));
+            if (!hidden_ping[0].ptr || !hidden_ping[1].ptr || !q_resident.ptr) goto fail;
+            mu_gpu_buf_copy_to(hidden_ping[0], hidden_state, hidden_bytes);
+            mu_gpu_buf cur_hs_buf = hidden_ping[0];
+            mu_gpu_buf next_hs_buf = hidden_ping[1];
+
+            for (int layer = 0; layer < 24; layer++) {
+                snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer);
+                const uint16_t *input_norm = mu_tensor_bf16(e, name, 1, hidden, 0);
+                snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", layer);
+                const uint16_t *post_norm = mu_tensor_bf16(e, name, 1, hidden, 0);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer);
+                const uint16_t *qw = mu_tensor_bf16(e, name, 2, q_out, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.bias", layer);
+                const uint16_t *qb = mu_tensor_bf16(e, name, 1, q_out, 0);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer);
+                const uint16_t *kw = mu_tensor_bf16(e, name, 2, kv_out, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.bias", layer);
+                const uint16_t *kb = mu_tensor_bf16(e, name, 1, kv_out, 0);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer);
+                const uint16_t *vw = mu_tensor_bf16(e, name, 2, kv_out, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.bias", layer);
+                const uint16_t *vb = mu_tensor_bf16(e, name, 1, kv_out, 0);
+                if (!input_norm || !post_norm || !qw || !qb || !kw || !kb || !vw || !vb) goto fail;
+
+                double qkv_start = timing_stats ? mu_time_now_seconds() : 0.0;
+                mu_gpu_cmd_ctx *ctx = NULL;
+                rc = mu_gpu_cmd_begin(e->gpu, &ctx);
+                if (rc != 0) goto fail;
+                mu_gpu_buf normed_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+                mu_gpu_buf k_buf = mu_gpu_scratch_alloc_a_ctx(ctx, kv_out * sizeof(float));
+                mu_gpu_buf v_buf = mu_gpu_scratch_alloc_a_ctx(ctx, kv_out * sizeof(float));
+                mu_gpu_buf input_norm_buf = mu_gpu_get_weight_buf(e->gpu, input_norm, hidden * sizeof(unsigned short));
+                mu_gpu_buf qw_buf = mu_gpu_get_weight_buf(e->gpu, qw, q_out * hidden * sizeof(unsigned short));
+                mu_gpu_buf qb_buf = mu_gpu_get_weight_buf(e->gpu, qb, q_out * sizeof(unsigned short));
+                mu_gpu_buf kw_buf = mu_gpu_get_weight_buf(e->gpu, kw, kv_out * hidden * sizeof(unsigned short));
+                mu_gpu_buf kb_buf = mu_gpu_get_weight_buf(e->gpu, kb, kv_out * sizeof(unsigned short));
+                mu_gpu_buf vw_buf = mu_gpu_get_weight_buf(e->gpu, vw, kv_out * hidden * sizeof(unsigned short));
+                mu_gpu_buf vb_buf = mu_gpu_get_weight_buf(e->gpu, vb, kv_out * sizeof(unsigned short));
+                if (!normed_buf.ptr || !k_buf.ptr || !v_buf.ptr || !input_norm_buf.ptr ||
+                    !qw_buf.ptr || !qb_buf.ptr || !kw_buf.ptr || !kb_buf.ptr ||
+                    !vw_buf.ptr || !vb_buf.ptr) {
+                    mu_gpu_cmd_discard(ctx);
+                    goto fail;
+                }
+                rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, cur_hs_buf, input_norm_buf, normed_buf, hidden, eps);
+                if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, qw_buf, qb_buf, q_resident, q_out, hidden);
+                if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, kw_buf, kb_buf, k_buf, kv_out, hidden);
+                if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, vw_buf, vb_buf, v_buf, kv_out, hidden);
+                if (rc == 0) rc = mu_gpu_text_rope_cache_update_ctx(ctx, q_resident, k_buf, v_buf,
+                                                                    gpu_cache, layer,
+                                                                    cache_pos, pos3);
+                if (rc == 0) {
+                    rc = mu_gpu_cmd_commit_and_wait(ctx);
+                } else {
+                    mu_gpu_cmd_discard(ctx);
+                }
+                if (rc != 0) goto fail;
+                if (timing_stats) {
+                    local_timing.cached_qkv += mu_time_now_seconds() - qkv_start;
+                }
+
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer);
+                const uint16_t *ow = mu_tensor_bf16(e, name, 2, hidden, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", layer);
+                const uint16_t *gate_w = mu_tensor_bf16(e, name, 2, inter, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", layer);
+                const uint16_t *up_w = mu_tensor_bf16(e, name, 2, inter, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", layer);
+                const uint16_t *down_w = mu_tensor_bf16(e, name, 2, hidden, inter);
+                if (!ow || !gate_w || !up_w || !down_w) goto fail;
+
+                double attn_mlp_start = timing_stats ? mu_time_now_seconds() : 0.0;
+                rc = mu_gpu_cmd_begin(e->gpu, &ctx);
+                if (rc != 0) goto fail;
+                mu_gpu_buf attn_buf = mu_gpu_scratch_alloc_a_ctx(ctx, q_out * sizeof(float));
+                mu_gpu_buf proj_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+                mu_gpu_buf hs_buf2 = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+                mu_gpu_buf normed_buf2 = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+                mu_gpu_buf gate_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
+                mu_gpu_buf up_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
+                mu_gpu_buf mid_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
+                mu_gpu_buf ow_buf = mu_gpu_get_weight_buf(e->gpu, ow, hidden * hidden * sizeof(unsigned short));
+                mu_gpu_buf post_norm_buf = mu_gpu_get_weight_buf(e->gpu, post_norm, hidden * sizeof(unsigned short));
+                mu_gpu_buf gate_w_buf = mu_gpu_get_weight_buf(e->gpu, gate_w, inter * hidden * sizeof(unsigned short));
+                mu_gpu_buf up_w_buf = mu_gpu_get_weight_buf(e->gpu, up_w, inter * hidden * sizeof(unsigned short));
+                mu_gpu_buf down_w_buf = mu_gpu_get_weight_buf(e->gpu, down_w, hidden * inter * sizeof(unsigned short));
+                if (!attn_buf.ptr || !proj_buf.ptr || !hs_buf2.ptr || !normed_buf2.ptr ||
+                    !gate_buf.ptr || !up_buf.ptr || !mid_buf.ptr || !ow_buf.ptr ||
+                    !post_norm_buf.ptr || !gate_w_buf.ptr || !up_w_buf.ptr || !down_w_buf.ptr) {
+                    mu_gpu_cmd_discard(ctx);
+                    goto fail;
+                }
+                rc = mu_gpu_text_attn_cached_resident_ctx(ctx, q_resident, gpu_cache, layer,
+                                                          cache_pos + 1, attn_buf);
+                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, attn_buf, ow_buf, proj_buf, hidden, hidden);
+                if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, cur_hs_buf, proj_buf, hs_buf2, hidden);
+                if (rc == 0) rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, hs_buf2, post_norm_buf, normed_buf2, hidden, eps);
+                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, gate_w_buf, gate_buf, inter, hidden);
+                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, up_w_buf, up_buf, inter, hidden);
+                if (rc == 0) rc = mu_gpu_silu_mul_f32_ctx(ctx, gate_buf, up_buf, mid_buf, inter);
+                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, mid_buf, down_w_buf, proj_buf, hidden, inter);
+                if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, hs_buf2, proj_buf, next_hs_buf, hidden);
+                if (rc == 0) {
+                    rc = mu_gpu_cmd_commit_and_wait(ctx);
+                } else {
+                    mu_gpu_cmd_discard(ctx);
+                }
+                if (rc != 0) goto fail;
+                if (timing_stats) {
+                    local_timing.cached_attn_mlp += mu_time_now_seconds() - attn_mlp_start;
+                }
+                mu_gpu_buf tmp = cur_hs_buf;
+                cur_hs_buf = next_hs_buf;
+                next_hs_buf = tmp;
+            }
+            mu_gpu_buf_copy_from(hidden_state, cur_hs_buf, hidden_bytes);
+            mu_record_metal_stage(e, "text_cached_hidden_resident");
+            double logits_start = timing_stats ? mu_time_now_seconds() : 0.0;
+            int top_rc = mu_text_top_logits_from_last_hidden(e, hidden_state, top_k, out);
+            if (timing_stats) {
+                local_timing.cached_logits += mu_time_now_seconds() - logits_start;
+                local_timing.cached_step += mu_time_now_seconds() - step_start;
+                local_timing.steps = 1;
+                mu_text_decode_timing_add(timing_stats, &local_timing);
+            }
+            free(gate); free(up); free(mid); free(w_tmp);
+            return top_rc;
+        }
+        if (layer_resident) {
+            mu_gpu_cmd_ctx *ctx = NULL;
+            rc = mu_gpu_cmd_begin(e->gpu, &ctx);
+            if (rc != 0) goto fail;
+
+            mu_gpu_buf cur_hs_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+            if (!cur_hs_buf.ptr) {
+                mu_gpu_cmd_discard(ctx);
+                goto fail;
+            }
+            mu_gpu_buf_copy_to(cur_hs_buf, hidden_state, hidden * sizeof(float));
+
+            for (int layer = 0; layer < 24; layer++) {
+                snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer);
+                const uint16_t *input_norm = mu_tensor_bf16(e, name, 1, hidden, 0);
+                snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", layer);
+                const uint16_t *post_norm = mu_tensor_bf16(e, name, 1, hidden, 0);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer);
+                const uint16_t *qw = mu_tensor_bf16(e, name, 2, q_out, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.bias", layer);
+                const uint16_t *qb = mu_tensor_bf16(e, name, 1, q_out, 0);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer);
+                const uint16_t *kw = mu_tensor_bf16(e, name, 2, kv_out, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.bias", layer);
+                const uint16_t *kb = mu_tensor_bf16(e, name, 1, kv_out, 0);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer);
+                const uint16_t *vw = mu_tensor_bf16(e, name, 2, kv_out, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.bias", layer);
+                const uint16_t *vb = mu_tensor_bf16(e, name, 1, kv_out, 0);
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer);
+                const uint16_t *ow = mu_tensor_bf16(e, name, 2, hidden, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", layer);
+                const uint16_t *gate_w = mu_tensor_bf16(e, name, 2, inter, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", layer);
+                const uint16_t *up_w = mu_tensor_bf16(e, name, 2, inter, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", layer);
+                const uint16_t *down_w = mu_tensor_bf16(e, name, 2, hidden, inter);
+                if (!input_norm || !post_norm || !qw || !qb || !kw || !kb || !vw || !vb ||
+                    !ow || !gate_w || !up_w || !down_w) {
+                    mu_gpu_cmd_discard(ctx);
+                    goto fail;
+                }
+
+                mu_gpu_buf normed_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+                mu_gpu_buf q_buf = mu_gpu_scratch_alloc_a_ctx(ctx, q_out * sizeof(float));
+                mu_gpu_buf k_buf = mu_gpu_scratch_alloc_a_ctx(ctx, kv_out * sizeof(float));
+                mu_gpu_buf v_buf = mu_gpu_scratch_alloc_a_ctx(ctx, kv_out * sizeof(float));
+                mu_gpu_buf attn_buf = mu_gpu_scratch_alloc_a_ctx(ctx, q_out * sizeof(float));
+                mu_gpu_buf proj_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+                mu_gpu_buf hs_buf2 = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+                mu_gpu_buf normed_buf2 = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+                mu_gpu_buf gate_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
+                mu_gpu_buf up_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
+                mu_gpu_buf mid_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
+                mu_gpu_buf out_hs_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+
+                mu_gpu_buf input_norm_buf = mu_gpu_get_weight_buf(e->gpu, input_norm, hidden * sizeof(unsigned short));
+                mu_gpu_buf qw_buf = mu_gpu_get_weight_buf(e->gpu, qw, q_out * hidden * sizeof(unsigned short));
+                mu_gpu_buf qb_buf = mu_gpu_get_weight_buf(e->gpu, qb, q_out * sizeof(unsigned short));
+                mu_gpu_buf kw_buf = mu_gpu_get_weight_buf(e->gpu, kw, kv_out * hidden * sizeof(unsigned short));
+                mu_gpu_buf kb_buf = mu_gpu_get_weight_buf(e->gpu, kb, kv_out * sizeof(unsigned short));
+                mu_gpu_buf vw_buf = mu_gpu_get_weight_buf(e->gpu, vw, kv_out * hidden * sizeof(unsigned short));
+                mu_gpu_buf vb_buf = mu_gpu_get_weight_buf(e->gpu, vb, kv_out * sizeof(unsigned short));
+                mu_gpu_buf ow_buf = mu_gpu_get_weight_buf(e->gpu, ow, hidden * hidden * sizeof(unsigned short));
+                mu_gpu_buf post_norm_buf = mu_gpu_get_weight_buf(e->gpu, post_norm, hidden * sizeof(unsigned short));
+                mu_gpu_buf gate_w_buf = mu_gpu_get_weight_buf(e->gpu, gate_w, inter * hidden * sizeof(unsigned short));
+                mu_gpu_buf up_w_buf = mu_gpu_get_weight_buf(e->gpu, up_w, inter * hidden * sizeof(unsigned short));
+                mu_gpu_buf down_w_buf = mu_gpu_get_weight_buf(e->gpu, down_w, hidden * inter * sizeof(unsigned short));
+
+                if (!normed_buf.ptr || !q_buf.ptr || !k_buf.ptr || !v_buf.ptr ||
+                    !attn_buf.ptr || !proj_buf.ptr || !hs_buf2.ptr || !normed_buf2.ptr ||
+                    !gate_buf.ptr || !up_buf.ptr || !mid_buf.ptr || !out_hs_buf.ptr ||
+                    !input_norm_buf.ptr || !qw_buf.ptr || !qb_buf.ptr || !kw_buf.ptr ||
+                    !kb_buf.ptr || !vw_buf.ptr || !vb_buf.ptr || !ow_buf.ptr ||
+                    !post_norm_buf.ptr || !gate_w_buf.ptr || !up_w_buf.ptr || !down_w_buf.ptr) {
+                    mu_gpu_cmd_discard(ctx);
+                    goto fail;
+                }
+
+                double qkv_start = timing_stats ? mu_time_now_seconds() : 0.0;
+                rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, cur_hs_buf, input_norm_buf, normed_buf, hidden, eps);
+                if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, qw_buf, qb_buf, q_buf, q_out, hidden);
+                if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, kw_buf, kb_buf, k_buf, kv_out, hidden);
+                if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, vw_buf, vb_buf, v_buf, kv_out, hidden);
+                if (rc == 0) rc = mu_gpu_text_rope_cache_update_ctx(ctx, q_buf, k_buf, v_buf,
+                                                                    gpu_cache, layer,
+                                                                    cache_pos, pos3);
+                if (timing_stats) {
+                    local_timing.cached_qkv += mu_time_now_seconds() - qkv_start;
+                }
+
+                double attn_mlp_start = timing_stats ? mu_time_now_seconds() : 0.0;
+                if (rc == 0) rc = mu_gpu_text_attn_cached_resident_ctx(ctx, q_buf, gpu_cache, layer,
+                                                                       cache_pos + 1, attn_buf);
+                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, attn_buf, ow_buf, proj_buf, hidden, hidden);
+                if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, cur_hs_buf, proj_buf, hs_buf2, hidden);
+                if (rc == 0) rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, hs_buf2, post_norm_buf, normed_buf2, hidden, eps);
+                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, gate_w_buf, gate_buf, inter, hidden);
+                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, up_w_buf, up_buf, inter, hidden);
+                if (rc == 0) rc = mu_gpu_silu_mul_f32_ctx(ctx, gate_buf, up_buf, mid_buf, inter);
+                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, mid_buf, down_w_buf, proj_buf, hidden, inter);
+                if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, hs_buf2, proj_buf, out_hs_buf, hidden);
+                if (rc != 0) {
+                    mu_gpu_cmd_discard(ctx);
+                    goto fail;
+                }
+                if (timing_stats) {
+                    local_timing.cached_attn_mlp += mu_time_now_seconds() - attn_mlp_start;
+                }
+                cur_hs_buf = out_hs_buf;
+            }
+
+            rc = mu_gpu_cmd_commit_and_wait(ctx);
+            if (rc != 0) goto fail;
+            mu_gpu_buf_copy_from(hidden_state, cur_hs_buf, hidden * sizeof(float));
+            mu_record_metal_stage(e, "text_cached_layer_resident");
+            double logits_start = timing_stats ? mu_time_now_seconds() : 0.0;
+            int top_rc = mu_text_top_logits_from_last_hidden(e, hidden_state, top_k, out);
+            if (timing_stats) {
+                local_timing.cached_logits += mu_time_now_seconds() - logits_start;
+                local_timing.cached_step += mu_time_now_seconds() - step_start;
+                local_timing.steps = 1;
+                mu_text_decode_timing_add(timing_stats, &local_timing);
+            }
+            free(gate); free(up); free(mid); free(w_tmp);
+            return top_rc;
+        }
         for (int layer = 0; layer < 24; layer++) {
             snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer);
             const uint16_t *input_norm = mu_tensor_bf16(e, name, 1, hidden, 0);
             snprintf(name, sizeof(name), "model.layers.%d.post_attention_layernorm.weight", layer);
             const uint16_t *post_norm = mu_tensor_bf16(e, name, 1, hidden, 0);
-            if (!input_norm || !post_norm) goto fail;
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer);
+            const uint16_t *qw = mu_tensor_bf16(e, name, 2, q_out, hidden);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.bias", layer);
+            const uint16_t *qb = mu_tensor_bf16(e, name, 1, q_out, 0);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer);
+            const uint16_t *kw = mu_tensor_bf16(e, name, 2, kv_out, hidden);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.bias", layer);
+            const uint16_t *kb = mu_tensor_bf16(e, name, 1, kv_out, 0);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer);
+            const uint16_t *vw = mu_tensor_bf16(e, name, 2, kv_out, hidden);
+            snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.bias", layer);
+            const uint16_t *vb = mu_tensor_bf16(e, name, 1, kv_out, 0);
+            if (!input_norm || !post_norm || !qw || !qb || !kw || !kb || !vw || !vb) goto fail;
 
-            memcpy(residual, hidden_state, sizeof(residual));
-            rc = mu_gpu_rmsnorm_bf16_probe(e->gpu, hidden_state,
-                                           (const unsigned short *)input_norm,
-                                           hidden, eps, normed);
-            if (rc == 0) {
-                snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer);
-                const uint16_t *qw = mu_tensor_bf16(e, name, 2, q_out, hidden);
-                snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.bias", layer);
-                const uint16_t *qb = mu_tensor_bf16(e, name, 1, q_out, 0);
-                if (!qw || !qb) goto fail;
-                rc = mu_gpu_dense_f32_bias_probe(e->gpu, normed,
-                                                 (const unsigned short *)qw,
-                                                 (const unsigned short *)qb,
-                                                 q_out, hidden, q);
+            // Context 1: input layernorm, qkv projections
+            double qkv_start = timing_stats ? mu_time_now_seconds() : 0.0;
+            mu_gpu_cmd_ctx *ctx = NULL;
+            rc = mu_gpu_cmd_begin(e->gpu, &ctx);
+            if (rc != 0) goto fail;
+
+            mu_gpu_buf hs_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+            mu_gpu_buf normed_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+            mu_gpu_buf q_buf = mu_gpu_scratch_alloc_a_ctx(ctx, q_out * sizeof(float));
+            mu_gpu_buf k_buf = mu_gpu_scratch_alloc_a_ctx(ctx, kv_out * sizeof(float));
+            mu_gpu_buf v_buf = mu_gpu_scratch_alloc_a_ctx(ctx, kv_out * sizeof(float));
+
+            mu_gpu_buf input_norm_buf = mu_gpu_get_weight_buf(e->gpu, input_norm, hidden * sizeof(unsigned short));
+            mu_gpu_buf qw_buf = mu_gpu_get_weight_buf(e->gpu, qw, q_out * hidden * sizeof(unsigned short));
+            mu_gpu_buf qb_buf = mu_gpu_get_weight_buf(e->gpu, qb, q_out * sizeof(unsigned short));
+            mu_gpu_buf kw_buf = mu_gpu_get_weight_buf(e->gpu, kw, kv_out * hidden * sizeof(unsigned short));
+            mu_gpu_buf kb_buf = mu_gpu_get_weight_buf(e->gpu, kb, kv_out * sizeof(unsigned short));
+            mu_gpu_buf vw_buf = mu_gpu_get_weight_buf(e->gpu, vw, kv_out * hidden * sizeof(unsigned short));
+            mu_gpu_buf vb_buf = mu_gpu_get_weight_buf(e->gpu, vb, kv_out * sizeof(unsigned short));
+
+            if (!hs_buf.ptr || !normed_buf.ptr || !q_buf.ptr || !k_buf.ptr || !v_buf.ptr ||
+                !input_norm_buf.ptr || !qw_buf.ptr || !qb_buf.ptr || !kw_buf.ptr || !kb_buf.ptr || !vw_buf.ptr || !vb_buf.ptr) {
+                mu_gpu_cmd_discard(ctx);
+                goto fail;
             }
-            if (rc == 0) {
-                snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.weight", layer);
-                const uint16_t *kw = mu_tensor_bf16(e, name, 2, kv_out, hidden);
-                snprintf(name, sizeof(name), "model.layers.%d.self_attn.k_proj.bias", layer);
-                const uint16_t *kb = mu_tensor_bf16(e, name, 1, kv_out, 0);
-                if (!kw || !kb) goto fail;
-                rc = mu_gpu_dense_f32_bias_probe(e->gpu, normed,
-                                                 (const unsigned short *)kw,
-                                                 (const unsigned short *)kb,
-                                                 kv_out, hidden, k);
+
+            mu_gpu_buf_copy_to(hs_buf, hidden_state, hidden * sizeof(float));
+
+            rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, hs_buf, input_norm_buf, normed_buf, hidden, eps);
+            if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, qw_buf, qb_buf, q_buf, q_out, hidden);
+            if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, kw_buf, kb_buf, k_buf, kv_out, hidden);
+            if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, vw_buf, vb_buf, v_buf, kv_out, hidden);
+
+            if (use_gpu_rope) {
+                if (rc == 0) {
+                    rc = mu_gpu_text_rope_cache_update_ctx(ctx, q_buf, k_buf, v_buf,
+                                                           gpu_cache, layer,
+                                                           cache_pos, pos3);
+                }
+                if (rc != 0) {
+                    mu_gpu_cmd_discard(ctx);
+                    goto fail;
+                }
+                if (timing_stats) {
+                    local_timing.cached_qkv += mu_time_now_seconds() - qkv_start;
+                }
+
+                snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer);
+                const uint16_t *ow = mu_tensor_bf16(e, name, 2, hidden, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", layer);
+                const uint16_t *gate_w = mu_tensor_bf16(e, name, 2, inter, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", layer);
+                const uint16_t *up_w = mu_tensor_bf16(e, name, 2, inter, hidden);
+                snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", layer);
+                const uint16_t *down_w = mu_tensor_bf16(e, name, 2, hidden, inter);
+                if (!ow || !gate_w || !up_w || !down_w) {
+                    mu_gpu_cmd_discard(ctx);
+                    goto fail;
+                }
+
+                double attn_mlp_start = timing_stats ? mu_time_now_seconds() : 0.0;
+                mu_gpu_buf attn_buf = mu_gpu_scratch_alloc_a_ctx(ctx, q_out * sizeof(float));
+                mu_gpu_buf proj_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+                mu_gpu_buf hs_buf2 = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+                mu_gpu_buf normed_buf2 = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+                mu_gpu_buf gate_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
+                mu_gpu_buf up_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
+                mu_gpu_buf mid_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
+                mu_gpu_buf out_hs_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+
+                mu_gpu_buf ow_buf = mu_gpu_get_weight_buf(e->gpu, ow, hidden * hidden * sizeof(unsigned short));
+                mu_gpu_buf post_norm_buf = mu_gpu_get_weight_buf(e->gpu, post_norm, hidden * sizeof(unsigned short));
+                mu_gpu_buf gate_w_buf = mu_gpu_get_weight_buf(e->gpu, gate_w, inter * hidden * sizeof(unsigned short));
+                mu_gpu_buf up_w_buf = mu_gpu_get_weight_buf(e->gpu, up_w, inter * hidden * sizeof(unsigned short));
+                mu_gpu_buf down_w_buf = mu_gpu_get_weight_buf(e->gpu, down_w, hidden * inter * sizeof(unsigned short));
+
+                if (!attn_buf.ptr || !proj_buf.ptr || !hs_buf2.ptr || !normed_buf2.ptr ||
+                    !gate_buf.ptr || !up_buf.ptr || !mid_buf.ptr || !out_hs_buf.ptr ||
+                    !ow_buf.ptr || !post_norm_buf.ptr || !gate_w_buf.ptr ||
+                    !up_w_buf.ptr || !down_w_buf.ptr) {
+                    mu_gpu_cmd_discard(ctx);
+                    goto fail;
+                }
+
+                rc = mu_gpu_text_attn_cached_resident_ctx(ctx, q_buf, gpu_cache, layer,
+                                                          cache_pos + 1, attn_buf);
+                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, attn_buf, ow_buf, proj_buf, hidden, hidden);
+                if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, hs_buf, proj_buf, hs_buf2, hidden);
+                if (rc == 0) rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, hs_buf2, post_norm_buf, normed_buf2, hidden, eps);
+                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, gate_w_buf, gate_buf, inter, hidden);
+                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, up_w_buf, up_buf, inter, hidden);
+                if (rc == 0) rc = mu_gpu_silu_mul_f32_ctx(ctx, gate_buf, up_buf, mid_buf, inter);
+                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, mid_buf, down_w_buf, proj_buf, hidden, inter);
+                if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, hs_buf2, proj_buf, out_hs_buf, hidden);
+
+                if (rc == 0) {
+                    rc = mu_gpu_cmd_commit_and_wait(ctx);
+                    if (rc == 0) {
+                        mu_gpu_buf_copy_from(hidden_state, out_hs_buf, hidden * sizeof(float));
+                    }
+                } else {
+                    mu_gpu_cmd_discard(ctx);
+                }
+                if (rc != 0) goto fail;
+                if (timing_stats) {
+                    local_timing.cached_attn_mlp += mu_time_now_seconds() - attn_mlp_start;
+                }
+                continue;
             }
+
             if (rc == 0) {
-                snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.weight", layer);
-                const uint16_t *vw = mu_tensor_bf16(e, name, 2, kv_out, hidden);
-                snprintf(name, sizeof(name), "model.layers.%d.self_attn.v_proj.bias", layer);
-                const uint16_t *vb = mu_tensor_bf16(e, name, 1, kv_out, 0);
-                if (!vw || !vb) goto fail;
-                rc = mu_gpu_dense_f32_bias_probe(e->gpu, normed,
-                                                 (const unsigned short *)vw,
-                                                 (const unsigned short *)vb,
-                                                 kv_out, hidden, v);
+                rc = mu_gpu_cmd_commit_and_wait(ctx);
+                if (rc == 0) {
+                    mu_gpu_buf_copy_from(q, q_buf, q_out * sizeof(float));
+                    mu_gpu_buf_copy_from(k, k_buf, kv_out * sizeof(float));
+                    mu_gpu_buf_copy_from(v, v_buf, kv_out * sizeof(float));
+                }
+            } else {
+                mu_gpu_cmd_discard(ctx);
             }
             if (rc != 0) goto fail;
+
+            memcpy(residual, hidden_state, sizeof(residual));
             mu_apply_text_rope_one(q, k, pos3);
             memcpy(k_cache + mu_text_cache_offset(layer, cache_pos, cache_cap), k,
                    (size_t)kv_out * sizeof(float));
             memcpy(v_cache + mu_text_cache_offset(layer, cache_pos, cache_cap), v,
                    (size_t)kv_out * sizeof(float));
-            rc = mu_gpu_text_attn_cached(
-                e->gpu, q,
-                k_cache + mu_text_cache_offset(layer, 0, cache_cap),
-                v_cache + mu_text_cache_offset(layer, 0, cache_cap),
-                cache_pos + 1, attn);
-            if (rc != 0) goto fail;
-            mu_record_metal_stage(e, "text_cached_attn");
+            if (gpu_cache) {
+                mu_gpu_kv_cache_update_layer(gpu_cache, layer, cache_pos, k, v);
+            }
+            if (timing_stats) {
+                local_timing.cached_qkv += mu_time_now_seconds() - qkv_start;
+            }
 
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer);
             const uint16_t *ow = mu_tensor_bf16(e, name, 2, hidden, hidden);
-            if (!ow) goto fail;
-            rc = mu_gpu_dense_probe(e->gpu, attn, (const unsigned short *)ow,
-                                    hidden, hidden, proj);
-            if (rc == 0) rc = mu_gpu_add_f32(e->gpu, residual, proj, hidden, hidden_state);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", layer);
+            const uint16_t *gate_w = mu_tensor_bf16(e, name, 2, inter, hidden);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", layer);
+            const uint16_t *up_w = mu_tensor_bf16(e, name, 2, inter, hidden);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", layer);
+            const uint16_t *down_w = mu_tensor_bf16(e, name, 2, hidden, inter);
+            if (!ow || !gate_w || !up_w || !down_w) goto fail;
+
+            // Context 2: Attention, o_proj, add_residual, post rmsnorm, MLP, add_residual
+            double attn_mlp_start = timing_stats ? mu_time_now_seconds() : 0.0;
+            rc = mu_gpu_cmd_begin(e->gpu, &ctx);
             if (rc != 0) goto fail;
 
-            memcpy(residual, hidden_state, sizeof(residual));
-            rc = mu_gpu_rmsnorm_bf16_probe(e->gpu, hidden_state,
-                                           (const unsigned short *)post_norm,
-                                           hidden, eps, normed);
-            if (rc == 0) {
-                snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", layer);
-                const uint16_t *gate_w = mu_tensor_bf16(e, name, 2, inter, hidden);
-                if (!gate_w) goto fail;
-                rc = mu_gpu_dense_probe(e->gpu, normed, (const unsigned short *)gate_w,
-                                        inter, hidden, gate);
+            mu_gpu_buf q_buf2 = mu_gpu_scratch_alloc_a_ctx(ctx, q_out * sizeof(float));
+            mu_gpu_buf attn_buf = mu_gpu_scratch_alloc_a_ctx(ctx, q_out * sizeof(float));
+            mu_gpu_buf proj_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+            mu_gpu_buf res_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+            mu_gpu_buf hs_buf2 = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+            mu_gpu_buf normed_buf2 = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+            mu_gpu_buf gate_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
+            mu_gpu_buf up_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
+            mu_gpu_buf mid_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
+            mu_gpu_buf out_hs_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
+
+            mu_gpu_buf ow_buf = mu_gpu_get_weight_buf(e->gpu, ow, hidden * hidden * sizeof(unsigned short));
+            mu_gpu_buf post_norm_buf = mu_gpu_get_weight_buf(e->gpu, post_norm, hidden * sizeof(unsigned short));
+            mu_gpu_buf gate_w_buf = mu_gpu_get_weight_buf(e->gpu, gate_w, inter * hidden * sizeof(unsigned short));
+            mu_gpu_buf up_w_buf = mu_gpu_get_weight_buf(e->gpu, up_w, inter * hidden * sizeof(unsigned short));
+            mu_gpu_buf down_w_buf = mu_gpu_get_weight_buf(e->gpu, down_w, hidden * inter * sizeof(unsigned short));
+
+            if (!q_buf2.ptr || !attn_buf.ptr || !proj_buf.ptr || !res_buf.ptr || !hs_buf2.ptr ||
+                !normed_buf2.ptr || !gate_buf.ptr || !up_buf.ptr || !mid_buf.ptr || !out_hs_buf.ptr ||
+                !ow_buf.ptr || !post_norm_buf.ptr || !gate_w_buf.ptr || !up_w_buf.ptr || !down_w_buf.ptr) {
+                mu_gpu_cmd_discard(ctx);
+                goto fail;
             }
-            if (rc == 0) {
-                snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", layer);
-                const uint16_t *up_w = mu_tensor_bf16(e, name, 2, inter, hidden);
-                if (!up_w) goto fail;
-                rc = mu_gpu_dense_probe(e->gpu, normed, (const unsigned short *)up_w,
-                                        inter, hidden, up);
+
+            mu_gpu_buf_copy_to(q_buf2, q, q_out * sizeof(float));
+            mu_gpu_buf_copy_to(res_buf, residual, hidden * sizeof(float));
+
+            if (gpu_cache) {
+                rc = mu_gpu_text_attn_cached_resident_ctx(ctx, q_buf2,
+                                                          gpu_cache, layer,
+                                                          cache_pos + 1, attn_buf);
+            } else {
+                rc = mu_gpu_text_attn_cached_ctx(ctx, q_buf2,
+                                                 k_cache + mu_text_cache_offset(layer, 0, cache_cap),
+                                                 v_cache + mu_text_cache_offset(layer, 0, cache_cap),
+                                                 cache_pos + 1, attn_buf);
             }
-            if (rc == 0) rc = mu_gpu_silu_mul_f32(e->gpu, gate, up, inter, mid);
+            if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, attn_buf, ow_buf, proj_buf, hidden, hidden);
+            if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, res_buf, proj_buf, hs_buf2, hidden);
+            if (rc == 0) rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, hs_buf2, post_norm_buf, normed_buf2, hidden, eps);
+            if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, gate_w_buf, gate_buf, inter, hidden);
+            if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, up_w_buf, up_buf, inter, hidden);
+            if (rc == 0) rc = mu_gpu_silu_mul_f32_ctx(ctx, gate_buf, up_buf, mid_buf, inter);
+            if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, mid_buf, down_w_buf, proj_buf, hidden, inter);
+            if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, hs_buf2, proj_buf, out_hs_buf, hidden);
+
             if (rc == 0) {
-                snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", layer);
-                const uint16_t *down_w = mu_tensor_bf16(e, name, 2, hidden, inter);
-                if (!down_w) goto fail;
-                rc = mu_gpu_dense_probe(e->gpu, mid, (const unsigned short *)down_w,
-                                        hidden, inter, proj);
+                rc = mu_gpu_cmd_commit_and_wait(ctx);
+                if (rc == 0) {
+                    mu_gpu_buf_copy_from(hidden_state, out_hs_buf, hidden * sizeof(float));
+                }
+            } else {
+                mu_gpu_cmd_discard(ctx);
             }
-            if (rc == 0) rc = mu_gpu_add_f32(e->gpu, residual, proj, hidden, hidden_state);
             if (rc != 0) goto fail;
+            if (timing_stats) {
+                local_timing.cached_attn_mlp += mu_time_now_seconds() - attn_mlp_start;
+            }
         }
+        mu_record_metal_stage(e, "text_cached_attn");
+        double logits_start = timing_stats ? mu_time_now_seconds() : 0.0;
         int top_rc = mu_text_top_logits_from_last_hidden(e, hidden_state, top_k, out);
+        if (timing_stats) {
+            local_timing.cached_logits += mu_time_now_seconds() - logits_start;
+            local_timing.cached_step += mu_time_now_seconds() - step_start;
+            local_timing.steps = 1;
+            mu_text_decode_timing_add(timing_stats, &local_timing);
+        }
         free(gate); free(up); free(mid); free(w_tmp);
         return top_rc;
     }
@@ -4813,6 +5494,11 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
     }
 
     int rc = mu_text_top_logits_from_last_hidden(e, hidden_state, top_k, out);
+    if (timing_stats) {
+        local_timing.cached_step += mu_time_now_seconds() - step_start;
+        local_timing.steps = 1;
+        mu_text_decode_timing_add(timing_stats, &local_timing);
+    }
     free(gate); free(up); free(mid); free(w_tmp);
     return rc;
 
@@ -4835,18 +5521,29 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
     const int layers = 24;
     const int kv_out = 128;
     const int vocab = 151936;
+    int timing = mu_timing_enabled();
     int cap = n_ids + max_new_tokens;
     int *ids = (int *)malloc((size_t)cap * sizeof(ids[0]));
     int *pos = (int *)malloc((size_t)cap * 3u * sizeof(pos[0]));
     float *hidden_states = (float *)malloc((size_t)n_ids * hidden * sizeof(hidden_states[0]));
     float *k_cache = (float *)calloc((size_t)layers * (size_t)cap * kv_out, sizeof(k_cache[0]));
     float *v_cache = (float *)calloc((size_t)layers * (size_t)cap * kv_out, sizeof(v_cache[0]));
+    mu_gpu_kv_cache *gpu_cache = NULL;
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        mu_gpu_kv_cache_create(e->gpu, layers, cap, &gpu_cache);
+    }
+#endif
+
     if (!ids || !pos || !hidden_states || !k_cache || !v_cache) {
         free(ids);
         free(pos);
         free(hidden_states);
         free(k_cache);
         free(v_cache);
+        if (gpu_cache) {
+            mu_gpu_kv_cache_destroy(gpu_cache);
+        }
         return -2;
     }
     memcpy(ids, input_ids, (size_t)n_ids * sizeof(ids[0]));
@@ -4854,6 +5551,9 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
     const uint16_t *embed = mu_tensor_bf16(e, "model.embed_tokens.weight", 2, vocab, hidden);
     if (!embed) {
         free(ids); free(pos); free(hidden_states); free(k_cache); free(v_cache);
+        if (gpu_cache) {
+            mu_gpu_kv_cache_destroy(gpu_cache);
+        }
         return -3;
     }
     int image_i = 0;
@@ -4863,6 +5563,9 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
         if (id == 151655) {
             if (image_i >= n_image_embeds) {
                 free(ids); free(pos); free(hidden_states); free(k_cache); free(v_cache);
+                if (gpu_cache) {
+                    mu_gpu_kv_cache_destroy(gpu_cache);
+                }
                 return -4;
             }
             memcpy(dst, image_embeds + (size_t)image_i * hidden, (size_t)hidden * sizeof(float));
@@ -4870,6 +5573,9 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
         } else {
             if (id < 0 || id >= vocab) {
                 free(ids); free(pos); free(hidden_states); free(k_cache); free(v_cache);
+                if (gpu_cache) {
+                    mu_gpu_kv_cache_destroy(gpu_cache);
+                }
                 return -5;
             }
             const uint16_t *row = embed + (size_t)id * hidden;
@@ -4878,24 +5584,54 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
     }
     if (image_i != n_image_embeds) {
         free(ids); free(pos); free(hidden_states); free(k_cache); free(v_cache);
+        if (gpu_cache) {
+            mu_gpu_kv_cache_destroy(gpu_cache);
+        }
         return -6;
     }
     int pos_n = mu_build_position_ids(e, ids, n_ids, grid_t, grid_h, grid_w, pos, n_ids * 3);
     if (pos_n != n_ids * 3) {
         free(ids); free(pos); free(hidden_states); free(k_cache); free(v_cache);
+        if (gpu_cache) {
+            mu_gpu_kv_cache_destroy(gpu_cache);
+        }
         return -7;
     }
 
     mu_token_logit top[8];
+    double stage_start = mu_time_now_seconds();
+    mu_text_prefill_timing prefill_timing = {0};
     int rc = mu_text_prefill_cache_from_embeddings(e, hidden_states, n_ids, pos,
-                                                   cap, k_cache, v_cache, 8, top);
+                                                   cap, k_cache, v_cache, 8, top,
+                                                   timing ? &prefill_timing : NULL);
+    mu_timing_log_stage(timing, "text_generate_prefill", stage_start);
+    if (timing && prefill_timing.layers > 0) {
+        mu_timing_log_seconds(timing, "text_generate_prefill_qkv",
+                              prefill_timing.qkv);
+        mu_timing_log_seconds(timing, "text_generate_prefill_attn",
+                              prefill_timing.attn);
+        mu_timing_log_seconds(timing, "text_generate_prefill_mlp",
+                              prefill_timing.mlp);
+        mu_timing_log_seconds(timing, "text_generate_prefill_logits",
+                              prefill_timing.logits);
+    }
     if (rc < 1) {
         free(ids); free(pos); free(hidden_states); free(k_cache); free(v_cache);
+        if (gpu_cache) {
+            mu_gpu_kv_cache_destroy(gpu_cache);
+        }
         return -8;
+    }
+    if (gpu_cache) {
+        stage_start = mu_time_now_seconds();
+        mu_gpu_kv_cache_upload_all(gpu_cache, k_cache, v_cache);
+        mu_timing_log_stage(timing, "text_generate_cache_upload", stage_start);
     }
 
     int cur = n_ids;
     int nout = 0;
+    mu_text_decode_timing decode_timing = {0};
+    double decode_start = mu_time_now_seconds();
     for (int step = 0; step < max_new_tokens; step++) {
         float best = top[0].logit;
         int next = top[0].id;
@@ -4910,6 +5646,9 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
         int next_pos_n = mu_build_position_ids(e, ids, cur, grid_t, grid_h, grid_w, pos, cur * 3);
         if (next_pos_n != cur * 3) {
             free(ids); free(pos); free(hidden_states); free(k_cache); free(v_cache);
+            if (gpu_cache) {
+                mu_gpu_kv_cache_destroy(gpu_cache);
+            }
             return -9;
         }
         int pos3[3] = {
@@ -4917,17 +5656,47 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
             pos[1 * cur + (cur - 1)],
             pos[2 * cur + (cur - 1)],
         };
-        rc = mu_text_cached_step(e, next, pos3, cur - 1, cap, k_cache, v_cache, 8, top);
+        rc = mu_text_cached_step(e, next, pos3, cur - 1, cap, k_cache, v_cache,
+                                 gpu_cache, 8, top,
+                                 timing ? &decode_timing : NULL);
         if (rc < 1) {
+            mu_timing_log_stage(timing, "text_generate_decode", decode_start);
+            if (timing && decode_timing.steps > 0) {
+                mu_timing_log_seconds(timing, "text_generate_decode_cached_step",
+                                      decode_timing.cached_step);
+                mu_timing_log_seconds(timing, "text_generate_decode_cached_qkv",
+                                      decode_timing.cached_qkv);
+                mu_timing_log_seconds(timing, "text_generate_decode_cached_attn_mlp",
+                                      decode_timing.cached_attn_mlp);
+                mu_timing_log_seconds(timing, "text_generate_decode_cached_logits",
+                                      decode_timing.cached_logits);
+            }
             free(ids); free(pos); free(hidden_states); free(k_cache); free(v_cache);
+            if (gpu_cache) {
+                mu_gpu_kv_cache_destroy(gpu_cache);
+            }
             return -10;
         }
+    }
+    mu_timing_log_stage(timing, "text_generate_decode", decode_start);
+    if (timing && decode_timing.steps > 0) {
+        mu_timing_log_seconds(timing, "text_generate_decode_cached_step",
+                              decode_timing.cached_step);
+        mu_timing_log_seconds(timing, "text_generate_decode_cached_qkv",
+                              decode_timing.cached_qkv);
+        mu_timing_log_seconds(timing, "text_generate_decode_cached_attn_mlp",
+                              decode_timing.cached_attn_mlp);
+        mu_timing_log_seconds(timing, "text_generate_decode_cached_logits",
+                              decode_timing.cached_logits);
     }
     free(ids);
     free(pos);
     free(hidden_states);
     free(k_cache);
     free(v_cache);
+    if (gpu_cache) {
+        mu_gpu_kv_cache_destroy(gpu_cache);
+    }
     return nout;
 }
 

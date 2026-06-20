@@ -84,4 +84,73 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
                          int rotary_rows, int rotary_cols,
                          float *out, int out_rows, int out_cols);
 
+typedef struct mu_gpu_cmd_ctx mu_gpu_cmd_ctx;
+
+int mu_gpu_cmd_begin(mu_gpu *gpu, mu_gpu_cmd_ctx **ctx);
+int mu_gpu_cmd_commit_and_wait(mu_gpu_cmd_ctx *ctx);
+void mu_gpu_cmd_discard(mu_gpu_cmd_ctx *ctx);
+
+typedef struct {
+    void *ptr;
+    unsigned long offset;
+} mu_gpu_buf;
+
+mu_gpu_buf mu_gpu_get_weight_buf(mu_gpu *gpu, const void *cpu_ptr, unsigned long length);
+mu_gpu_buf mu_gpu_scratch_b_at(mu_gpu *gpu, unsigned long offset, unsigned long size);
+mu_gpu_buf mu_gpu_scratch_alloc_a_ctx(mu_gpu_cmd_ctx *ctx, unsigned long size);
+mu_gpu_buf mu_gpu_scratch_alloc_b_ctx(mu_gpu_cmd_ctx *ctx, unsigned long size);
+void mu_gpu_buf_copy_to(mu_gpu_buf dst, const void *src, unsigned long size);
+void mu_gpu_buf_copy_from(void *dst, mu_gpu_buf src, unsigned long size);
+
+// C-compatible _ctx operator signatures
+int mu_gpu_rmsnorm_bf16_probe_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf weight,
+                                  mu_gpu_buf out, int n, float eps);
+int mu_gpu_dense_f32_bias_probe_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
+                                    mu_gpu_buf bias, mu_gpu_buf out, int rows, int cols);
+int mu_gpu_dense_probe_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
+                           mu_gpu_buf out, int rows, int cols);
+int mu_gpu_add_f32_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf a, mu_gpu_buf b,
+                       mu_gpu_buf out, int n);
+int mu_gpu_silu_mul_f32_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf gate, mu_gpu_buf up,
+                            mu_gpu_buf out, int n);
+int mu_gpu_text_attn_cached_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
+                                const float *k_cache, const float *v_cache,
+                                int cache_len, mu_gpu_buf out);
+int mu_gpu_layernorm_bf16_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf weight,
+                                   mu_gpu_buf bias, int rows, int cols, float eps, mu_gpu_buf out);
+int mu_gpu_dense_bf16_bias_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
+                                    mu_gpu_buf bias, int x_rows, int cols, int out_cols, mu_gpu_buf out);
+int mu_gpu_vision_attn_concat_probe_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q0, mu_gpu_buf kv,
+                                        const float *rotary, int rows, int token_index, mu_gpu_buf out);
+int mu_gpu_vision_attn_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q, mu_gpu_buf kv,
+                                const float *rotary, int rows, mu_gpu_buf out);
+int mu_gpu_vision_add_bf16_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf a, mu_gpu_buf b,
+                               int n, mu_gpu_buf out);
+int mu_gpu_vision_quick_gelu_bf16_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x,
+                                      int n, mu_gpu_buf out);
+int mu_gpu_vision_gelu_bf16_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x,
+                                 int n, mu_gpu_buf out);
+int mu_gpu_vision_merge4_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf hidden,
+                             int rows, mu_gpu_buf out);
+
+typedef struct mu_gpu_kv_cache mu_gpu_kv_cache;
+
+int mu_gpu_kv_cache_create(mu_gpu *gpu, int layers, int cap, mu_gpu_kv_cache **out);
+void mu_gpu_kv_cache_destroy(mu_gpu_kv_cache *cache);
+int mu_gpu_kv_cache_update_layer(mu_gpu_kv_cache *cache, int layer, int pos, const float *k_val, const float *v_val);
+int mu_gpu_kv_cache_upload_all(mu_gpu_kv_cache *cache, const float *k_cpu, const float *v_cpu);
+int mu_gpu_text_attn_cached_resident_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
+                                         mu_gpu_kv_cache *cache, int layer,
+                                         int cache_len, mu_gpu_buf out);
+int mu_gpu_text_rope_cache_update_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
+                                      mu_gpu_buf k, mu_gpu_buf v,
+                                      mu_gpu_kv_cache *cache, int layer,
+                                      int cache_pos, const int pos3[3]);
+
+int mu_gpu_text_logits_argmax(mu_gpu *gpu, const float *hidden_state_cpu,
+                              const unsigned short *final_norm_bf16,
+                              const unsigned short *embed_bf16,
+                              float eps, int hidden_dim, int vocab_dim,
+                              int *out_id, float *out_val);
+
 #endif

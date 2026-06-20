@@ -20,7 +20,7 @@ ifeq ($(UNAME_S),Darwin)
 METALC ?= $(shell xcrun -sdk macosx -find metal 2>/dev/null)
 METALLIBC ?= $(shell xcrun -sdk macosx -find metallib 2>/dev/null)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-MU_LDLIBS := $(LDLIBS) -framework CoreFoundation -framework CoreGraphics -framework ImageIO -framework Accelerate
+MU_LDLIBS := $(LDLIBS) -framework CoreFoundation -framework CoreGraphics -framework ImageIO -framework Accelerate -framework MetalPerformanceShaders
 CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
 MU_OBJS = mineru/mu.o mineru/mu_metal.o
@@ -231,6 +231,11 @@ mu: mineru/mu_cli.o $(MU_OBJS)
 mu-test: mineru/tests/mu_test.o $(MU_OBJS)
 	$(CC) $(CFLAGS) -Imineru -o $@ mineru/tests/mu_test.o $(MU_OBJS) $(MU_LDLIBS) -framework Foundation -framework Metal
 	./mu-test
+
+mu-dense-shape-bench: mineru/tests/mu_dense_shape_bench
+
+mineru/tests/mu_dense_shape_bench: mineru/tests/mu_dense_shape_bench.m mineru/mu_metal.o
+	$(CC) $(OBJCFLAGS) -Imineru -o $@ $^ $(MU_LDLIBS) -framework Foundation -framework Metal
 else
 mu: mineru/mu_cli.o $(MU_OBJS)
 	$(CC) $(CFLAGS) -o $@ mineru/mu_cli.o $(MU_OBJS) $(MU_LDLIBS)
@@ -287,4 +292,4 @@ q4k-dot-test: tests/test_q4k_dot.c
 	./tests/test_q4k_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test mu mu-test tests/test_q4k_dot *.o mineru/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o mineru/tests/mu_test.o mineru/metal/mu.air mineru/metal/mu.metallib
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test mu mu-test tests/test_q4k_dot *.o mineru/*.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o mineru/tests/mu_test.o mineru/tests/mu_dense_shape_bench mineru/metal/mu.air mineru/metal/mu.metallib
