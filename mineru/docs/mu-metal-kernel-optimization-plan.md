@@ -1663,6 +1663,74 @@ Decision:
 - Use the explicit-flag 10-page layout-only gate as the current performance
   claim, and run a promoted-default full-content512 gate next.
 
+## Task 16: Promoted-Default 10-Page Full-Content512 Gate
+
+**Goal:** Run the 10-page full-content512 benchmark under the promoted-default path (fused PV attention + MPS dense + layer-resident text decode) to establish the final optimized end-to-end performance baseline.
+
+- [x] **Step 1: Execute the benchmark**
+
+```bash
+MU_TIMING=1 MU_USE_SIMD=1 /Users/will/github/mineru-model/.venv/bin/python \
+  mineru/tests/mu_benchmark_pages.py \
+  --backend metal --pages 224,234,237,241,244,247,258,281,303,334 \
+  --max-new-tokens 512 --timeout 7200 --timing \
+  --out /tmp/mu-benchmark-metal-10page-fullcontent512-current-default.json \
+  --save-output-dir /tmp/mu-10page-fullcontent512-current-default
+```
+
+- [x] **Step 2: Verify correctness**
+
+Verify that output matches the baseline default Metal run exactly (ordered type accuracy = 1.0, Token F1 = 1.0, Table cell recall = 1.0).
+
+```bash
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_compare_outputs.py \
+  --ref-json-template /tmp/mu-10page-fullcontent512-default/metal_page_{page:04d}.json \
+  --pages 224,234,237,241,244,247,258,281,303,334 \
+  --pred-json-template /tmp/mu-10page-fullcontent512-current-default/metal_page_{page:04d}.json \
+  --out /tmp/mu-10page-fullcontent512-current-default/previous-vs-current-default.metrics.json
+```
+
+- [x] **Step 3: Document findings**
+
+- **Mean page_total**: 58.32s (1.60x faster than CPU at 92.95s, 4.66x faster than unoptimized Metal at 271.94s).
+- **Comparison to PyTorch/MPS**: 1.51x slower (PyTorch/MPS is 38.58s).
+- **Bottleneck**: The remaining gap lies in command dispatch queue latency (CPU-GPU round-trip/sync overhead) and crop-level vision preprocessing.
+
+## Task 17: End-to-End GPU Residency (Zero-Sync Control Loop)
+
+**Goal:** Eliminate CPU-GPU synchronization overhead during the forward pass. Refactor the control loop to chain all 32 layers of the vision block tower and all 24 text decoder layers into a single Command Buffer execution. Keep activation outputs completely on the GPU in scratch buffers rather than copy-syncing them layer-by-layer.
+
+- [ ] **Step 1: Design GPU-resident activation memory layout**
+  Define scratch buffers that persist on the GPU across layers for Q, K, V, MLP activations, and residual states, removing intermediate `memcpy` back to host.
+- [ ] **Step 2: Remove blocking synchronizations**
+  Modify `mu.c` and `mu_metal.m` to enqueue dispatches without calling `mu_gpu_cmd_commit_and_wait` or `waitUntilCompleted` between individual layers.
+- [ ] **Step 3: Single-commit and wait**
+  Commit the Command Buffer once at the end of the full stage (e.g., at the end of the vision tower prefill or after the text logits argmax).
+- [ ] **Step 4: Verify correctness and latency reduction**
+  Ensure all trace checks pass and measure the reduction in dispatch queue overhead.
+
+## Task 18: SIMDgroup GEMM Custom Shader Spike
+
+**Goal:** Implement MSL `simdgroup_matrix` custom matrix multiplication kernels to leverage Apple Silicon's matrix coprocessors directly in custom shaders, bypassing `MPSMatrixMultiplication` overhead and allowing fusion of GEMM + activation/bias.
+
+- [ ] **Step 1: Research SIMDgroup MSL APIs**
+  Reference `mlx` and `ggml-metal.metal` matrix multiplication implementations for threadgroup cooperative loading.
+- [ ] **Step 2: Write custom BF16/F32 GEMM kernels**
+  Implement custom MSL kernels using `simdgroup_matrix` primitives for dominant shapes (e.g., 1280x1280, 1280x5120).
+- [ ] **Step 3: Benchmark custom GEMM vs MPS**
+  Measure latency of custom GEMM kernels compared to Apple's native `MPSMatrixMultiplication`.
+
+## Task 19: Fully Fused Attention Kernels (FlashAttention)
+
+**Goal:** Implement a fully tiled 2D FlashAttention MSL kernel (tiling Q, K, V loading inside threadgroup memory) to fully fuse QK + softmax + PV, avoiding all global memory round-trips for the attention scoring loop.
+
+- [ ] **Step 1: Write FlashAttention MSL kernel**
+  Reference `ggml-metal` (`kernel_flash_attn_ext`) and MLX SDPA implementations.
+- [ ] **Step 2: Integrate into Metal backend**
+  Replace the current prerotate QK + fused PV attention split with the fully tiled FlashAttention kernel.
+- [ ] **Step 3: Measure attention latency**
+  Verify correctness and benchmark against the fused PV attention baseline.
+
 ## Self-Review
 
 - Spec coverage: The plan covers the requested external references and maps each one to a concrete use or rejection.

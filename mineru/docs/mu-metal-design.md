@@ -376,6 +376,29 @@ Report all of these:
 Do not compare a fallback-enabled Metal run against Transformers as if it were
 a real Metal speed number.
 
+## Advanced Performance Optimization Strategy (Closing the MPS/Transformers Gap)
+
+To achieve parity or superior performance compared to PyTorch/MPS and Apple MLX, the Metal backend can adopt the design principles established by `ggml-metal` and `mlx`:
+
+### 1. End-to-End GPU Residency (Eliminating CPU-GPU Syncs)
+- **Problem**: PyTorch/MPS and MLX execute the entire forward pass completely on the GPU without host-device round-trips. In contrast, our current implementation schedules the network block-by-block from the CPU (`mu.c`), which commits the command buffer and waits (`waitUntilCompleted`) after each block or layer. This introduces substantial CPU-GPU synchronization latency (~50-100μs per sync), which accumulates significantly across 32 vision blocks and 24 text decoder layers (especially during step-by-step autoregressive generation).
+- **Strategy**: Refactor the control loop in `mu.c` and `mu_metal.m` to transition to a non-blocking model:
+  - Chain all block/layer dispatches (e.g., all 32 layers of the vision tower) inside a single `MTLCommandBuffer` or a minimized set of buffers.
+  - Keep intermediate activations entirely within GPU-resident scratch buffers rather than copying them back to CPU.
+  - Commit and wait only once at the end of the full stage (e.g., when retrieving final image embeddings or greedily sampling the next token logits).
+
+### 2. Zero-Copy Memory Integration (Unified Memory Optimization)
+- **Problem**: Moving input and output tensors between standard CPU memory allocations and GPU-managed buffers incurs overhead.
+- **Strategy**: Leverage Apple Silicon's unified memory architecture by wrapping page-aligned CPU memory directly into `MTLBuffer` objects using `newBufferWithBytesNoCopy:length:options:deallocator:` (similar to `ggml-metal`'s memory strategy). This allows CPU and GPU to share the same physical memory space, eliminating copies.
+
+### 3. SIMDgroup Matrix Co-Processor Acceleration
+- **Problem**: High-level frameworks like MPS often suffer from compile/warmup overhead or restrict custom kernel fusion. Custom elementwise implementations are memory-bound.
+- **Strategy**: Borrow optimization techniques from `mlx` and `ggml-metal` by using Metal Shading Language (MSL) `simdgroup_matrix` primitives. This allows threadgroups of 32 threads (a SIMDgroup) to collaboratively compute GEMM operations directly on Apple Silicon's matrix coprocessors, achieving near-peak hardware performance.
+
+### 4. Fully Fused Attention Kernels (FlashAttention)
+- **Problem**: While fused softmax + PV (`mu_vision_softmax_pv_head`) avoids materializing the intermediate probability matrix $P$, it does not tile $Q$ and $K$ loading.
+- **Strategy**: Design a fully tiled 2D FlashAttention MSL kernel (referencing `ggml-metal.metal`'s `kernel_flash_attn_ext` and MLX SDPA implementations) that tiles Query ($Q$), Key ($K$), and Value ($V$) loading inside threadgroup memory (SRAM), entirely avoiding VRAM round-trips for the attention scoring loop.
+
 ## Implementation Milestones
 
 ### Milestone 1: Backend Shell
