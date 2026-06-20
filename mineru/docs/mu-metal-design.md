@@ -399,6 +399,22 @@ To achieve parity or superior performance compared to PyTorch/MPS and Apple MLX,
 - **Problem**: While fused softmax + PV (`mu_vision_softmax_pv_head`) avoids materializing the intermediate probability matrix $P$, it does not tile $Q$ and $K$ loading.
 - **Strategy**: Design a fully tiled 2D FlashAttention MSL kernel (referencing `ggml-metal.metal`'s `kernel_flash_attn_ext` and MLX SDPA implementations) that tiles Query ($Q$), Key ($K$), and Value ($V$) loading inside threadgroup memory (SRAM), entirely avoiding VRAM round-trips for the attention scoring loop.
 
+### 5. Native FP16/Half-Precision Pipeline (vs. current BF16->FP32 Upcast)
+- **Problem**: Currently, the Metal backend caches BF16 weights as FP32 buffers and runs FP32 MPS GEMMs to bypass layout restrictions. This doubles memory bandwidth usage (the primary bottleneck on Apple Silicon) and halves execution throughput, since Apple Silicon GPU's native FP16/half-precision matrix math has twice the throughput of FP32.
+- **Strategy**: Migrate the entire GPU activation and weight execution path to FP16/half precision (`half` and `half4` types in MSL). Embellish this with native half-precision MPS calls (using `MPSDataTypeFloat16`) to halve the bandwidth footprint and unlock native double-speed FP16 GPU arithmetic.
+
+### 6. Transient Buffer Reuse via `MTLHeap` (Resource Aliasing)
+- **Problem**: Layer-by-layer execution allocates individual activation scratch buffers, leading to higher memory consumption and driver allocation overhead.
+- **Strategy**: Use `MTLHeap` to allocate a single unified transient memory pool for activations. Employ **resource aliasing** so that subsequent layers (e.g., Layer $N$) reuse the exact same physical memory address space as prior layers (e.g., Layer $N-1$) for their temporary buffers, minimizing memory footprint and improving L2 cache locality.
+
+### 7. Indirect Command Buffers (ICB) for Autoregressive Decoding
+- **Problem**: Autoregressive decoding submits the same sequence of kernels (RMSNorm, GEMM, Attention, etc.) at every token generation step. Encoding these command buffers on the CPU repeatedly adds host-side encoding overhead.
+- **Strategy**: Pre-record the entire sequence of decoder execution commands into an **Indirect Command Buffer (ICB)** during initialization. During each generation step, the CPU simply updates dynamic parameters (like KV-cache offsets) and commands the GPU to execute the ICB, reducing CPU encoding overhead to zero.
+
+### 8. Precompiled Metal Shader Libraries (`.metallib`)
+- **Problem**: Loading Metal kernels from source strings at runtime via JIT compilation (`newLibraryWithSource`) introduces startup delays and stutter.
+- **Strategy**: Compile `.metal` source files to binary `.metallib` files at build time using the Xcode Command Line tools (`xcrun -sdk macosx metal`). Load the pre-compiled `.metallib` directly at startup, eliminating JIT compilation overhead.
+
 ## Implementation Milestones
 
 ### Milestone 1: Backend Shell
