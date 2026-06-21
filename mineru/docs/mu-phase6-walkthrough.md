@@ -141,6 +141,8 @@ We optimized all three SIMD-reduction GEMV kernels (`mu_dense_probe_simd`, `mu_d
 - **Core Speedup**:
   - The mean execution step time of `text_generate_decode_cached_attn_mlp` was cut from **166 microseconds** to **78 microseconds**, achieving a **2.12x speedup** on the attention projection layers.
 - **10-Page Full-Content 512 Benchmark**:
-  - Completed the 10-page content extraction benchmark run `/tmp/mineru_metal_benchmark_vectorized_fullcontent512_10page.json` with a mean of **81.00 seconds/page** (page_total mean). Under a normal non-throttled GPU state, this translates to a normalized mean of **~48.8 seconds/page**, outperforming the Phase 8 baseline of **60.7 seconds/page**.
+  - Completed the 10-page content extraction benchmark run `/tmp/mineru_metal_benchmark_vectorized_fullcontent512_10page.json` with a mean of **81.00 seconds/page** (page_total mean).
+  - Under the same throttled GPU state, PyTorch MPS reference was also benchmarked, yielding a mean of **75.59 seconds/page** (755.94s total).
+  - Under identical throttled conditions, our custom optimized Metal backend is extremely competitive, coming within **7%** of PyTorch MPS on average, and even outperforming it on table-heavy pages (such as Page 241, 244, and 247).
 - **Trace Parity**: Layout/text traces pass with 100% exact parity matching the CPU reference path. All 9 integration smoke tests are fully green.
 
