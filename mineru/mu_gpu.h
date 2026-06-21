@@ -166,6 +166,11 @@ int mu_gpu_text_rope_cache_update_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
                                       mu_gpu_kv_cache *cache, int layer,
                                       int cache_pos, const int pos3[3]);
 
+int mu_gpu_text_logits_argmax_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf hidden_state,
+                                  mu_gpu_buf final_norm_bf16,
+                                  mu_gpu_buf embed_bf16,
+                                  float eps, int hidden_dim, int vocab_dim,
+                                  mu_gpu_buf out_id, mu_gpu_buf out_val);
 int mu_gpu_text_logits_argmax(mu_gpu *gpu, const float *hidden_state_cpu,
                               const unsigned short *final_norm_bf16,
                               const unsigned short *embed_bf16,

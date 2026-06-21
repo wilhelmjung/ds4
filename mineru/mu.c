@@ -5170,6 +5170,55 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                 cur_hs_buf = out_hs_buf;
             }
 
+            int resident_logits = getenv("MU_TEXT_DECODE_NO_RESIDENT_LOGITS") == NULL;
+            if (resident_logits) {
+                const uint16_t *final_norm = mu_tensor_bf16(e, "model.norm.weight", 1, hidden, 0);
+                mu_gpu_buf final_norm_buf = mu_gpu_get_weight_buf(e->gpu, final_norm, hidden * sizeof(unsigned short));
+                mu_gpu_buf embed_buf = mu_gpu_get_weight_buf(e->gpu, embed, vocab * hidden * sizeof(unsigned short));
+                mu_gpu_buf out_id_buf = mu_gpu_scratch_alloc_b_ctx(ctx, sizeof(int));
+                mu_gpu_buf out_val_buf = mu_gpu_scratch_alloc_b_ctx(ctx, sizeof(float));
+                if (final_norm && final_norm_buf.ptr && embed_buf.ptr &&
+                    out_id_buf.ptr && out_val_buf.ptr) {
+                    double logits_start = timing_stats ? mu_time_now_seconds() : 0.0;
+                    int resident_rc = mu_gpu_text_logits_argmax_ctx(ctx, cur_hs_buf,
+                                                                    final_norm_buf,
+                                                                    embed_buf, eps,
+                                                                    hidden, vocab,
+                                                                    out_id_buf,
+                                                                    out_val_buf);
+                    double logits_end = timing_stats ? mu_time_now_seconds() : 0.0;
+                    if (resident_rc == 0) {
+                        rc = mu_gpu_cmd_commit_and_wait(ctx);
+                        if (rc != 0) goto fail;
+
+                        int best_id = -1;
+                        float best_val = -FLT_MAX;
+                        mu_gpu_buf_copy_from(&best_id, out_id_buf, sizeof(best_id));
+                        mu_gpu_buf_copy_from(&best_val, out_val_buf, sizeof(best_val));
+                        out[0].id = best_id;
+                        out[0].logit = best_val;
+                        for (int i = 1; i < top_k; i++) {
+                            out[i].id = -1;
+                            out[i].logit = -FLT_MAX;
+                        }
+                        mu_record_metal_stage(e, "text_cached_layer_resident");
+                        mu_record_metal_stage(e, "text_cached_attn");
+                        mu_record_metal_stage(e, "text_decode_resident_logits");
+                        mu_record_metal_stage(e, "text_final_norm");
+                        mu_record_metal_stage(e, "text_logits");
+                        mu_record_metal_stage(e, "text_argmax");
+                        if (timing_stats) {
+                            local_timing.cached_logits += logits_end - logits_start;
+                            local_timing.cached_step += mu_time_now_seconds() - step_start;
+                            local_timing.steps = 1;
+                            mu_text_decode_timing_add(timing_stats, &local_timing);
+                        }
+                        free(gate); free(up); free(mid); free(w_tmp);
+                        return top_k;
+                    }
+                }
+            }
+
             rc = mu_gpu_cmd_commit_and_wait(ctx);
             if (rc != 0) goto fail;
             mu_gpu_buf_copy_from(hidden_state, cur_hs_buf, hidden * sizeof(float));

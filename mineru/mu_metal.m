@@ -3341,6 +3341,68 @@ int mu_gpu_text_attn_cached_resident_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
     return 0;
 }
 
+int mu_gpu_text_logits_argmax_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf hidden_state,
+                                  mu_gpu_buf final_norm_bf16,
+                                  mu_gpu_buf embed_bf16,
+                                  float eps, int hidden_dim, int vocab_dim,
+                                  mu_gpu_buf out_id, mu_gpu_buf out_val) {
+    if (!ctx || !ctx->gpu || !ctx->encoder || !hidden_state.ptr ||
+        !final_norm_bf16.ptr || !embed_bf16.ptr || !out_id.ptr ||
+        !out_val.ptr || hidden_dim <= 0 || vocab_dim <= 0 ||
+        !ctx->gpu->rmsnorm_bf16_rows || !ctx->gpu->dense_f32_rows ||
+        !ctx->gpu->argmax_f32) {
+        return -1;
+    }
+
+    mu_gpu_buf last = mu_gpu_scratch_alloc_a_ctx(ctx, (unsigned long)hidden_dim * sizeof(float));
+    mu_gpu_buf logits = mu_gpu_scratch_alloc_b_ctx(ctx, (unsigned long)vocab_dim * sizeof(float));
+    if (!last.ptr || !logits.ptr) return -2;
+
+    id<MTLBuffer> hidden_buf = (__bridge id<MTLBuffer>)hidden_state.ptr;
+    id<MTLBuffer> norm_buf = (__bridge id<MTLBuffer>)final_norm_bf16.ptr;
+    id<MTLBuffer> last_buf = (__bridge id<MTLBuffer>)last.ptr;
+    id<MTLBuffer> embed_buf = (__bridge id<MTLBuffer>)embed_bf16.ptr;
+    id<MTLBuffer> logits_buf = (__bridge id<MTLBuffer>)logits.ptr;
+    id<MTLBuffer> out_id_buf = (__bridge id<MTLBuffer>)out_id.ptr;
+    id<MTLBuffer> out_val_buf = (__bridge id<MTLBuffer>)out_val.ptr;
+
+    [ctx->encoder setComputePipelineState:ctx->gpu->rmsnorm_bf16_rows];
+    [ctx->encoder setBuffer:hidden_buf offset:hidden_state.offset atIndex:0];
+    [ctx->encoder setBuffer:norm_buf offset:final_norm_bf16.offset atIndex:1];
+    [ctx->encoder setBuffer:last_buf offset:last.offset atIndex:2];
+    [ctx->encoder setBytes:&hidden_dim length:sizeof(hidden_dim) atIndex:3];
+    [ctx->encoder setBytes:&eps length:sizeof(eps) atIndex:4];
+
+    NSUInteger w_norm = ctx->gpu->rmsnorm_bf16_rows.threadExecutionWidth;
+    if (w_norm < 1) w_norm = 1;
+    if (w_norm > (NSUInteger)hidden_dim) w_norm = (NSUInteger)hidden_dim;
+    [ctx->encoder dispatchThreads:MTLSizeMake((NSUInteger)hidden_dim, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(w_norm, 1, 1)];
+
+    [ctx->encoder setComputePipelineState:ctx->gpu->dense_f32_rows];
+    [ctx->encoder setBuffer:last_buf offset:last.offset atIndex:0];
+    [ctx->encoder setBuffer:embed_buf offset:embed_bf16.offset atIndex:1];
+    [ctx->encoder setBuffer:logits_buf offset:logits.offset atIndex:2];
+    [ctx->encoder setBytes:&hidden_dim length:sizeof(hidden_dim) atIndex:3];
+    [ctx->encoder setBytes:&vocab_dim length:sizeof(vocab_dim) atIndex:4];
+
+    NSUInteger w_dense = ctx->gpu->dense_f32_rows.threadExecutionWidth;
+    if (w_dense < 1) w_dense = 1;
+    if (w_dense > (NSUInteger)vocab_dim) w_dense = (NSUInteger)vocab_dim;
+    [ctx->encoder dispatchThreads:MTLSizeMake((NSUInteger)vocab_dim, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(w_dense, 1, 1)];
+
+    [ctx->encoder setComputePipelineState:ctx->gpu->argmax_f32];
+    [ctx->encoder setBuffer:logits_buf offset:logits.offset atIndex:0];
+    [ctx->encoder setBuffer:out_id_buf offset:out_id.offset atIndex:1];
+    [ctx->encoder setBuffer:out_val_buf offset:out_val.offset atIndex:2];
+    [ctx->encoder setBytes:&vocab_dim length:sizeof(vocab_dim) atIndex:3];
+    [ctx->encoder dispatchThreads:MTLSizeMake(512, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+
+    return 0;
+}
+
 int mu_gpu_text_logits_argmax(mu_gpu *gpu, const float *hidden_state_cpu,
                               const unsigned short *final_norm_bf16,
                               const unsigned short *embed_bf16,

@@ -137,6 +137,17 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn("hidden_resident", source)
         self.assertIn("hidden_ping", source)
 
+    def test_text_decode_resident_logits_path_is_wired(self):
+        header = (ROOT / "mineru/mu_gpu.h").read_text()
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+        source = (ROOT / "mineru/mu.c").read_text()
+
+        self.assertIn("mu_gpu_text_logits_argmax_ctx", header)
+        self.assertIn("int mu_gpu_text_logits_argmax_ctx", host)
+        self.assertIn('getenv("MU_TEXT_DECODE_NO_RESIDENT_LOGITS")', source)
+        self.assertIn("text_decode_resident_logits", source)
+        self.assertIn("mu_gpu_text_logits_argmax_ctx(ctx", source)
+
     def test_text_prefill_flash_attention_is_wired(self):
         metal = (ROOT / "mineru/metal/mu_attn.metal").read_text()
         host = (ROOT / "mineru/mu_metal.m").read_text()
