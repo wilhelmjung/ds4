@@ -187,13 +187,32 @@ kernel void mu_dense_probe_simd(device const float *x [[buffer(0)]],
                                 uint2 gid [[thread_position_in_grid]],
                                 uint simd_lane [[thread_index_in_simdgroup]]) {
     uint row = gid.y;
-    float local_sum = 0.0f;
-    for (int c = (int)simd_lane; c < cols; c += 32) {
-        local_sum += x[c] * mu_bf16_to_f32(w[(size_t)row * (size_t)cols + c]);
-    }
-    float total_sum = simd_sum(local_sum);
-    if (simd_lane == 0) {
-        out[row] = total_sum;
+    if ((cols & 3) == 0) {
+        device const float4 *x_vec = (device const float4 *)x;
+        device const ushort4 *w_vec = (device const ushort4 *)(w + (size_t)row * (size_t)cols);
+        int cols_vec = cols / 4;
+        float local_sum = 0.0f;
+        for (int c = (int)simd_lane; c < cols_vec; c += 32) {
+            float4 xv = x_vec[c];
+            ushort4 wv = w_vec[c];
+            local_sum += xv.x * mu_bf16_to_f32(wv.x) +
+                         xv.y * mu_bf16_to_f32(wv.y) +
+                         xv.z * mu_bf16_to_f32(wv.z) +
+                         xv.w * mu_bf16_to_f32(wv.w);
+        }
+        float total_sum = simd_sum(local_sum);
+        if (simd_lane == 0) {
+            out[row] = total_sum;
+        }
+    } else {
+        float local_sum = 0.0f;
+        for (int c = (int)simd_lane; c < cols; c += 32) {
+            local_sum += x[c] * mu_bf16_to_f32(w[(size_t)row * (size_t)cols + c]);
+        }
+        float total_sum = simd_sum(local_sum);
+        if (simd_lane == 0) {
+            out[row] = total_sum;
+        }
     }
 }
 
@@ -205,14 +224,34 @@ kernel void mu_dense_bf16_bias_probe_simd(device const float *x [[buffer(0)]],
                                           uint2 gid [[thread_position_in_grid]],
                                           uint simd_lane [[thread_index_in_simdgroup]]) {
     uint row = gid.y;
-    float local_sum = 0.0f;
-    for (int c = (int)simd_lane; c < cols; c += 32) {
-        local_sum += x[c] * mu_bf16_to_f32(w[(size_t)row * (size_t)cols + c]);
-    }
-    float total_sum = simd_sum(local_sum);
-    if (simd_lane == 0) {
-        float bias_val = mu_bf16_to_f32(bias[row]);
-        out[row] = mu_round_bf16(total_sum + bias_val);
+    if ((cols & 3) == 0) {
+        device const float4 *x_vec = (device const float4 *)x;
+        device const ushort4 *w_vec = (device const ushort4 *)(w + (size_t)row * (size_t)cols);
+        int cols_vec = cols / 4;
+        float local_sum = 0.0f;
+        for (int c = (int)simd_lane; c < cols_vec; c += 32) {
+            float4 xv = x_vec[c];
+            ushort4 wv = w_vec[c];
+            local_sum += xv.x * mu_bf16_to_f32(wv.x) +
+                         xv.y * mu_bf16_to_f32(wv.y) +
+                         xv.z * mu_bf16_to_f32(wv.z) +
+                         xv.w * mu_bf16_to_f32(wv.w);
+        }
+        float total_sum = simd_sum(local_sum);
+        if (simd_lane == 0) {
+            float bias_val = mu_bf16_to_f32(bias[row]);
+            out[row] = mu_round_bf16(total_sum + bias_val);
+        }
+    } else {
+        float local_sum = 0.0f;
+        for (int c = (int)simd_lane; c < cols; c += 32) {
+            local_sum += x[c] * mu_bf16_to_f32(w[(size_t)row * (size_t)cols + c]);
+        }
+        float total_sum = simd_sum(local_sum);
+        if (simd_lane == 0) {
+            float bias_val = mu_bf16_to_f32(bias[row]);
+            out[row] = mu_round_bf16(total_sum + bias_val);
+        }
     }
 }
 
@@ -224,14 +263,34 @@ kernel void mu_dense_f32_bias_probe_simd(device const float *x [[buffer(0)]],
                                          uint2 gid [[thread_position_in_grid]],
                                          uint simd_lane [[thread_index_in_simdgroup]]) {
     uint row = gid.y;
-    float local_sum = 0.0f;
-    for (int c = (int)simd_lane; c < cols; c += 32) {
-        local_sum += x[c] * mu_bf16_to_f32(w[(size_t)row * (size_t)cols + c]);
-    }
-    float total_sum = simd_sum(local_sum);
-    if (simd_lane == 0) {
-        float bias_val = mu_bf16_to_f32(bias[row]);
-        out[row] = total_sum + bias_val;
+    if ((cols & 3) == 0) {
+        device const float4 *x_vec = (device const float4 *)x;
+        device const ushort4 *w_vec = (device const ushort4 *)(w + (size_t)row * (size_t)cols);
+        int cols_vec = cols / 4;
+        float local_sum = 0.0f;
+        for (int c = (int)simd_lane; c < cols_vec; c += 32) {
+            float4 xv = x_vec[c];
+            ushort4 wv = w_vec[c];
+            local_sum += xv.x * mu_bf16_to_f32(wv.x) +
+                         xv.y * mu_bf16_to_f32(wv.y) +
+                         xv.z * mu_bf16_to_f32(wv.z) +
+                         xv.w * mu_bf16_to_f32(wv.w);
+        }
+        float total_sum = simd_sum(local_sum);
+        if (simd_lane == 0) {
+            float bias_val = mu_bf16_to_f32(bias[row]);
+            out[row] = total_sum + bias_val;
+        }
+    } else {
+        float local_sum = 0.0f;
+        for (int c = (int)simd_lane; c < cols; c += 32) {
+            local_sum += x[c] * mu_bf16_to_f32(w[(size_t)row * (size_t)cols + c]);
+        }
+        float total_sum = simd_sum(local_sum);
+        if (simd_lane == 0) {
+            float bias_val = mu_bf16_to_f32(bias[row]);
+            out[row] = total_sum + bias_val;
+        }
     }
 }
 

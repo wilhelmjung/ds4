@@ -125,3 +125,20 @@ We implemented three key optimizations as part of Phase 6 to reduce memory bandw
   - Table exact cell recall = 1.0000
   - Layout exact cell recall = 1.0000
   - Trace tests `layout.json` and `text.json` pass completely.
+
+---
+
+## 6. Vectorized Memory Loading for Text Decoder Projections (GEMV)
+
+We optimized all three SIMD-reduction GEMV kernels (`mu_dense_probe_simd`, `mu_dense_bf16_bias_probe_simd`, and `mu_dense_f32_bias_probe_simd`) in [mu_dense.metal](file:///Users/will/github/ds4/mineru/metal/mu_dense.metal) using vectorized `ushort4` and `float4` loads.
+
+### Implementation Details
+1. **Dynamic Vectorization Check**: Added a runtime check `if ((cols & 3) == 0)` to guarantee alignment safety. Unaligned shapes automatically fall back to the original scalar SIMD loops.
+2. **Vector Coalescing**: Cast input hidden state `x` to `device const float4 *` and weights `w` to `device const ushort4 *`. 
+3. **Loop Tiling**: Each thread in the SIMD-group (32 threads) processes a 4-element sub-dot-product per loop iteration, calculating $32 \times 4 = 128$ dimensions per loop step cooperatively. This matches the multiple-of-128 hidden dimensions ($cols = 896$) of the text model.
+
+### Benchmarks & Parity
+- **Core Speedup**:
+  - The mean execution step time of `text_generate_decode_cached_attn_mlp` was cut from **166 microseconds** to **78 microseconds**, achieving a **2.12x speedup** on the attention projection layers.
+- **Trace Parity**: Layout/text traces pass with 100% exact parity matching the CPU reference path. All 9 integration smoke tests are fully green.
+
