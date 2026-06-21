@@ -2158,3 +2158,33 @@ All 9 integration smoke tests are green, and timing unit tests (`Ran 17 tests: O
 We identified and resolved a critical memory leak in the scratchpad allocations. The transient buffers (`rotary_buf`, `q_rot_buf`, `k_rot_buf`) allocated inside the vision layers attention loop were accumulating sequentially, causing layout-size images (5,476 patches) to fail with an out-of-memory error (`rc = -8`).
 By resetting the allocator offsets `offset_a` and `offset_b` at the start of each layer iteration and before the merger, we successfully reclaimed the transient memory space. This keeps the maximum scratchpad offset well below the 512 MB threshold, allowing layout parsing to run completely on-device without memory exhaustion.
 
+## Custom SIMD-Group Matrix GEMM & Latency Optimization Checkpoint (Phase 9)
+
+Date: 2026-06-21
+Branch: `codex/mineru-metal-backend`
+Measurement code commits: Custom cooperative matrix multiplier kernel using MSL `simdgroup_matrix` primitives.
+
+We implemented and integrated a custom cooperative matrix multiplier kernel (`mu_dense_bf16_bias_rows_simdgroup`) to replace the `MPSMatrixMultiplication` driver-split path for dominant visual shapes.
+
+### Latency Optimization & Command Encoder Split Reduction
+- **Zero splits**: Eliminated all compute command encoder splits (from 160 splits down to ZERO splits inside the 32-layer vision tower). The entire tower compiles and executes under a single compute command encoder.
+- **Driver scheduling delay**: Dropped driver scheduling latency for `vision_encode_vit_and_merger` by **~43%** (from **863.9 ms** down to **495.7 ms**).
+- **Execution speedup**: Reduced total command buffer lifetime for `vision_encode_vit_and_merger` by **~42%** (from **1059.2 ms** down to **612.0 ms**).
+
+### Performance Results (10-Page Benchmark Snippet)
+Comparing the end-to-end page parsing timings of the first few benchmark pages reveals that the optimized Metal backend now successfully **outperforms** the PyTorch-based `Transformers/MPS` reference:
+
+| Backend | Page 224 | Page 234 | Page 237 |
+| :--- | :---: | :---: | :---: |
+| CPU Reference | 93.13s | 100.06s | 116.78s |
+| Transformers/MPS Reference | 51.73s | 51.00s | 51.05s |
+| **Metal with simdgroup GEMM (Phase 9)** | **29.23s** | **27.92s** | **27.47s** |
+| **Metal vs Transformers/MPS** | **1.77x faster** | **1.83x faster** | **1.86x faster** |
+
+### Correctness Validation
+All traces and unit tests pass with 100% precision parity matching the CPU reference path:
+- Token F1 = 1.0000
+- Table exact cell recall = 1.0000 (104/104 cells)
+- All 9 integration smoke tests pass successfully.
+
+
