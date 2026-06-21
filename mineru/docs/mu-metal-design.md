@@ -32,7 +32,7 @@ path.
 - Do not remove or weaken the CPU implementation.
 - Do not merge MinerU Metal code into DS4 Metal code.
 - Do not introduce DS4 SSD streaming; MinerU2.5-Pro is a dense Qwen2-VL model.
-- Do not quantize weights in the first Metal version.
+- Do not quantize weights. Quantization is strictly prohibited in the mu engine to prevent precision loss; all weights must be stored and computed using BF16/FP32.
 - Do not make the backend generic across arbitrary Qwen2-VL checkpoints.
 - Do not require Metal for tests that are meant to run on non-macOS machines.
 

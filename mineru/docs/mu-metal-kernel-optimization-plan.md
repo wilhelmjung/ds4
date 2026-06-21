@@ -38,7 +38,7 @@ Use these sources narrowly:
 | [MLX `gemv.h`](https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/kernels/gemv.h), [MLX `gemv.metal`](https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/kernels/gemv.metal) | SIMD/threadgroup blocked GEMV shape thinking; multiple output rows per threadgroup; tail handling. | MLX template/codegen stack and generic tensor layout machinery. |
 | [MLX `rms_norm.metal`](https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/kernels/rms_norm.metal) | `simd_sum` + threadgroup partial reduction for one row norm. | Generic type/function-constant framework. |
 | [MLX `scaled_dot_product_attention.metal`](https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/kernels/scaled_dot_product_attention.metal), [MLX `sdpa_vector.h`](https://github.com/ml-explore/mlx/blob/main/mlx/backend/metal/kernels/sdpa_vector.h) | Online softmax accumulation and one-pass QK/softmax/V pattern. | Full SDPA API, masks, transposed layouts, sinks. |
-| [GGML official `ggml-metal.metal`](https://github.com/ggml-org/ggml/blob/master/src/ggml-metal/ggml-metal.metal) | Later dense/quantized matmul reference: Metal threadgroup layout, simdgroup-style reductions, and practical backend kernel organization. | Vendoring GGML, adopting its tensor runtime, or changing MinerU weights into GGML formats in this phase. |
+| [GGML official `ggml-metal.metal`](https://github.com/ggml-org/ggml/blob/master/src/ggml-metal/ggml-metal.metal) | Later dense matmul reference: Metal threadgroup layout, simdgroup-style reductions, and practical backend kernel organization (quantization references are irrelevant since quantization is prohibited). | Vendoring GGML, adopting its tensor runtime, or changing MinerU weights into GGML formats. |
 | [Apple `MPSMatrixMultiplication`](https://developer.apple.com/documentation/metalperformanceshaders/mpsmatrixmultiplication), [Apple `MPSMatrixDescriptor`](https://developer.apple.com/documentation/metalperformanceshaders/mpsmatrixdescriptor) | Official library baseline for row-major `X * W^T` dense shapes before writing deeper custom kernels. | Replacing the whole backend with MPSGraph. |
 | [OpenAI GPT-OSS Metal README](https://github.com/openai/gpt-oss#reference-metal-implementation), [GPT-OSS Metal source](https://github.com/openai/gpt-oss/tree/main/gpt_oss/metal) | Backend organization and BF16/Metal reference constraints. | Treating it as production performance code; README says it is reference/not production-ready. |
 | [Elijah Kurien Metal-from-scratch RMSNorm article](https://www.elijahkurien.com/blog/metal-from-scratch) | Small readable norm reduction pattern: vectorized reads, `simd_sum`, threadgroup reduction. | Using RMSNorm as first optimization target. Dense rows is the current larger bottleneck. |
@@ -50,7 +50,7 @@ Use these sources narrowly:
 
 - Do not vendor MLX, GPT-OSS, or MFA.
 - Do not rewrite `mu_metal.m` around Swift codegen.
-- Do not introduce quantization or weight repacking in the first spike.
+- Do not introduce quantization. Quantization is strictly prohibited in the mu engine to prevent precision loss; all weights must be stored and computed using BF16/FP32.
 - Do not change CPU behavior or CPU default backend.
 - Do not keep a permanent semantic switch. Temporary env flags are diagnostic only.
 

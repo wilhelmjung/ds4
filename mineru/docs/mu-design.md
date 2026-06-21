@@ -567,8 +567,8 @@ reference.
 
 Only after correctness is stable:
 
-- quantize selected dense matrices.
-- optionally convert BF16 safetensors to a project-native packed format.
+- DO NOT quantize weights. Quantization is strictly prohibited in the mu engine to prevent precision loss.
+- optionally convert BF16 safetensors to a project-native packed format (maintaining exact BF16/FP32 precision).
 - add graph scheduling and buffer reuse.
 - batch block extraction more aggressively.
 - tune for MPS/Metal memory behavior on small unified-memory machines.

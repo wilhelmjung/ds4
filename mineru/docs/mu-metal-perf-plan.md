@@ -18,7 +18,7 @@
 - CPU 始终是默认后端和精度权威，Metal 不得改变 CPU 代码路径的数值行为
 - Objective-C 限定在 `mu_metal.m`，`mu.c` 不引入 Metal 头文件
 - 后端选择在 **stage 级别** 做 dispatch（vision encode / text generate），不要在每个 math helper 里散落后端判断
-- 不要在第一个 Metal 版本中做权重量化
+- 严禁做权重量化（不要在任何版本中做权重量化，以避免精度损失；这是当前的架构原则）
 
 **Tech Stack:** C99, Objective-C ARC, Apple Metal, BF16 safetensors mmap weights, Accelerate/CBLAS CPU reference, Python smoke harness.
 
