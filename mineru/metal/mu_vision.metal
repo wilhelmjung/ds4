@@ -347,3 +347,107 @@ kernel void mu_vision_merge4(device const float *hidden [[buffer(0)]],
     int inner = col - row_in_group * 1280;
     out[i] = hidden[((group * 4 + row_in_group) * 1280) + inner];
 }
+
+kernel void mu_vision_attn_rows_flash(device const float *q [[buffer(0)]],
+                                      device const float *kv [[buffer(1)]],
+                                      device const float *rotary [[buffer(2)]],
+                                      device float *out [[buffer(3)]],
+                                      constant int &rows [[buffer(4)]],
+                                      uint2 tg [[threadgroup_position_in_grid]],
+                                      uint lane [[thread_index_in_simdgroup]]) {
+    int head = (int)tg.y;
+    int query_row = (int)tg.x * 32 + (int)lane;
+    const int head_dim = 80;
+    const float scale = rsqrt(80.0f);
+
+    float qd[80];
+    if (query_row < rows) {
+        device const float *q_head = q + (size_t)query_row * 1280u + head * head_dim;
+        device const float *q_rope = rotary + (size_t)query_row * 40u;
+        for (int d = 0; d < 80; d++) {
+            qd[d] = mu_rope_value(q_head, q_rope, d);
+        }
+    }
+
+    threadgroup float shared_k[32 * 80];
+    threadgroup float shared_v[32 * 80];
+
+    float max_score = -3.402823466e38f;
+    float denom = 0.0f;
+
+    for (int kb = 0; kb < rows; kb += 32) {
+        int k_row = kb + (int)lane;
+        if (k_row < rows) {
+            device const float *k_head = kv + (size_t)k_row * 2560u + head * head_dim;
+            device const float *k_rope = rotary + (size_t)k_row * 40u;
+            for (int d = 0; d < 80; d++) {
+                shared_k[lane * 80 + d] = mu_rope_value(k_head, k_rope, d);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (query_row < rows) {
+            int limit = min(32, rows - kb);
+            for (int j = 0; j < limit; j++) {
+                float dot = 0.0f;
+                threadgroup const float *k_head_shared = shared_k + j * 80;
+                for (int d = 0; d < 80; d++) {
+                    dot += qd[d] * k_head_shared[d];
+                }
+                float score = dot * scale;
+                float m_new = max(max_score, score);
+                denom = denom * exp(max_score - m_new) + exp(score - m_new);
+                max_score = m_new;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float acc[80];
+    for (int d = 0; d < 80; d++) {
+        acc[d] = 0.0f;
+    }
+
+    for (int kb = 0; kb < rows; kb += 32) {
+        int kv_row = kb + (int)lane;
+        if (kv_row < rows) {
+            device const float *k_head = kv + (size_t)kv_row * 2560u + head * head_dim;
+            device const float *k_rope = rotary + (size_t)kv_row * 40u;
+            device const float *v_head = kv + (size_t)kv_row * 2560u + 1280u + head * head_dim;
+            for (int d = 0; d < 80; d++) {
+                shared_k[lane * 80 + d] = mu_rope_value(k_head, k_rope, d);
+                shared_v[lane * 80 + d] = v_head[d];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (query_row < rows) {
+            int limit = min(32, rows - kb);
+            for (int j = 0; j < limit; j++) {
+                float dot = 0.0f;
+                threadgroup const float *k_head_shared = shared_k + j * 80;
+                for (int d = 0; d < 80; d++) {
+                    dot += qd[d] * k_head_shared[d];
+                }
+                float p = mu_round_bf16(exp(dot * scale - max_score) / denom);
+                threadgroup const float *v_head_shared = shared_v + j * 80;
+                for (int d = 0; d < 80; d++) {
+                    acc[d] += p * v_head_shared[d];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (query_row < rows) {
+        device float *out_head = out + (size_t)query_row * 1280u + head * head_dim;
+        for (int d = 0; d < 80; d++) {
+            out_head[d] = mu_round_bf16(acc[d]);
+        }
+    }
+}
+

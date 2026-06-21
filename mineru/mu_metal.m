@@ -80,6 +80,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> vision_pv_head;
     id<MTLComputePipelineState> vision_softmax_pv_head;
     id<MTLComputePipelineState> vision_attn_rows_online;
+    id<MTLComputePipelineState> vision_attn_rows_flash;
     id<MTLComputePipelineState> vision_add_bf16;
     id<MTLComputePipelineState> vision_quick_gelu_bf16;
     id<MTLComputePipelineState> vision_gelu_bf16;
@@ -581,6 +582,8 @@ int mu_gpu_create(mu_gpu **out) {
                                                            @"mu_vision_softmax_pv_head");
         gpu->vision_attn_rows_online = mu_gpu_make_pipeline(device, @"mu_vision.metal",
                                                             @"mu_vision_attn_rows_online");
+        gpu->vision_attn_rows_flash = mu_gpu_make_pipeline(device, @"mu_vision.metal",
+                                                           @"mu_vision_attn_rows_flash");
         gpu->vision_add_bf16 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
                                                     @"mu_vision_add_bf16");
         gpu->vision_quick_gelu_bf16 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
@@ -664,6 +667,7 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->vision_quick_gelu_bf16 = nil;
     gpu->vision_add_bf16 = nil;
     gpu->vision_attn_rows_online = nil;
+    gpu->vision_attn_rows_flash = nil;
     gpu->vision_softmax_pv_head = nil;
     gpu->vision_pv_head = nil;
     gpu->vision_softmax_bf16_rows = nil;
@@ -2819,6 +2823,21 @@ int mu_gpu_vision_attn_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q, mu_gpu_buf kv
         memcpy((char *)[rotary_buf contents] + rotary_offset, rotary, rotary_bytes);
     } else {
         rotary_buf = [ctx->gpu->device newBufferWithBytes:rotary length:rotary_bytes options:MTLResourceStorageModeShared];
+    }
+
+    bool request_flash = getenv("MU_VISION_ATTN_NO_FLASH") == NULL;
+    if (request_flash && ctx->gpu->vision_attn_rows_flash) {
+        [ctx->encoder setComputePipelineState:ctx->gpu->vision_attn_rows_flash];
+        [ctx->encoder setBuffer:q_buf offset:q.offset atIndex:0];
+        [ctx->encoder setBuffer:kv_buf offset:kv.offset atIndex:1];
+        [ctx->encoder setBuffer:rotary_buf offset:rotary_offset atIndex:2];
+        [ctx->encoder setBuffer:out_buf offset:out.offset atIndex:3];
+        [ctx->encoder setBytes:&rows length:sizeof(rows) atIndex:4];
+        
+        MTLSize grid = MTLSizeMake(((NSUInteger)rows + 31u) / 32u, 16u, 1);
+        MTLSize threads = MTLSizeMake(32, 1, 1);
+        [ctx->encoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+        return 0;
     }
 
     if (getenv("MU_VISION_ATTN_ONLINE") != NULL && ctx->gpu->vision_attn_rows_online) {
