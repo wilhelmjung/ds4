@@ -2201,17 +2201,25 @@ We implemented a fully fused tiled FlashAttention Metal Shading Language (MSL) k
   2. **Pass 2 (Value Accumulation)**: Threadgroups reload Key and Value vectors, compute exact rounded intermediate BF16 probabilities using `mu_round_bf16(exp(score - max_score) / denom)`, and accumulate Value vectors.
 - **Tiled Coalescing**: By grouping threads to process 32 query rows in a SIMD-group, we load K and V tiles (tile size $32 \times 80$) cooperatively into threadgroup memory. This coalesces HBM reads, reducing the HBM read frequency of K/V weights by over 30x.
 
-### Performance Results (10-Page Benchmark Snippet)
-Comparing the end-to-end page parsing timings of the first few benchmark pages reveals that the optimized Metal backend remains extremely fast:
+### Performance Results (10-Page Benchmark Summary)
+Below is the full 10-page benchmark run comparing the CPU reference and the optimized Metal backend (Phase 10 with FlashAttention) in layout-only mode (`--skip-content --max-new-tokens 4`):
 
-| Backend | Page 224 | Page 234 | Page 237 |
-| :--- | :---: | :---: | :---: |
-| CPU Reference | 93.13s | 100.06s | 116.78s |
-| Transformers/MPS Reference | 51.73s | 51.00s | 51.05s |
-| **Metal with FlashAttention (Phase 10)** | **28.26s** | **28.33s** | **28.38s** |
-| **Metal vs Transformers/MPS** | **1.83x faster** | **1.80x faster** | **1.80x faster** |
+| Page | CPU Reference (s) | Metal with FlashAttention (s) | Speedup |
+| :---: | :---: | :---: | :---: |
+| Page 224 | 46.87s | 30.05s | 1.56x |
+| Page 234 | 46.06s | 27.53s | 1.67x |
+| Page 237 | 46.06s | 27.93s | 1.65x |
+| Page 241 | 46.21s | 28.19s | 1.64x |
+| Page 244 | 46.34s | 28.00s | 1.66x |
+| Page 247 | 45.67s | 27.59s | 1.66x |
+| Page 258 | 45.83s | 27.53s | 1.66x |
+| Page 281 | 46.03s | 27.63s | 1.67x |
+| Page 303 | 46.27s | 27.93s | 1.66x |
+| Page 334 | 46.14s | 28.19s | 1.64x |
+| **Total** | **461.49s** | **280.58s** | **1.64x** |
+| **Mean** | **46.15s** | **28.06s** | **1.64x** |
 
-*Note: The primary benefit of the FlashAttention kernel is the reduction in memory bandwidth pressure and kernel dispatch overhead. By fusing QK projection, softmax, and PV multiplication into a single kernel, we avoid materializing the large intermediate attention score and probability matrices to global HBM, significantly improving device efficiency.*
+*Note: The primary benefit of the FlashAttention kernel is the reduction in memory bandwidth pressure and kernel dispatch overhead. By fusing QK projection, softmax, and PV multiplication into a single kernel, we avoid materializing the large intermediate attention score and probability matrices to global VRAM, significantly improving device efficiency.*
 
 ### Correctness Validation
 All layout/text traces and unit tests pass with 100% precision parity matching the CPU reference path:
