@@ -136,3 +136,14 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn('getenv("MU_TEXT_CACHED_HIDDEN_RESIDENT")', source)
         self.assertIn("hidden_resident", source)
         self.assertIn("hidden_ping", source)
+
+    def test_text_prefill_flash_attention_is_wired(self):
+        metal = (ROOT / "mineru/metal/mu_attn.metal").read_text()
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn("kernel void mu_text_prefill_attn_flash", metal)
+        self.assertIn("kernel void mu_text_prefill_attn_pos_flash", metal)
+        self.assertIn("text_prefill_attn_flash", host)
+        self.assertIn("text_prefill_attn_pos_flash", host)
+        self.assertIn('getenv("MU_TEXT_PREFILL_ATTN_NO_FLASH")', host)
+        self.assertIn("dispatchThreadgroups:grid threadsPerThreadgroup:threads", host)

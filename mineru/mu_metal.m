@@ -96,6 +96,8 @@ struct mu_gpu {
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_gelu;
     id<MTLComputePipelineState> text_decode_fused_ffn;
     id<MTLComputePipelineState> text_attn_cached_simd;
+    id<MTLComputePipelineState> text_prefill_attn_flash;
+    id<MTLComputePipelineState> text_prefill_attn_pos_flash;
     MPSMatrixMultiplication *dense_mps_1280_1280;
     MPSMatrixMultiplication *dense_mps_1280_2560;
     MPSMatrixMultiplication *dense_mps_1280_5120;
@@ -619,6 +621,10 @@ int mu_gpu_create(mu_gpu **out) {
                                                           @"mu_text_attn_cached_simd");
         gpu->text_prefill_rope_cache_update = mu_gpu_make_pipeline(device, @"mu_attn.metal",
                                                                    @"mu_text_prefill_rope_cache_update");
+        gpu->text_prefill_attn_flash = mu_gpu_make_pipeline(device, @"mu_attn.metal",
+                                                            @"mu_text_prefill_attn_flash");
+        gpu->text_prefill_attn_pos_flash = mu_gpu_make_pipeline(device, @"mu_attn.metal",
+                                                                @"mu_text_prefill_attn_pos_flash");
         const char *name = [[device name] UTF8String];
         if (name) {
             strlcpy(gpu->device_name, name, sizeof(gpu->device_name));
@@ -693,6 +699,8 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->text_attn_cached = nil;
     gpu->text_rope_cache_update = nil;
     gpu->text_prefill_rope_cache_update = nil;
+    gpu->text_prefill_attn_flash = nil;
+    gpu->text_prefill_attn_pos_flash = nil;
     gpu->text_attn_seq = nil;
     gpu->text_attn_token0 = nil;
     gpu->layernorm_bf16_rows = nil;
@@ -1913,6 +1921,7 @@ static int mu_gpu_text_layers_mlp_seq_engine(mu_gpu *gpu, void *engine,
             rc = mu_gpu_dense_f32_bias_rows_ctx(ctx, temp_normed, vw_buf, vb_buf, n_ids, hidden, 128, temp_v);
             if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
 
+            bool use_prefill_flash = gpu_cache && getenv("MU_TEXT_PREFILL_ATTN_NO_FLASH") == NULL;
             if (gpu_cache) {
                 [ctx->encoder setComputePipelineState:gpu->text_prefill_rope_cache_update];
                 [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_k.ptr offset:temp_k.offset atIndex:0];
@@ -1929,10 +1938,37 @@ static int mu_gpu_text_layers_mlp_seq_engine(mu_gpu *gpu, void *engine,
                 [ctx->encoder dispatchThreads:grid threadsPerThreadgroup:threads];
             }
 
-            if (position_ids) {
-                rc = mu_gpu_text_attn_seq_pos_ctx(ctx, temp_q, temp_k, temp_v, pos_buf, n_ids, temp_attn);
+            if (use_prefill_flash) {
+                if (position_ids) {
+                    [ctx->encoder setComputePipelineState:gpu->text_prefill_attn_pos_flash];
+                    [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_q.ptr offset:temp_q.offset atIndex:0];
+                    [ctx->encoder setBuffer:gpu_cache->k_cache offset:0 atIndex:1];
+                    [ctx->encoder setBuffer:gpu_cache->v_cache offset:0 atIndex:2];
+                    [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)pos_buf.ptr offset:pos_buf.offset atIndex:3];
+                    [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_attn.ptr offset:temp_attn.offset atIndex:4];
+                    [ctx->encoder setBytes:&n_ids length:sizeof(n_ids) atIndex:5];
+                    [ctx->encoder setBytes:&cache_cap length:sizeof(cache_cap) atIndex:6];
+                    [ctx->encoder setBytes:&layer length:sizeof(layer) atIndex:7];
+                } else {
+                    [ctx->encoder setComputePipelineState:gpu->text_prefill_attn_flash];
+                    [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_q.ptr offset:temp_q.offset atIndex:0];
+                    [ctx->encoder setBuffer:gpu_cache->k_cache offset:0 atIndex:1];
+                    [ctx->encoder setBuffer:gpu_cache->v_cache offset:0 atIndex:2];
+                    [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_attn.ptr offset:temp_attn.offset atIndex:3];
+                    [ctx->encoder setBytes:&n_ids length:sizeof(n_ids) atIndex:4];
+                    [ctx->encoder setBytes:&cache_cap length:sizeof(cache_cap) atIndex:5];
+                    [ctx->encoder setBytes:&layer length:sizeof(layer) atIndex:6];
+                }
+                MTLSize grid = MTLSizeMake(((NSUInteger)n_ids + 31u) / 32u, 14, 1);
+                MTLSize threads = MTLSizeMake(32, 1, 1);
+                [ctx->encoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+                rc = 0;
             } else {
-                rc = mu_gpu_text_attn_seq_ctx(ctx, temp_q, temp_k, temp_v, n_ids, temp_attn);
+                if (position_ids) {
+                    rc = mu_gpu_text_attn_seq_pos_ctx(ctx, temp_q, temp_k, temp_v, pos_buf, n_ids, temp_attn);
+                } else {
+                    rc = mu_gpu_text_attn_seq_ctx(ctx, temp_q, temp_k, temp_v, n_ids, temp_attn);
+                }
             }
             if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
 

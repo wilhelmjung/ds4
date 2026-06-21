@@ -2307,3 +2307,183 @@ Below is the full 10-page content extraction benchmark run comparing the CPU ref
 
 *\*Note: Both the "PyTorch MPS (Throttled)" and "Metal (Throttled Current)" runs were measured while the GPU was in a system-level throttled/low-power state. Under these identical hardware conditions, our custom Metal backend is extremely competitive, coming within **7%** of PyTorch MPS on average, and even outperforming it on table-heavy pages (Pages 241, 244, and 247). Compared to the unthrottled MPS baseline, the throttled state slowed PyTorch MPS down by **2.10x** (from 36.06s to 75.59s), which is in line with the ~2x slowdown observed in our Metal backend. This confirms that the native Metal engine is highly optimized and matches the performance profile of PyTorch MPS.*
 
+## Text Prefill FlashAttention Dispatch Fix
+
+Date: 2026-06-21
+
+This checkpoint verifies the fused causal FlashAttention prefill path for the
+text decoder. The shader was already present, but the host used
+`dispatchThreads` with a threadgroup count while the shader indexes query rows
+with `threadgroup_position_in_grid`. Long prompts therefore left most query rows
+uncomputed. The fix is to dispatch with `dispatchThreadgroups`.
+
+Escape hatch:
+
+```text
+MU_TEXT_PREFILL_ATTN_NO_FLASH=1
+```
+
+Validation:
+
+```text
+make -B mu-test
+MU_TIMING=1 ./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/text.json
+MU_TIMING=1 ./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/layout.json
+for f in mineru/tests/mu_metal_*.py; do python "$f"; done
+```
+
+Artifacts:
+
+```text
+/tmp/mu-benchmark-metal-10page-layout-text-prefill-flash.json
+/tmp/mu-10page-layout-text-prefill-flash/metal_page_*.json
+/tmp/mu-benchmark-metal-10page-layout-text-prefill-no-flash.json
+/tmp/mu-10page-layout-text-prefill-no-flash/metal_page_*.json
+/tmp/mu-10page-layout-text-prefill-flash/no-flash-vs-flash.metrics.json
+```
+
+10-page layout-only benchmark, adjacent A/B:
+
+| Path | Total s | Mean wall s/page | Mean page_total s | Mean layout_generate s | Mean prefill s/page | Mean decode s/page | Fallback rows |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Flash prefill default | 563.9306 | 56.3931 | 55.9523 | 3.7728 | 3.5098 | 0.2560 | 0 |
+| `MU_TEXT_PREFILL_ATTN_NO_FLASH=1` | 573.3830 | 57.3383 | 57.0316 | 4.3055 | 4.0509 | 0.2500 | 0 |
+
+Measured speedup:
+
+| Stage | Seconds saved/page | Speedup |
+| --- | ---: | ---: |
+| `text_generate_prefill` | 0.5411 | 1.1542x |
+| `layout_generate` | 0.5327 | 1.1412x |
+| `page_total` | 1.0794 | 1.0193x |
+
+Output comparison, no-flash versus flash:
+
+| Metric | Value |
+| --- | ---: |
+| Block count exact pages | 10 / 10 |
+| Block count exact rate | 1.0000 |
+| Ordered type accuracy | 1.0000 |
+| Mean content token F1 | 1.0000 |
+
+Fresh full-content512 gate:
+
+```text
+/tmp/mu-benchmark-metal-10page-fullcontent512-text-prefill-flash-current.json
+/tmp/mu-10page-fullcontent512-text-prefill-flash-current/metal_page_*.json
+/tmp/mu-10page-fullcontent512-text-prefill-flash-current/current-default-vs-text-prefill-flash.metrics.json
+```
+
+| Metric | Value |
+| --- | ---: |
+| Completed pages | 10 / 10 |
+| Failed pages | 0 |
+| Fallback rows | 0 |
+| Total seconds | 1078.2178 |
+| Mean wall seconds/page | 107.8218 |
+| Mean page_total | 107.5964 |
+| Mean layout_vision_encode | 50.8216 |
+| Mean content_region_vision_encode | 21.8710 |
+| Mean layout_generate | 8.6912 |
+| Mean content_region_generate | 22.0287 |
+| Mean text_generate_prefill | 5.0157 |
+| Mean text_generate_decode | 25.6893 |
+
+Full-content output comparison against the prior current-default Metal artifact:
+
+| Metric | Value |
+| --- | ---: |
+| Block count exact pages | 10 / 10 |
+| Block count exact rate | 1.0000 |
+| Ordered type accuracy | 1.0000 |
+| Mean content token F1 | 1.0000 |
+| Table exact cell recall | 1.0000 |
+
+Result:
+
+- Keep fused text prefill FlashAttention enabled by default.
+- Keep `MU_TEXT_PREFILL_ATTN_NO_FLASH=1` as the regression escape hatch.
+- Do not infer vision performance from this benchmark; the adjacent A/B is for
+  text prefill only, and `layout_vision_encode` varied across runs.
+- Treat the full-content512 gate as a correctness/no-fallback checkpoint for
+  the plan command. The fresh run was slower than the older same-command
+  artifact because decode and vision stages varied under current system state.
+
+## Fresh PyTorch MPS vs Current Metal A/B Rerun
+
+Date: 2026-06-21
+
+This rerun compares the current `mu` Metal backend against the local
+PyTorch/Transformers MPS reference on the same 10-page full-content512 sample:
+
+```text
+224,234,237,241,244,247,258,281,303,334
+```
+
+MPS command basis:
+
+```text
+/Users/will/github/mineru-model/.venv/bin/python benchmark_pdf.py
+--device mps --batch-size 1 --dpi 120 --max-new-tokens 512
+```
+
+Metal command basis:
+
+```text
+MU_TIMING=1 /Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_benchmark_pages.py
+--backend metal --max-new-tokens 512 --timeout 7200 --timing
+```
+
+Artifacts:
+
+```text
+/tmp/mu-mps-current-10page-fullcontent512/summary.json
+/tmp/mu-mps-current-10page-fullcontent512/pages.jsonl
+/tmp/mu-benchmark-metal-current-10page-fullcontent512-rerun.json
+/tmp/mu-metal-current-10page-fullcontent512-rerun/metal_page_*.json
+```
+
+Summary:
+
+| Path | Completed | Errors | Fallback rows | Total s | Mean s/page |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| PyTorch/Transformers MPS (`mps:0`, BF16) | 10 / 10 | 0 | n/a | 841.1548 | 84.1155 |
+| Current Metal | 10 / 10 | 0 | 0 | 1247.0661 | 124.7066 |
+
+Current Metal is `1.4826x` slower than the same-run PyTorch MPS reference.
+
+Page-level comparison:
+
+| Page | MPS s | Metal s | Metal / MPS | Metal page_total | Metal layout_vision | Metal content_vision | Metal decode |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 224 | 98.34 | 130.21 | 1.32x | 130.03 | 39.65 | 23.41 | 59.05 |
+| 234 | 130.19 | 140.99 | 1.08x | 140.82 | 40.21 | 25.63 | 67.06 |
+| 237 | 140.54 | 143.33 | 1.02x | 143.16 | 40.03 | 26.96 | 67.98 |
+| 241 | 140.04 | 144.08 | 1.03x | 143.92 | 40.17 | 25.79 | 69.47 |
+| 244 | 89.76 | 142.87 | 1.59x | 142.72 | 40.34 | 25.73 | 68.26 |
+| 247 | 90.26 | 191.36 | 2.12x | 191.19 | 47.76 | 34.14 | 99.60 |
+| 258 | 45.77 | 86.64 | 1.89x | 86.44 | 50.90 | 4.43 | 22.19 |
+| 281 | 37.39 | 81.41 | 2.18x | 81.19 | 50.93 | 5.12 | 17.06 |
+| 303 | 33.65 | 91.58 | 2.72x | 91.35 | 54.19 | 5.32 | 22.65 |
+| 334 | 35.22 | 94.59 | 2.69x | 94.37 | 56.60 | 4.70 | 23.76 |
+
+Metal mean stage timings:
+
+| Stage | Mean s/page |
+| --- | ---: |
+| `page_total` | 124.5197 |
+| `layout_vision_encode` | 46.0787 |
+| `content_region_vision_encode` | 18.1223 |
+| `text_generate_prefill` | 4.4560 |
+| `text_generate_decode` | 51.7080 |
+
+Result:
+
+- Correctness gate remains clean: Metal completed `10 / 10` with `0` fallback
+  rows.
+- The current same-run comparison is worse than the earlier throttled-MPS table:
+  Metal is `1.48x` slower than MPS in this run.
+- The remaining gap is not text prefill. The dominant Metal costs are
+  `text_generate_decode` and fixed vision encode time, especially on short
+  content pages where MPS finishes in `33-46s` but Metal still spends
+  `50-56s` in layout vision encode.

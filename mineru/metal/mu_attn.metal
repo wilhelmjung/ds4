@@ -389,3 +389,213 @@ kernel void mu_text_prefill_rope_cache_update(device const float *k [[buffer(0)]
     }
 }
 
+kernel void mu_text_prefill_attn_flash(device const float *q [[buffer(0)]],
+                                       device const float *k_cache [[buffer(1)]],
+                                       device const float *v_cache [[buffer(2)]],
+                                       device float *out [[buffer(3)]],
+                                       constant int &seq [[buffer(4)]],
+                                       constant int &cache_cap [[buffer(5)]],
+                                       constant int &layer [[buffer(6)]],
+                                       uint2 tg [[threadgroup_position_in_grid]],
+                                       uint lane [[thread_index_in_simdgroup]]) {
+    int head = (int)tg.y;
+    int query_row = (int)tg.x * 32 + (int)lane;
+    const int head_dim = 64;
+    const int n_heads = 14;
+    const int kv_group = 7;
+    const int kvh = head / kv_group;
+    const float scale = 0.125f; // 1 / sqrt(64)
+
+    float qd[64];
+    if (query_row < seq) {
+        device const float *q_head = q + ((size_t)query_row * (size_t)n_heads + (size_t)head) * head_dim;
+        for (int d = 0; d < 64; d++) {
+            qd[d] = mu_text_rope_value(q_head, query_row, d);
+        }
+    }
+
+    threadgroup float shared_k[32 * 64];
+    threadgroup float shared_v[32 * 64];
+
+    float max_score = -3.402823466e38f;
+    float denom = 0.0f;
+
+    // Pass 1: compute online softmax stats (max_score and denom) causally
+    for (int kb = 0; kb < seq; kb += 32) {
+        int k_row = kb + (int)lane;
+        if (k_row < seq) {
+            size_t base_k_cache = (((size_t)layer * (size_t)cache_cap) + (size_t)k_row) * 128u + (size_t)kvh * 64u;
+            for (int d = 0; d < 64; d++) {
+                shared_k[lane * 64 + d] = k_cache[base_k_cache + d];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (query_row < seq && kb <= query_row) {
+            int limit = min(32, query_row - kb + 1);
+            for (int j = 0; j < limit; j++) {
+                float dot = 0.0f;
+                threadgroup const float *k_shared = shared_k + j * 64;
+                for (int d = 0; d < 64; d++) {
+                    dot += qd[d] * k_shared[d];
+                }
+                float score = dot * scale;
+                float m_new = max(max_score, score);
+                denom = denom * exp(max_score - m_new) + exp(score - m_new);
+                max_score = m_new;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Pass 2: accumulate value vectors weighted by softmax probabilities
+    float acc[64];
+    for (int d = 0; d < 64; d++) acc[d] = 0.0f;
+
+    for (int kb = 0; kb < seq; kb += 32) {
+        int kv_row = kb + (int)lane;
+        if (kv_row < seq) {
+            size_t base_k_cache = (((size_t)layer * (size_t)cache_cap) + (size_t)kv_row) * 128u + (size_t)kvh * 64u;
+            size_t base_v_cache = (((size_t)layer * (size_t)cache_cap) + (size_t)kv_row) * 128u + (size_t)kvh * 64u;
+            for (int d = 0; d < 64; d++) {
+                shared_k[lane * 64 + d] = k_cache[base_k_cache + d];
+                shared_v[lane * 64 + d] = v_cache[base_v_cache + d];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (query_row < seq && kb <= query_row) {
+            int limit = min(32, query_row - kb + 1);
+            for (int j = 0; j < limit; j++) {
+                float dot = 0.0f;
+                threadgroup const float *k_shared = shared_k + j * 64;
+                for (int d = 0; d < 64; d++) {
+                    dot += qd[d] * k_shared[d];
+                }
+                float p = exp(dot * scale - max_score) / denom;
+                threadgroup const float *v_shared = shared_v + j * 64;
+                for (int d = 0; d < 64; d++) {
+                    acc[d] += p * v_shared[d];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (query_row < seq) {
+        device float *oh = out + ((size_t)query_row * (size_t)n_heads + (size_t)head) * head_dim;
+        for (int d = 0; d < 64; d++) {
+            oh[d] = acc[d];
+        }
+    }
+}
+
+kernel void mu_text_prefill_attn_pos_flash(device const float *q [[buffer(0)]],
+                                           device const float *k_cache [[buffer(1)]],
+                                           device const float *v_cache [[buffer(2)]],
+                                           device const int *position_ids [[buffer(3)]],
+                                           device float *out [[buffer(4)]],
+                                           constant int &seq [[buffer(5)]],
+                                           constant int &cache_cap [[buffer(6)]],
+                                           constant int &layer [[buffer(7)]],
+                                           uint2 tg [[threadgroup_position_in_grid]],
+                                           uint lane [[thread_index_in_simdgroup]]) {
+    int head = (int)tg.y;
+    int query_row = (int)tg.x * 32 + (int)lane;
+    const int head_dim = 64;
+    const int n_heads = 14;
+    const int kv_group = 7;
+    const int kvh = head / kv_group;
+    const float scale = 0.125f; // 1 / sqrt(64)
+
+    float qd[64];
+    if (query_row < seq) {
+        device const float *q_head = q + ((size_t)query_row * (size_t)n_heads + (size_t)head) * head_dim;
+        for (int d = 0; d < 64; d++) {
+            qd[d] = mu_text_rope_value_pos(q_head, position_ids, seq, query_row, d);
+        }
+    }
+
+    threadgroup float shared_k[32 * 64];
+    threadgroup float shared_v[32 * 64];
+
+    float max_score = -3.402823466e38f;
+    float denom = 0.0f;
+
+    // Pass 1: compute online softmax stats (max_score and denom) causally
+    for (int kb = 0; kb < seq; kb += 32) {
+        int k_row = kb + (int)lane;
+        if (k_row < seq) {
+            size_t base_k_cache = (((size_t)layer * (size_t)cache_cap) + (size_t)k_row) * 128u + (size_t)kvh * 64u;
+            for (int d = 0; d < 64; d++) {
+                shared_k[lane * 64 + d] = k_cache[base_k_cache + d];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (query_row < seq && kb <= query_row) {
+            int limit = min(32, query_row - kb + 1);
+            for (int j = 0; j < limit; j++) {
+                float dot = 0.0f;
+                threadgroup const float *k_shared = shared_k + j * 64;
+                for (int d = 0; d < 64; d++) {
+                    dot += qd[d] * k_shared[d];
+                }
+                float score = dot * scale;
+                float m_new = max(max_score, score);
+                denom = denom * exp(max_score - m_new) + exp(score - m_new);
+                max_score = m_new;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Pass 2: accumulate value vectors weighted by softmax probabilities
+    float acc[64];
+    for (int d = 0; d < 64; d++) acc[d] = 0.0f;
+
+    for (int kb = 0; kb < seq; kb += 32) {
+        int kv_row = kb + (int)lane;
+        if (kv_row < seq) {
+            size_t base_k_cache = (((size_t)layer * (size_t)cache_cap) + (size_t)kv_row) * 128u + (size_t)kvh * 64u;
+            size_t base_v_cache = (((size_t)layer * (size_t)cache_cap) + (size_t)kv_row) * 128u + (size_t)kvh * 64u;
+            for (int d = 0; d < 64; d++) {
+                shared_k[lane * 64 + d] = k_cache[base_k_cache + d];
+                shared_v[lane * 64 + d] = v_cache[base_v_cache + d];
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (query_row < seq && kb <= query_row) {
+            int limit = min(32, query_row - kb + 1);
+            for (int j = 0; j < limit; j++) {
+                float dot = 0.0f;
+                threadgroup const float *k_shared = shared_k + j * 64;
+                for (int d = 0; d < 64; d++) {
+                    dot += qd[d] * k_shared[d];
+                }
+                float p = exp(dot * scale - max_score) / denom;
+                threadgroup const float *v_shared = shared_v + j * 64;
+                for (int d = 0; d < 64; d++) {
+                    acc[d] += p * v_shared[d];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (query_row < seq) {
+        device float *oh = out + ((size_t)query_row * (size_t)n_heads + (size_t)head) * head_dim;
+        for (int d = 0; d < 64; d++) {
+            oh[d] = acc[d];
+        }
+    }
+}
