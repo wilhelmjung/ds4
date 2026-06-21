@@ -376,12 +376,15 @@ kernel void mu_vision_attn_rows_flash(device const float *q [[buffer(0)]],
     float denom = 0.0f;
 
     for (int kb = 0; kb < rows; kb += 32) {
-        int k_row = kb + (int)lane;
-        if (k_row < rows) {
-            device const float *k_head = kv + (size_t)k_row * 2560u + head * head_dim;
-            device const float *k_rope = rotary + (size_t)k_row * 40u;
-            for (int d = 0; d < 80; d++) {
-                shared_k[lane * 80 + d] = mu_rope_value(k_head, k_rope, d);
+        for (int d = 0; d < 80; d++) {
+            int i = (int)lane + d * 32;
+            int r = i / 80;
+            int dim = i % 80;
+            int k_row = kb + r;
+            if (k_row < rows) {
+                device const float *k_head = kv + (size_t)k_row * 2560u + head * head_dim;
+                device const float *k_rope = rotary + (size_t)k_row * 40u;
+                shared_k[i] = mu_rope_value(k_head, k_rope, dim);
             }
         }
 
@@ -411,14 +414,17 @@ kernel void mu_vision_attn_rows_flash(device const float *q [[buffer(0)]],
     }
 
     for (int kb = 0; kb < rows; kb += 32) {
-        int kv_row = kb + (int)lane;
-        if (kv_row < rows) {
-            device const float *k_head = kv + (size_t)kv_row * 2560u + head * head_dim;
-            device const float *k_rope = rotary + (size_t)kv_row * 40u;
-            device const float *v_head = kv + (size_t)kv_row * 2560u + 1280u + head * head_dim;
-            for (int d = 0; d < 80; d++) {
-                shared_k[lane * 80 + d] = mu_rope_value(k_head, k_rope, d);
-                shared_v[lane * 80 + d] = v_head[d];
+        for (int d = 0; d < 80; d++) {
+            int i = (int)lane + d * 32;
+            int r = i / 80;
+            int dim = i % 80;
+            int kv_row = kb + r;
+            if (kv_row < rows) {
+                device const float *k_head = kv + (size_t)kv_row * 2560u + head * head_dim;
+                device const float *k_rope = rotary + (size_t)kv_row * 40u;
+                device const float *v_head = kv + (size_t)kv_row * 2560u + 1280u + head * head_dim;
+                shared_k[i] = mu_rope_value(k_head, k_rope, dim);
+                shared_v[i] = v_head[dim];
             }
         }
 

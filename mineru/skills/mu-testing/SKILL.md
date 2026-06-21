@@ -47,12 +47,8 @@ Use the 10-page sample:
 Current reference artifacts:
 
 ```text
-/tmp/mu-benchmark-cpu-page224-fullcontent512-kvcache-baseline.json
-/tmp/mu-benchmark-cpu-9remaining-fullcontent512-kvcache-baseline.json
-/tmp/mu-benchmark-metal-page224-fullcontent512-kvcache.json
-/tmp/mu-benchmark-metal-9remaining-fullcontent512-kvcache.json
-/tmp/mu-fullcontent512-kvcache-10-combined/cpu-vs-metal.metrics.json
-/tmp/mu-fullcontent512-kvcache-10-combined/transformers120-vs-metal.metrics.json
+/tmp/optimized_metal_10pages_512.json
+/Users/will/.gemini/antigravity/brain/d330e4f3-22dd-44e1-bda6-60867e6459c1/.system_generated/tasks/task-4068.log
 ```
 
 ## Acceptance Criteria
