@@ -2487,3 +2487,85 @@ Result:
   `text_generate_decode` and fixed vision encode time, especially on short
   content pages where MPS finishes in `33-46s` but Metal still spends
   `50-56s` in layout vision encode.
+
+## Resident Decode Logits Checkpoint
+
+Date: 2026-06-21
+
+Change tested:
+
+- Added `mu_gpu_text_logits_argmax_ctx`.
+- The default `layer_resident` decode path now keeps the final hidden state on
+  GPU through final norm, vocab projection, and argmax.
+- Escape hatch: `MU_TEXT_DECODE_NO_RESIDENT_LOGITS=1`.
+
+Command basis:
+
+```text
+MU_TIMING=1 /Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_benchmark_pages.py
+--backend metal --pages 224,258 --max-new-tokens 512 --timeout 7200 --keep-going --timing
+
+MU_TEXT_DECODE_NO_RESIDENT_LOGITS=1 MU_TIMING=1 /Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_benchmark_pages.py
+--backend metal --pages 224,258 --max-new-tokens 512 --timeout 7200 --keep-going --timing
+```
+
+Artifacts:
+
+```text
+/tmp/mu-benchmark-metal-resident-logits-pages224-258.json
+/tmp/mu-benchmark-metal-no-resident-logits-pages224-258.json
+/tmp/mu-metal-resident-logits-pages224-258/metal_page_*.json
+/tmp/mu-metal-no-resident-logits-pages224-258/metal_page_*.json
+/tmp/mu-resident-logits-pages224-258.metrics.json
+```
+
+Summary:
+
+| Path | Completed | Failed | Fallback rows | Total s | Mean wall s/page | Mean decode s/page |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Resident logits default | 2 / 2 | 0 | 0 | 202.4127 | 101.2063 | 38.3554 |
+| `MU_TEXT_DECODE_NO_RESIDENT_LOGITS=1` | 2 / 2 | 0 | 0 | 210.0852 | 105.0426 | 40.0556 |
+
+Speedup:
+
+| Metric | Value |
+| --- | ---: |
+| Total speedup | 1.0379x |
+| `text_generate_decode` speedup | 1.0443x |
+| Resident mean `text_generate_decode_cached_logits` | 0.000625s |
+| Baseline mean `text_generate_decode_cached_logits` | 1.278272s |
+
+Page details:
+
+| Page | Path | Wall s | Page total s | Decode s | Decode cached logits s | Layout vision s | Content vision s |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 224 | Resident | 137.1242 | 136.5479 | 62.2674 | 0.000984 | 41.9294 | 23.8659 |
+| 224 | Escape hatch | 134.1808 | 134.0229 | 61.5704 | 1.760033 | 40.5900 | 23.6949 |
+| 258 | Resident | 65.2885 | 65.1300 | 14.4434 | 0.000266 | 40.5074 | 2.7584 |
+| 258 | Escape hatch | 75.9044 | 75.6885 | 18.5408 | 0.796511 | 40.4715 | 7.4878 |
+
+Output comparison:
+
+| Metric | Value |
+| --- | ---: |
+| Block count exact pages | 2 / 2 |
+| Ordered type accuracy | 1.0000 |
+| Ordered mean bbox IoU | 1.0000 |
+| Mean content token F1 | 1.0000 |
+| Table exact cell recall | 1.0000 |
+
+Decision:
+
+- Keep resident logits enabled by default because it is correct and gives a
+  small same-run improvement.
+- Keep `MU_TEXT_DECODE_NO_RESIDENT_LOGITS=1` as the regression escape hatch.
+- Do not run the 10-page resident-logits gate. The two-page
+  `text_generate_decode` speedup was `1.0443x`, below the `1.05x` threshold.
+- Stop this optimization line and move the next work to `layout_vision_encode`.
+
+Timing note:
+
+- In the resident path, final norm, logits, and argmax share the decode command
+  buffer. The isolated `text_generate_decode_cached_logits` field therefore
+  reflects host-side dispatch/copy accounting, not isolated GPU kernel time.
+  Use `text_generate_decode` for the gate.

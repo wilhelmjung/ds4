@@ -549,3 +549,72 @@ Report:
 ## Execution Choice
 
 Recommended execution mode: inline execution with checkpoints. This change is small and crosses shared C/Metal code, so keeping one thread of context is cheaper than dispatching multiple workers.
+
+## Execution Result: 2026-06-21
+
+Implementation:
+
+- Commit: `16c4144 feat(mineru): keep decode logits resident`.
+- Added `mu_gpu_text_logits_argmax_ctx`.
+- Wired default `layer_resident` decode to keep final hidden state resident
+  through final norm, vocab projection, and argmax.
+- Added escape hatch: `MU_TEXT_DECODE_NO_RESIDENT_LOGITS=1`.
+- Kept the standalone `mu_gpu_text_logits_argmax` body unchanged. Refactoring it
+  into the `_ctx` helper would require sharing scratch allocator offsets with an
+  opaque command context and was not needed for the resident path.
+
+Verification run before the implementation commit:
+
+```text
+make -B mu-test mu
+MU_TIMING=1 ./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/text.json
+MU_TEXT_DECODE_NO_RESIDENT_LOGITS=1 MU_TIMING=1 ./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/text.json
+MU_TIMING=1 ./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/layout.json
+python3 -m unittest mineru.tests.test_mu_metal_kernel_sources mineru.tests.test_mu_text_timing_sources
+for f in mineru/tests/mu_metal_*.py; do python3 "$f"; done
+git diff --check
+```
+
+Two-page A/B artifacts:
+
+```text
+/tmp/mu-benchmark-metal-resident-logits-pages224-258.json
+/tmp/mu-benchmark-metal-no-resident-logits-pages224-258.json
+/tmp/mu-metal-resident-logits-pages224-258/metal_page_*.json
+/tmp/mu-metal-no-resident-logits-pages224-258/metal_page_*.json
+/tmp/mu-resident-logits-pages224-258.metrics.json
+```
+
+Two-page A/B result:
+
+| Path | Completed | Failed | Fallback rows | Total s | Mean wall s/page | Mean decode s/page |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Resident logits default | 2 / 2 | 0 | 0 | 202.4127 | 101.2063 | 38.3554 |
+| `MU_TEXT_DECODE_NO_RESIDENT_LOGITS=1` | 2 / 2 | 0 | 0 | 210.0852 | 105.0426 | 40.0556 |
+
+Speedups:
+
+- Total speedup: `1.0379x`.
+- `text_generate_decode` speedup: `1.0443x`.
+
+Output comparison:
+
+- Block count exact pages: `2 / 2`.
+- Ordered type accuracy: `1.0000`.
+- Mean content token F1: `1.0000`.
+- Table exact cell recall: `1.0000`.
+
+Gate decision:
+
+- Keep resident logits enabled by default because correctness is clean and the
+  change gives a small same-run improvement.
+- Keep `MU_TEXT_DECODE_NO_RESIDENT_LOGITS=1`.
+- Do not run the 10-page resident-logits gate. The two-page decode speedup is
+  below the `1.05x` continuation threshold.
+- Next target: `layout_vision_encode`.
+
+Timing note:
+
+- In the resident path, logits kernels share the decode command buffer. The
+  isolated `text_generate_decode_cached_logits` value is only host-side
+  dispatch/copy accounting; use `text_generate_decode` for the gate.
