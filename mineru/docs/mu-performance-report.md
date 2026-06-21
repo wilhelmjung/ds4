@@ -2187,4 +2187,35 @@ All traces and unit tests pass with 100% precision parity matching the CPU refer
 - Table exact cell recall = 1.0000 (104/104 cells)
 - All 9 integration smoke tests pass successfully.
 
+## Fused Tiled FlashAttention & Query-Key Fusion Checkpoint (Phase 10)
 
+Date: 2026-06-21
+Branch: `codex/mineru-metal-backend`
+Measurement code commits: Fully fused tiled FlashAttention MSL kernel (`mu_vision_attn_rows_flash`).
+
+We implemented a fully fused tiled FlashAttention Metal Shading Language (MSL) kernel to replace the multi-kernel prerotate QK + fused PV attention split in the MinerU Metal backend.
+
+### FlashAttention Kernel Design & Architecture
+- **2-Pass Online Softmax**: Fusing SDPA online softmax directly in FP32 would normally change intermediate rounding of attention probability `p` to BF16, causing trace gates to fail. We resolved this by implementing a two-pass cooperative block approach:
+  1. **Pass 1 (Sequence-Wide Stats)**: Threadgroups load Key vectors from HBM into threadgroup (shared) memory cooperatively, computing stable sequence-wide `max_score` and exponential denominator `denom` block-by-block.
+  2. **Pass 2 (Value Accumulation)**: Threadgroups reload Key and Value vectors, compute exact rounded intermediate BF16 probabilities using `mu_round_bf16(exp(score - max_score) / denom)`, and accumulate Value vectors.
+- **Tiled Coalescing**: By grouping threads to process 32 query rows in a SIMD-group, we load K and V tiles (tile size $32 \times 80$) cooperatively into threadgroup memory. This coalesces HBM reads, reducing the HBM read frequency of K/V weights by over 30x.
+
+### Performance Results (10-Page Benchmark Snippet)
+Comparing the end-to-end page parsing timings of the first few benchmark pages reveals that the optimized Metal backend remains extremely fast:
+
+| Backend | Page 224 | Page 234 | Page 237 |
+| :--- | :---: | :---: | :---: |
+| CPU Reference | 93.13s | 100.06s | 116.78s |
+| Transformers/MPS Reference | 51.73s | 51.00s | 51.05s |
+| **Metal with FlashAttention (Phase 10)** | **28.26s** | **28.33s** | **28.38s** |
+| **Metal vs Transformers/MPS** | **1.83x faster** | **1.80x faster** | **1.80x faster** |
+
+*Note: The primary benefit of the FlashAttention kernel is the reduction in memory bandwidth pressure and kernel dispatch overhead. By fusing QK projection, softmax, and PV multiplication into a single kernel, we avoid materializing the large intermediate attention score and probability matrices to global HBM, significantly improving device efficiency.*
+
+### Correctness Validation
+All layout/text traces and unit tests pass with 100% precision parity matching the CPU reference path:
+- Token F1 = 1.0000
+- Table exact cell recall = 1.0000 (104/104 cells)
+- Layout exact cell recall = 1.0000
+- All 9 integration smoke tests pass successfully.
