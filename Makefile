@@ -234,7 +234,7 @@ mu-test: mineru/tests/mu_test.o $(MU_OBJS)
 
 mu-dense-shape-bench: mineru/tests/mu_dense_shape_bench
 
-mineru/tests/mu_dense_shape_bench: mineru/tests/mu_dense_shape_bench.m mineru/mu_metal.o
+mineru/tests/mu_dense_shape_bench: mineru/tests/mu_dense_shape_bench.m $(MU_OBJS)
 	$(CC) $(OBJCFLAGS) -Imineru -o $@ $^ $(MU_LDLIBS) -framework Foundation -framework Metal
 else
 mu: mineru/mu_cli.o $(MU_OBJS)

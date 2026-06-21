@@ -90,6 +90,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> dense_f32_bias_probe_simd;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simd;
     id<MTLComputePipelineState> dense_bf16_bias_rows_tiled;
+    id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup;
     id<MTLComputePipelineState> text_attn_cached_simd;
     MPSMatrixMultiplication *dense_mps_1280_1280;
     MPSMatrixMultiplication *dense_mps_1280_2560;
@@ -600,6 +601,8 @@ int mu_gpu_create(mu_gpu **out) {
                                                               @"mu_dense_bf16_bias_rows_simd");
         gpu->dense_bf16_bias_rows_tiled = mu_gpu_make_pipeline(device, @"mu_dense.metal",
                                                                @"mu_dense_bf16_bias_rows_tiled");
+        gpu->dense_bf16_bias_rows_simdgroup = mu_gpu_make_pipeline(device, @"mu_dense.metal",
+                                                                   @"mu_dense_bf16_bias_rows_simdgroup");
         gpu->text_attn_cached_simd = mu_gpu_make_pipeline(device, @"mu_attn.metal",
                                                           @"mu_text_attn_cached_simd");
         gpu->text_prefill_rope_cache_update = mu_gpu_make_pipeline(device, @"mu_attn.metal",
@@ -647,6 +650,7 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->dense_f32_bias_probe_simd = nil;
     gpu->dense_bf16_bias_rows_simd = nil;
     gpu->dense_bf16_bias_rows_tiled = nil;
+    gpu->dense_bf16_bias_rows_simdgroup = nil;
     gpu->text_attn_cached_simd = nil;
     gpu->dense_mps_1280_1280 = nil;
     gpu->dense_mps_1280_2560 = nil;
@@ -2703,8 +2707,27 @@ int mu_gpu_dense_bf16_bias_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_bu
     id<MTLBuffer> bias_buf = (__bridge id<MTLBuffer>)bias.ptr;
     id<MTLBuffer> out_buf = (__bridge id<MTLBuffer>)out.ptr;
 
-    bool can_use_tiled = mu_gpu_dense_mps_shape(cols, out_cols) || mu_gpu_dense_mps_text_shape(cols, out_cols);
     bool request_mps = getenv("MU_DENSE_ROWS_MPS") != NULL;
+    bool use_simdgroup = mu_gpu_dense_mps_shape(cols, out_cols) &&
+                         ctx->gpu->dense_bf16_bias_rows_simdgroup &&
+                         getenv("MU_DENSE_ROWS_NO_SIMDGROUP") == NULL;
+    if (use_simdgroup && !request_mps) {
+        [ctx->encoder setComputePipelineState:ctx->gpu->dense_bf16_bias_rows_simdgroup];
+        [ctx->encoder setBuffer:x_buf offset:x.offset atIndex:0];
+        [ctx->encoder setBuffer:w_buf offset:w.offset atIndex:1];
+        [ctx->encoder setBuffer:bias_buf offset:bias.offset atIndex:2];
+        [ctx->encoder setBuffer:out_buf offset:out.offset atIndex:3];
+        [ctx->encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+        [ctx->encoder setBytes:&out_cols length:sizeof(out_cols) atIndex:5];
+        [ctx->encoder setBytes:&x_rows length:sizeof(x_rows) atIndex:6];
+
+        MTLSize grid = MTLSizeMake(((NSUInteger)out_cols + 31u) / 32u, ((NSUInteger)x_rows + 7u) / 8u, 1);
+        MTLSize threads = MTLSizeMake(32, 1, 1);
+        [ctx->encoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+        return 0;
+    }
+
+    bool can_use_tiled = mu_gpu_dense_mps_shape(cols, out_cols) || mu_gpu_dense_mps_text_shape(cols, out_cols);
     bool disable_mps = getenv("MU_DENSE_ROWS_NO_MPS") != NULL;
     if ((request_mps || !disable_mps) && can_use_tiled) {
         return mu_gpu_dense_bf16_bias_rows_mps_ctx(ctx, x, w, bias,
