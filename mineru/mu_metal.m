@@ -18,6 +18,20 @@ int mu_engine_hidden_size(const mu_engine *e);
 #include <string.h>
 
 #include <unistd.h>
+#include <sys/time.h>
+
+static double local_time_now_seconds(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+
+@protocol MTLCommandBufferProfiling <NSObject>
+@property (readonly) double kernelStartTime;
+@property (readonly) double kernelEndTime;
+@property (readonly) double gpuStartTime;
+@property (readonly) double gpuEndTime;
+@end
 
 #define MU_GPU_WEIGHT_CACHE_CAP 1024
 #define MU_GPU_DENSE_MPS_WEIGHT_CACHE_CAP 256
@@ -320,13 +334,97 @@ int mu_gpu_cmd_begin(mu_gpu *gpu, mu_gpu_cmd_ctx **out_ctx) {
     return 0;
 }
 
+void mu_gpu_cmd_set_label(mu_gpu_cmd_ctx *ctx, const char *label) {
+    if (ctx && ctx->command_buffer && label) {
+        @autoreleasepool {
+            ctx->command_buffer.label = [NSString stringWithUTF8String:label];
+        }
+    }
+}
+
 int mu_gpu_cmd_commit_and_wait(mu_gpu_cmd_ctx *ctx) {
     if (!ctx) return -1;
     int rc = 0;
     @autoreleasepool {
         if (ctx->encoder) [ctx->encoder endEncoding];
+
+        static int check_profile = -1;
+        if (check_profile == -1) {
+            const char *env = getenv("MU_LATENCY_PROFILE");
+            check_profile = (env && strcmp(env, "0") != 0) ? 1 : 0;
+        }
+
+        double t_commit_start = 0.0;
+        double t_commit_end = 0.0;
+        double t_wait_end = 0.0;
+
+        if (check_profile) {
+            t_commit_start = local_time_now_seconds();
+        }
+
         [ctx->command_buffer commit];
+
+        if (check_profile) {
+            t_commit_end = local_time_now_seconds();
+        }
+
         [ctx->command_buffer waitUntilCompleted];
+
+        if (check_profile) {
+            t_wait_end = local_time_now_seconds();
+            double kernel_start = 0.0;
+            double kernel_end = 0.0;
+            double gpu_start = 0.0;
+            double gpu_end = 0.0;
+
+            id<MTLCommandBufferProfiling> cb = (id<MTLCommandBufferProfiling>)ctx->command_buffer;
+            if ([cb respondsToSelector:@selector(kernelStartTime)]) {
+                kernel_start = cb.kernelStartTime;
+            }
+            if ([cb respondsToSelector:@selector(kernelEndTime)]) {
+                kernel_end = cb.kernelEndTime;
+            }
+            if ([cb respondsToSelector:@selector(gpuStartTime)]) {
+                gpu_start = cb.gpuStartTime;
+            }
+            if ([cb respondsToSelector:@selector(gpuEndTime)]) {
+                gpu_end = cb.gpuEndTime;
+            }
+
+            NSString *label = ctx->command_buffer.label;
+            const char *label_str = label ? [label UTF8String] : "unlabeled";
+
+            if (gpu_start > 0.0 && gpu_end > 0.0) {
+                fprintf(stderr, "[MU_LATENCY_PROFILE] command_buffer='%s'\n"
+                                "  CPU Enqueue (Commit call): %10.3f ms\n"
+                                "  Driver Scheduling Delay:  %10.3f ms\n"
+                                "  Queue Handoff Latency:    %10.3f ms\n"
+                                "  GPU Execution Time:       %10.3f ms\n"
+                                "  CPU Wait/Stall Time:      %10.3f ms\n"
+                                "  Total Command Buffer Lft: %10.3f ms\n",
+                        label_str,
+                        (t_commit_end - t_commit_start) * 1000.0,
+                        (kernel_end - kernel_start) * 1000.0,
+                        (gpu_start - kernel_end) * 1000.0,
+                        (gpu_end - gpu_start) * 1000.0,
+                        (t_wait_end - t_commit_end) * 1000.0,
+                        (t_wait_end - t_commit_start) * 1000.0);
+            } else {
+                fprintf(stderr, "[MU_LATENCY_PROFILE] command_buffer='%s'\n"
+                                "  CPU Enqueue (Commit call): %10.3f ms\n"
+                                "  Driver Scheduling Delay:  %10.3f ms\n"
+                                "  Queue Handoff Latency:           n/a (GPU timestamp unavailable)\n"
+                                "  GPU Execution Time:              n/a (GPU timestamp unavailable)\n"
+                                "  CPU Wait/Stall Time:      %10.3f ms\n"
+                                "  Total Command Buffer Lft: %10.3f ms\n",
+                        label_str,
+                        (t_commit_end - t_commit_start) * 1000.0,
+                        (kernel_end - kernel_start) * 1000.0,
+                        (t_wait_end - t_commit_end) * 1000.0,
+                        (t_wait_end - t_commit_start) * 1000.0);
+            }
+        }
+
         if (ctx->command_buffer.status != MTLCommandBufferStatusCompleted) {
             rc = -2;
         }
@@ -1487,6 +1585,7 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
         mu_gpu_cmd_ctx *ctx = NULL;
         int rc = mu_gpu_cmd_begin(gpu, &ctx);
         if (rc != 0) return rc;
+        mu_gpu_cmd_set_label(ctx, "vision_encode_vit_and_merger");
 
         unsigned long embed_bytes = (unsigned long)rows * 1280u * sizeof(float);
         unsigned long kv_bytes = (unsigned long)rows * 2560u * sizeof(float);
@@ -1696,6 +1795,7 @@ static int mu_gpu_text_layers_mlp_seq_engine(mu_gpu *gpu, void *engine,
         mu_gpu_cmd_ctx *ctx = NULL;
         int rc = mu_gpu_cmd_begin(gpu, &ctx);
         if (rc != 0) return rc;
+        mu_gpu_cmd_set_label(ctx, "text_prefill_seq");
 
         const int hidden = 896;
         const int inter = 4864;

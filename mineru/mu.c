@@ -2596,6 +2596,7 @@ static int mu_vision_block_output_all_layer_metal(mu_engine *e, int layer,
     mu_gpu_cmd_ctx *ctx = NULL;
     int rc = mu_gpu_cmd_begin(e->gpu, &ctx);
     if (rc != 0) return rc;
+    mu_gpu_cmd_set_label(ctx, "old_vision_encode_hidden");
 
     unsigned long embed_bytes = (unsigned long)rows * 1280u * sizeof(float);
     unsigned long kv_bytes = (unsigned long)rows * 2560u * sizeof(float);
@@ -4963,6 +4964,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                 mu_gpu_cmd_ctx *ctx = NULL;
                 rc = mu_gpu_cmd_begin(e->gpu, &ctx);
                 if (rc != 0) goto fail;
+                mu_gpu_cmd_set_label(ctx, "text_decode_qkv");
                 mu_gpu_buf normed_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
                 mu_gpu_buf k_buf = mu_gpu_scratch_alloc_a_ctx(ctx, kv_out * sizeof(float));
                 mu_gpu_buf v_buf = mu_gpu_scratch_alloc_a_ctx(ctx, kv_out * sizeof(float));
@@ -5009,6 +5011,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                 double attn_mlp_start = timing_stats ? mu_time_now_seconds() : 0.0;
                 rc = mu_gpu_cmd_begin(e->gpu, &ctx);
                 if (rc != 0) goto fail;
+                mu_gpu_cmd_set_label(ctx, "text_decode_attn_mlp");
                 mu_gpu_buf attn_buf = mu_gpu_scratch_alloc_a_ctx(ctx, q_out * sizeof(float));
                 mu_gpu_buf proj_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
                 mu_gpu_buf hs_buf2 = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
@@ -5068,6 +5071,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
             mu_gpu_cmd_ctx *ctx = NULL;
             rc = mu_gpu_cmd_begin(e->gpu, &ctx);
             if (rc != 0) goto fail;
+            mu_gpu_cmd_set_label(ctx, "text_decode_layer_resident");
 
             mu_gpu_buf cur_hs_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
             if (!cur_hs_buf.ptr) {
@@ -5216,6 +5220,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
             mu_gpu_cmd_ctx *ctx = NULL;
             rc = mu_gpu_cmd_begin(e->gpu, &ctx);
             if (rc != 0) goto fail;
+            mu_gpu_cmd_set_label(ctx, "text_decode_fallback_qkv");
 
             mu_gpu_buf hs_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
             mu_gpu_buf normed_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
@@ -5360,6 +5365,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
             double attn_mlp_start = timing_stats ? mu_time_now_seconds() : 0.0;
             rc = mu_gpu_cmd_begin(e->gpu, &ctx);
             if (rc != 0) goto fail;
+            mu_gpu_cmd_set_label(ctx, "text_decode_fallback_attn_mlp");
 
             mu_gpu_buf q_buf2 = mu_gpu_scratch_alloc_a_ctx(ctx, q_out * sizeof(float));
             mu_gpu_buf attn_buf = mu_gpu_scratch_alloc_a_ctx(ctx, q_out * sizeof(float));

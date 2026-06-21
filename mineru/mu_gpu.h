@@ -87,6 +87,7 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
 typedef struct mu_gpu_cmd_ctx mu_gpu_cmd_ctx;
 
 int mu_gpu_cmd_begin(mu_gpu *gpu, mu_gpu_cmd_ctx **ctx);
+void mu_gpu_cmd_set_label(mu_gpu_cmd_ctx *ctx, const char *label);
 int mu_gpu_cmd_commit_and_wait(mu_gpu_cmd_ctx *ctx);
 void mu_gpu_cmd_discard(mu_gpu_cmd_ctx *ctx);
 
