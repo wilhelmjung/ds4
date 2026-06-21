@@ -279,14 +279,22 @@ kernel void mu_dense_bf16_bias_rows_simdgroup(device const float *x [[buffer(0)]
 
         {
             int oc = col_start + (int)lane;
-            device const ushort *w_row = w + (size_t)oc * (size_t)cols;
-            for (int c_idx = 0; c_idx < 8; c_idx++) {
-                int c = k + c_idx;
-                float val = 0.0f;
-                if (oc < out_cols && c < cols) {
-                    val = mu_bf16_to_f32(w_row[c]);
+            if (oc < out_cols && k < cols) {
+                device const ushort4 *w_vec = (device const ushort4 *)(w + (size_t)oc * (size_t)cols + k);
+                ushort4 v0 = w_vec[0];
+                ushort4 v1 = w_vec[1];
+                shared_w[lane * 8 + 0] = mu_bf16_to_f32(v0.x);
+                shared_w[lane * 8 + 1] = mu_bf16_to_f32(v0.y);
+                shared_w[lane * 8 + 2] = mu_bf16_to_f32(v0.z);
+                shared_w[lane * 8 + 3] = mu_bf16_to_f32(v0.w);
+                shared_w[lane * 8 + 4] = mu_bf16_to_f32(v1.x);
+                shared_w[lane * 8 + 5] = mu_bf16_to_f32(v1.y);
+                shared_w[lane * 8 + 6] = mu_bf16_to_f32(v1.z);
+                shared_w[lane * 8 + 7] = mu_bf16_to_f32(v1.w);
+            } else {
+                for (int c_idx = 0; c_idx < 8; c_idx++) {
+                    shared_w[lane * 8 + c_idx] = 0.0f;
                 }
-                shared_w[lane * 8 + c_idx] = val;
             }
         }
 
@@ -326,4 +334,219 @@ kernel void mu_dense_bf16_bias_rows_simdgroup(device const float *x [[buffer(0)]
         }
     }
 }
+
+kernel void mu_dense_bf16_bias_rows_simdgroup_quick_gelu(device const float *x [[buffer(0)]],
+                                                        device const ushort *w [[buffer(1)]],
+                                                        device const ushort *bias [[buffer(2)]],
+                                                        device float *out [[buffer(3)]],
+                                                        constant int &cols [[buffer(4)]],
+                                                        constant int &out_cols [[buffer(5)]],
+                                                        constant int &x_rows [[buffer(6)]],
+                                                        uint2 tg [[threadgroup_position_in_grid]],
+                                                        uint lane [[thread_index_in_simdgroup]]) {
+    int row_start = (int)tg.y * 8;
+    int col_start = (int)tg.x * 32;
+
+    threadgroup float shared_x[8 * 8];
+    threadgroup float shared_w[32 * 8];
+
+    simdgroup_matrix<float, 8, 8> acc[4];
+    for (int b = 0; b < 4; b++) {
+        acc[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int k = 0; k < cols; k += 8) {
+        {
+            int idx0 = (int)lane * 2;
+            int idx1 = idx0 + 1;
+
+            int r0 = row_start + idx0 / 8;
+            int c0 = k + idx0 % 8;
+            float val0 = 0.0f;
+            if (r0 < x_rows && c0 < cols) {
+                val0 = x[(size_t)r0 * (size_t)cols + c0];
+            }
+            shared_x[idx0] = val0;
+
+            int r1 = row_start + idx1 / 8;
+            int c1 = k + idx1 % 8;
+            float val1 = 0.0f;
+            if (r1 < x_rows && c1 < cols) {
+                val1 = x[(size_t)r1 * (size_t)cols + c1];
+            }
+            shared_x[idx1] = val1;
+        }
+
+        {
+            int oc = col_start + (int)lane;
+            if (oc < out_cols && k < cols) {
+                device const ushort4 *w_vec = (device const ushort4 *)(w + (size_t)oc * (size_t)cols + k);
+                ushort4 v0 = w_vec[0];
+                ushort4 v1 = w_vec[1];
+                shared_w[lane * 8 + 0] = mu_bf16_to_f32(v0.x);
+                shared_w[lane * 8 + 1] = mu_bf16_to_f32(v0.y);
+                shared_w[lane * 8 + 2] = mu_bf16_to_f32(v0.z);
+                shared_w[lane * 8 + 3] = mu_bf16_to_f32(v0.w);
+                shared_w[lane * 8 + 4] = mu_bf16_to_f32(v1.x);
+                shared_w[lane * 8 + 5] = mu_bf16_to_f32(v1.y);
+                shared_w[lane * 8 + 6] = mu_bf16_to_f32(v1.z);
+                shared_w[lane * 8 + 7] = mu_bf16_to_f32(v1.w);
+            } else {
+                for (int c_idx = 0; c_idx < 8; c_idx++) {
+                    shared_w[lane * 8 + c_idx] = 0.0f;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_matrix<float, 8, 8> x_matrix;
+        simdgroup_load(x_matrix, shared_x, 8, ulong2(0, 0), false);
+
+        for (int b = 0; b < 4; b++) {
+            simdgroup_matrix<float, 8, 8> w_matrix;
+            simdgroup_load(w_matrix, shared_w + b * 64, 8, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc[b], x_matrix, w_matrix, acc[b]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float shared_out[8 * 32];
+    for (int b = 0; b < 4; b++) {
+        simdgroup_store(acc[b], shared_out + b * 8, 32, ulong2(0, 0), false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int step = 0; step < 8; step++) {
+        int linear_idx = step * 32 + (int)lane;
+        int r_offset = linear_idx / 32;
+        int c_offset = linear_idx % 32;
+
+        int r = row_start + r_offset;
+        int c = col_start + c_offset;
+
+        if (r < x_rows && c < out_cols) {
+            float val = shared_out[r_offset * 32 + c_offset];
+            float b_val = mu_bf16_to_f32(bias[c]);
+            float sum = val + b_val;
+            float act = sum / (1.0f + exp(-1.702f * sum));
+            out[(size_t)r * (size_t)out_cols + c] = mu_round_bf16(act);
+        }
+    }
+}
+
+static inline float mu_erf_approx(float x) {
+    float sign = x < 0.0f ? -1.0f : 1.0f;
+    float ax = abs(x);
+    float t = 1.0f / (1.0f + 0.3275911f * ax);
+    float poly = (((((1.061405429f * t - 1.453152027f) * t) +
+                    1.421413741f) * t - 0.284496736f) * t +
+                  0.254829592f) * t;
+    return sign * (1.0f - poly * exp(-ax * ax));
+}
+
+kernel void mu_dense_bf16_bias_rows_simdgroup_gelu(device const float *x [[buffer(0)]],
+                                                  device const ushort *w [[buffer(1)]],
+                                                  device const ushort *bias [[buffer(2)]],
+                                                  device float *out [[buffer(3)]],
+                                                  constant int &cols [[buffer(4)]],
+                                                  constant int &out_cols [[buffer(5)]],
+                                                  constant int &x_rows [[buffer(6)]],
+                                                  uint2 tg [[threadgroup_position_in_grid]],
+                                                  uint lane [[thread_index_in_simdgroup]]) {
+    int row_start = (int)tg.y * 8;
+    int col_start = (int)tg.x * 32;
+
+    threadgroup float shared_x[8 * 8];
+    threadgroup float shared_w[32 * 8];
+
+    simdgroup_matrix<float, 8, 8> acc[4];
+    for (int b = 0; b < 4; b++) {
+        acc[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int k = 0; k < cols; k += 8) {
+        {
+            int idx0 = (int)lane * 2;
+            int idx1 = idx0 + 1;
+
+            int r0 = row_start + idx0 / 8;
+            int c0 = k + idx0 % 8;
+            float val0 = 0.0f;
+            if (r0 < x_rows && c0 < cols) {
+                val0 = x[(size_t)r0 * (size_t)cols + c0];
+            }
+            shared_x[idx0] = val0;
+
+            int r1 = row_start + idx1 / 8;
+            int c1 = k + idx1 % 8;
+            float val1 = 0.0f;
+            if (r1 < x_rows && c1 < cols) {
+                val1 = x[(size_t)r1 * (size_t)cols + c1];
+            }
+            shared_x[idx1] = val1;
+        }
+
+        {
+            int oc = col_start + (int)lane;
+            if (oc < out_cols && k < cols) {
+                device const ushort4 *w_vec = (device const ushort4 *)(w + (size_t)oc * (size_t)cols + k);
+                ushort4 v0 = w_vec[0];
+                ushort4 v1 = w_vec[1];
+                shared_w[lane * 8 + 0] = mu_bf16_to_f32(v0.x);
+                shared_w[lane * 8 + 1] = mu_bf16_to_f32(v0.y);
+                shared_w[lane * 8 + 2] = mu_bf16_to_f32(v0.z);
+                shared_w[lane * 8 + 3] = mu_bf16_to_f32(v0.w);
+                shared_w[lane * 8 + 4] = mu_bf16_to_f32(v1.x);
+                shared_w[lane * 8 + 5] = mu_bf16_to_f32(v1.y);
+                shared_w[lane * 8 + 6] = mu_bf16_to_f32(v1.z);
+                shared_w[lane * 8 + 7] = mu_bf16_to_f32(v1.w);
+            } else {
+                for (int c_idx = 0; c_idx < 8; c_idx++) {
+                    shared_w[lane * 8 + c_idx] = 0.0f;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_matrix<float, 8, 8> x_matrix;
+        simdgroup_load(x_matrix, shared_x, 8, ulong2(0, 0), false);
+
+        for (int b = 0; b < 4; b++) {
+            simdgroup_matrix<float, 8, 8> w_matrix;
+            simdgroup_load(w_matrix, shared_w + b * 64, 8, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc[b], x_matrix, w_matrix, acc[b]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float shared_out[8 * 32];
+    for (int b = 0; b < 4; b++) {
+        simdgroup_store(acc[b], shared_out + b * 8, 32, ulong2(0, 0), false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int step = 0; step < 8; step++) {
+        int linear_idx = step * 32 + (int)lane;
+        int r_offset = linear_idx / 32;
+        int c_offset = linear_idx % 32;
+
+        int r = row_start + r_offset;
+        int c = col_start + c_offset;
+
+        if (r < x_rows && c < out_cols) {
+            float val = shared_out[r_offset * 32 + c_offset];
+            float b_val = mu_bf16_to_f32(bias[c]);
+            float sum = val + b_val;
+            float act = 0.5f * sum * (1.0f + mu_erf_approx(sum * 0.7071067811865476f));
+            out[(size_t)r * (size_t)out_cols + c] = mu_round_bf16(act);
+        }
+    }
+}
+
 

@@ -5118,10 +5118,6 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                 mu_gpu_buf attn_buf = mu_gpu_scratch_alloc_a_ctx(ctx, q_out * sizeof(float));
                 mu_gpu_buf proj_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
                 mu_gpu_buf hs_buf2 = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
-                mu_gpu_buf normed_buf2 = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
-                mu_gpu_buf gate_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
-                mu_gpu_buf up_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
-                mu_gpu_buf mid_buf = mu_gpu_scratch_alloc_a_ctx(ctx, inter * sizeof(float));
                 mu_gpu_buf out_hs_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
 
                 mu_gpu_buf input_norm_buf = mu_gpu_get_weight_buf(e->gpu, input_norm, hidden * sizeof(unsigned short));
@@ -5138,8 +5134,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                 mu_gpu_buf down_w_buf = mu_gpu_get_weight_buf(e->gpu, down_w, hidden * inter * sizeof(unsigned short));
 
                 if (!normed_buf.ptr || !q_buf.ptr || !k_buf.ptr || !v_buf.ptr ||
-                    !attn_buf.ptr || !proj_buf.ptr || !hs_buf2.ptr || !normed_buf2.ptr ||
-                    !gate_buf.ptr || !up_buf.ptr || !mid_buf.ptr || !out_hs_buf.ptr ||
+                    !attn_buf.ptr || !proj_buf.ptr || !hs_buf2.ptr || !out_hs_buf.ptr ||
                     !input_norm_buf.ptr || !qw_buf.ptr || !qb_buf.ptr || !kw_buf.ptr ||
                     !kb_buf.ptr || !vw_buf.ptr || !vb_buf.ptr || !ow_buf.ptr ||
                     !post_norm_buf.ptr || !gate_w_buf.ptr || !up_w_buf.ptr || !down_w_buf.ptr) {
@@ -5164,12 +5159,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                                                                        cache_pos + 1, attn_buf);
                 if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, attn_buf, ow_buf, proj_buf, hidden, hidden);
                 if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, cur_hs_buf, proj_buf, hs_buf2, hidden);
-                if (rc == 0) rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, hs_buf2, post_norm_buf, normed_buf2, hidden, eps);
-                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, gate_w_buf, gate_buf, inter, hidden);
-                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, up_w_buf, up_buf, inter, hidden);
-                if (rc == 0) rc = mu_gpu_silu_mul_f32_ctx(ctx, gate_buf, up_buf, mid_buf, inter);
-                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, mid_buf, down_w_buf, proj_buf, hidden, inter);
-                if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, hs_buf2, proj_buf, out_hs_buf, hidden);
+                if (rc == 0) rc = mu_gpu_text_decode_fused_ffn_ctx(ctx, hs_buf2, post_norm_buf, gate_w_buf, up_w_buf, down_w_buf, eps, out_hs_buf);
                 if (rc != 0) {
                     mu_gpu_cmd_discard(ctx);
                     goto fail;
