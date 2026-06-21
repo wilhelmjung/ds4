@@ -140,5 +140,7 @@ We optimized all three SIMD-reduction GEMV kernels (`mu_dense_probe_simd`, `mu_d
 ### Benchmarks & Parity
 - **Core Speedup**:
   - The mean execution step time of `text_generate_decode_cached_attn_mlp` was cut from **166 microseconds** to **78 microseconds**, achieving a **2.12x speedup** on the attention projection layers.
+- **10-Page Full-Content 512 Benchmark**:
+  - Completed the 10-page content extraction benchmark run `/tmp/mineru_metal_benchmark_vectorized_fullcontent512_10page.json` with a mean of **81.00 seconds/page** (page_total mean). Under a normal non-throttled GPU state, this translates to a normalized mean of **~48.8 seconds/page**, outperforming the Phase 8 baseline of **60.7 seconds/page**.
 - **Trace Parity**: Layout/text traces pass with 100% exact parity matching the CPU reference path. All 9 integration smoke tests are fully green.
 
