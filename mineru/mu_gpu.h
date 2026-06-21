@@ -118,8 +118,18 @@ int mu_gpu_text_attn_cached_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
                                 int cache_len, mu_gpu_buf out);
 int mu_gpu_layernorm_bf16_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf weight,
                                    mu_gpu_buf bias, int rows, int cols, float eps, mu_gpu_buf out);
+int mu_gpu_rmsnorm_bf16_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf weight,
+                                 int rows, int cols, float eps, mu_gpu_buf out);
 int mu_gpu_dense_bf16_bias_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
                                     mu_gpu_buf bias, int x_rows, int cols, int out_cols, mu_gpu_buf out);
+int mu_gpu_dense_f32_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
+                              int x_rows, int cols, int out_cols, mu_gpu_buf out);
+int mu_gpu_dense_f32_bias_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
+                                   mu_gpu_buf bias, int x_rows, int cols, int out_cols, mu_gpu_buf out);
+int mu_gpu_text_attn_seq_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q, mu_gpu_buf k,
+                             mu_gpu_buf v, int seq, mu_gpu_buf out);
+int mu_gpu_text_attn_seq_pos_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q, mu_gpu_buf k,
+                                 mu_gpu_buf v, mu_gpu_buf position_ids, int seq, mu_gpu_buf out);
 int mu_gpu_vision_attn_concat_probe_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q0, mu_gpu_buf kv,
                                         const float *rotary, int rows, int token_index, mu_gpu_buf out);
 int mu_gpu_vision_attn_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q, mu_gpu_buf kv,
@@ -152,5 +162,22 @@ int mu_gpu_text_logits_argmax(mu_gpu *gpu, const float *hidden_state_cpu,
                               const unsigned short *embed_bf16,
                               float eps, int hidden_dim, int vocab_dim,
                               int *out_id, float *out_val);
+
+const unsigned short *mu_engine_get_vision_block_tensor(void *engine, int layer, const char *suffix, int ndim, unsigned long d0, unsigned long d1);
+const unsigned short *mu_engine_get_vision_merger_tensor(void *engine, const char *name, int ndim, unsigned long d0, unsigned long d1);
+const unsigned short *mu_engine_get_text_layer_tensor(void *engine, int layer, const char *suffix, int ndim, unsigned long d0, unsigned long d1);
+int mu_gpu_text_layers_mlp_seq(mu_gpu *gpu, void *engine,
+                               const int *input_ids, int n_ids,
+                               int n_layers, float *out);
+int mu_gpu_text_layers_mlp_seq_from_hidden(mu_gpu *gpu, void *engine,
+                                           const float *initial_hidden,
+                                           int n_ids, const int *position_ids,
+                                           int n_layers, float *out);
+int mu_gpu_text_prefill_cache_from_embeddings(mu_gpu *gpu, void *engine,
+                                              const float *hidden_states,
+                                              int n_ids, const int *position_ids,
+                                              int cache_cap,
+                                              mu_gpu_kv_cache *gpu_cache,
+                                              float *last_hidden_out);
 
 #endif

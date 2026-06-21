@@ -3005,10 +3005,17 @@ static int mu_cpu_vision_encode(mu_engine *e, const float *patch_embeds,
     }
     float *hidden = (float *)malloc((size_t)rows * 1280u * sizeof(hidden[0]));
     if (!hidden) return -2;
+    int timing = mu_timing_enabled();
+    double stage_start = mu_time_now_seconds();
     int rc = mu_vision_encode_hidden(e, patch_embeds, rows, cols,
                                      rotary, rotary_rows, rotary_cols,
                                      hidden, rows, 1280);
-    if (rc == 0) rc = mu_vision_merger(e, hidden, rows, 1280, out, out_rows, out_cols);
+    mu_timing_log_stage(timing, "vision_encode_hidden", stage_start);
+    if (rc == 0) {
+        stage_start = mu_time_now_seconds();
+        rc = mu_vision_merger(e, hidden, rows, 1280, out, out_rows, out_cols);
+        mu_timing_log_stage(timing, "vision_encode_merger", stage_start);
+    }
     free(hidden);
     return rc == 0 ? 0 : -3;
 }
@@ -3019,40 +3026,19 @@ int mu_vision_encode(mu_engine *e, const float *patch_embeds,
                      float *out, int out_rows, int out_cols) {
 #if defined(__APPLE__)
     if (e && e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
-        if (patch_embeds && rotary && out &&
-            rows > 0 && cols == 1280 &&
-            rotary_rows == rows && rotary_cols == 40 &&
-            rows % 4 == 0 && out_rows == rows / 4 && out_cols == 896) {
-            float *hidden = (float *)malloc((size_t)rows * 1280u * sizeof(hidden[0]));
-            if (!hidden) {
-                int frc = mu_record_cpu_fallback(e, "vision_encode_alloc");
-                if (frc) return frc;
-            } else {
-                int timing = mu_timing_enabled();
-                double stage_start = mu_time_now_seconds();
-                int rc = mu_vision_encode_hidden(e, patch_embeds, rows, cols,
-                                                 rotary, rotary_rows, rotary_cols,
-                                                 hidden, rows, 1280);
-                mu_timing_log_stage(timing, "vision_encode_hidden", stage_start);
-                if (rc == 0) {
-                    stage_start = mu_time_now_seconds();
-                    rc = mu_vision_merger(e, hidden, rows, 1280,
-                                          out, out_rows, out_cols);
-                    mu_timing_log_stage(timing, "vision_encode_merger", stage_start);
-                }
-                free(hidden);
-                if (rc == 0) {
-                    mu_record_metal_stage(e, "vision_encode");
-                    return 0;
-                }
-                rc = mu_record_cpu_fallback(e, "vision_encode");
-                if (rc) return rc;
-            }
-        }
+        int timing = mu_timing_enabled();
+        double stage_start = mu_time_now_seconds();
         int rc = mu_gpu_vision_encode(e->gpu, e, patch_embeds, rows, cols,
                                       rotary, rotary_rows, rotary_cols,
                                       out, out_rows, out_cols);
-        if (rc == 0) return 0;
+        mu_timing_log_stage(timing, "vision_encode", stage_start);
+        if (rc == 0) {
+            mu_record_metal_stage(e, "vision_encode");
+            return 0;
+        }
+        if (getenv("MU_METAL_DEBUG")) {
+            fprintf(stderr, "DEBUG: mu_gpu_vision_encode failed with rc = %d\n", rc);
+        }
         rc = mu_record_cpu_fallback(e, "vision_encode");
         if (rc) return rc;
     }
@@ -3091,8 +3077,8 @@ static int mu_text_attention_f32(const float *q, const float *k, const float *v,
                                  int seq, float *out);
 static int mu_text_prefill_cache_from_embeddings(mu_engine *e, float *hidden_states,
                                                  int n_ids, const int *position_ids,
-                                                 int cache_cap, float *k_cache,
-                                                 float *v_cache,
+                                                 int cache_cap, mu_gpu_kv_cache *gpu_cache,
+                                                 float *k_cache, float *v_cache,
                                                  int top_k, mu_token_logit *out,
                                                  mu_text_prefill_timing *timing_stats);
 static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
@@ -3543,6 +3529,19 @@ static const uint16_t *mu_text_layer_tensor_bf16(const mu_engine *e, int layer,
     return mu_tensor_bf16(e, name, ndim, d0, d1);
 }
 
+const unsigned short *mu_engine_get_vision_block_tensor(void *engine, int layer, const char *suffix, int ndim, unsigned long d0, unsigned long d1) {
+    return (const unsigned short *)mu_vision_block_tensor_bf16((const mu_engine *)engine, layer, suffix, ndim, d0, d1);
+}
+
+const unsigned short *mu_engine_get_vision_merger_tensor(void *engine, const char *name, int ndim, unsigned long d0, unsigned long d1) {
+    return (const unsigned short *)mu_tensor_bf16((const mu_engine *)engine, name, ndim, d0, d1);
+}
+
+const unsigned short *mu_engine_get_text_layer_tensor(void *engine, int layer, const char *suffix, int ndim, unsigned long d0, unsigned long d1) {
+    return (const unsigned short *)mu_text_layer_tensor_bf16((const mu_engine *)engine, layer, suffix, ndim, d0, d1);
+}
+
+
 static void mu_record_text_layer_seq_stage(const mu_engine *e, int layer,
                                            const char *suffix) {
     char stage[96];
@@ -3831,6 +3830,14 @@ int mu_text_layers_mlp_seq(mu_engine *e, const int *input_ids, int n_ids,
         out_cols != 896) {
         return -1;
     }
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        int rc = mu_gpu_text_layers_mlp_seq(e->gpu, e, input_ids, n_ids, n_layers, out);
+        if (rc == 0) return 0;
+        rc = mu_record_cpu_fallback(e, "text_layers_mlp_seq");
+        if (rc) return rc;
+    }
+#endif
     const int hidden = 896;
     const int vocab = 151936;
     const uint16_t *embed = mu_tensor_bf16(e, "model.embed_tokens.weight", 2, vocab, hidden);
@@ -3885,6 +3892,14 @@ static int mu_text_layers_mlp_seq_from_hidden(mu_engine *e,
         n_layers <= 0 || n_layers > e->cfg.text_layers || !out) {
         return -1;
     }
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        int rc = mu_gpu_text_layers_mlp_seq_from_hidden(e->gpu, e, initial_hidden, n_ids, position_ids, n_layers, out);
+        if (rc == 0) return 0;
+        rc = mu_record_cpu_fallback(e, "text_layers_mlp_seq_from_hidden");
+        if (rc) return rc;
+    }
+#endif
     const int hidden = 896;
     float *a = (float *)malloc((size_t)n_ids * hidden * sizeof(a[0]));
     float *b = (float *)malloc((size_t)n_ids * hidden * sizeof(b[0]));
@@ -4476,7 +4491,7 @@ int mu_text_generate_greedy(mu_engine *e, const int *input_ids, int n_ids,
         double stage_start = mu_time_now_seconds();
         mu_text_prefill_timing prefill_timing = {0};
         int rc = mu_text_prefill_cache_from_embeddings(e, hidden_states, n_ids, NULL,
-                                                       cap, k_cache, v_cache, 8, top,
+                                                       cap, gpu_cache, k_cache, v_cache, 8, top,
                                                        timing ? &prefill_timing : NULL);
         mu_timing_log_stage(timing, "text_generate_prefill", stage_start);
         if (timing && prefill_timing.layers > 0) {
@@ -4497,7 +4512,7 @@ int mu_text_generate_greedy(mu_engine *e, const int *input_ids, int n_ids,
             if (gpu_cache) mu_gpu_kv_cache_destroy(gpu_cache);
             return -5;
         }
-        if (gpu_cache) {
+        if (gpu_cache && e->opt.backend != MU_BACKEND_METAL) {
             stage_start = mu_time_now_seconds();
             mu_gpu_kv_cache_upload_all(gpu_cache, k_cache, v_cache);
             mu_timing_log_stage(timing, "text_generate_cache_upload", stage_start);
@@ -4678,8 +4693,8 @@ static size_t mu_text_cache_offset(int layer, int pos, int cache_cap) {
 
 static int mu_text_prefill_cache_from_embeddings(mu_engine *e, float *hidden_states,
                                                  int n_ids, const int *position_ids,
-                                                 int cache_cap, float *k_cache,
-                                                 float *v_cache,
+                                                 int cache_cap, mu_gpu_kv_cache *gpu_cache,
+                                                 float *k_cache, float *v_cache,
                                                  int top_k, mu_token_logit *out,
                                                  mu_text_prefill_timing *timing_stats) {
     if (!e || !hidden_states || n_ids <= 0 ||
@@ -4694,51 +4709,32 @@ static int mu_text_prefill_cache_from_embeddings(mu_engine *e, float *hidden_sta
 
 #if defined(__APPLE__)
     if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
-        float *a = (float *)malloc((size_t)n_ids * hidden * sizeof(a[0]));
-        float *b = (float *)malloc((size_t)n_ids * hidden * sizeof(b[0]));
-        if (!a || !b) {
-            free(a);
-            free(b);
+        float *last_hidden = (float *)malloc(hidden * sizeof(float));
+        if (!last_hidden) {
             int frc = mu_record_cpu_fallback(e, "text_prefill_cache_alloc");
             if (frc) return frc;
         } else {
-            memcpy(a, hidden_states, (size_t)n_ids * hidden * sizeof(a[0]));
-            float *src = a;
-            float *dst = b;
-            int rc = 0;
-            for (int layer = 0; layer < e->cfg.text_layers; layer++) {
-                rc = mu_text_layer_mlp_seq_from_hidden(e, layer, src, position_ids,
-                                                       n_ids, cache_cap,
-                                                       k_cache, v_cache, dst,
-                                                       timing_stats);
-                if (rc != 0) break;
-                float *tmp = src;
-                src = dst;
-                dst = tmp;
-            }
+            int rc = mu_gpu_text_prefill_cache_from_embeddings(e->gpu, e, hidden_states, n_ids,
+                                                               position_ids, cache_cap, gpu_cache,
+                                                               last_hidden);
             if (rc == 0) {
                 double logits_start = timing_stats ? mu_time_now_seconds() : 0.0;
-                int top_rc = mu_text_top_logits_from_last_hidden(
-                    e, src + (size_t)(n_ids - 1) * hidden, top_k, out);
+                int top_rc = mu_text_top_logits_from_last_hidden(e, last_hidden, top_k, out);
                 if (timing_stats) {
                     timing_stats->logits += mu_time_now_seconds() - logits_start;
                 }
-                if (top_rc == top_k) {
-                    free(a);
-                    free(b);
-                    return top_k;
-                }
+                free(last_hidden);
+                if (top_rc == top_k) return top_k;
                 rc = top_rc;
+            } else {
+                free(last_hidden);
             }
-            free(a);
-            free(b);
-            if (rc != 0) {
-                int frc = mu_record_cpu_fallback(e, "text_prefill_cache");
-                if (frc) return frc;
-            }
+            int frc = mu_record_cpu_fallback(e, "text_prefill_cache");
+            if (frc) return frc;
         }
     }
 #endif
+
 
     float *residual = (float *)malloc((size_t)n_ids * hidden * sizeof(float));
     float *normed = (float *)malloc((size_t)n_ids * hidden * sizeof(float));
@@ -5056,6 +5052,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
             }
             mu_gpu_buf_copy_from(hidden_state, cur_hs_buf, hidden_bytes);
             mu_record_metal_stage(e, "text_cached_hidden_resident");
+            mu_record_metal_stage(e, "text_cached_attn");
             double logits_start = timing_stats ? mu_time_now_seconds() : 0.0;
             int top_rc = mu_text_top_logits_from_last_hidden(e, hidden_state, top_k, out);
             if (timing_stats) {
@@ -5183,6 +5180,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
             if (rc != 0) goto fail;
             mu_gpu_buf_copy_from(hidden_state, cur_hs_buf, hidden * sizeof(float));
             mu_record_metal_stage(e, "text_cached_layer_resident");
+            mu_record_metal_stage(e, "text_cached_attn");
             double logits_start = timing_stats ? mu_time_now_seconds() : 0.0;
             int top_rc = mu_text_top_logits_from_last_hidden(e, hidden_state, top_k, out);
             if (timing_stats) {
@@ -5602,7 +5600,7 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
     double stage_start = mu_time_now_seconds();
     mu_text_prefill_timing prefill_timing = {0};
     int rc = mu_text_prefill_cache_from_embeddings(e, hidden_states, n_ids, pos,
-                                                   cap, k_cache, v_cache, 8, top,
+                                                   cap, gpu_cache, k_cache, v_cache, 8, top,
                                                    timing ? &prefill_timing : NULL);
     mu_timing_log_stage(timing, "text_generate_prefill", stage_start);
     if (timing && prefill_timing.layers > 0) {
@@ -5622,7 +5620,7 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
         }
         return -8;
     }
-    if (gpu_cache) {
+    if (gpu_cache && e->opt.backend != MU_BACKEND_METAL) {
         stage_start = mu_time_now_seconds();
         mu_gpu_kv_cache_upload_all(gpu_cache, k_cache, v_cache);
         mu_timing_log_stage(timing, "text_generate_cache_upload", stage_start);

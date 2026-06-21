@@ -345,3 +345,47 @@ kernel void mu_text_attn_cached_simd(device const float *q [[buffer(0)]],
     oh[tid] = acc0;
     oh[tid + 32] = acc1;
 }
+
+kernel void mu_text_prefill_rope_cache_update(device const float *k [[buffer(0)]],
+                                              device const float *v [[buffer(1)]],
+                                              device const int *position_ids [[buffer(2)]],
+                                              device float *k_cache [[buffer(3)]],
+                                              device float *v_cache [[buffer(4)]],
+                                              constant int &seq [[buffer(5)]],
+                                              constant int &cache_cap [[buffer(6)]],
+                                              constant int &layer [[buffer(7)]],
+                                              uint2 gid [[thread_position_in_grid]]) {
+    int t = (int)gid.x;
+    int head = (int)gid.y;
+    if (t >= seq || head >= 2) return;
+
+    const int head_dim = 64;
+    size_t base_k = ((size_t)t * 2u + (size_t)head) * head_dim;
+    size_t base_cache = (((size_t)layer * (size_t)cache_cap) + (size_t)t) * 128u + (size_t)head * 64u;
+
+    for (int d = 0; d < 32; d++) {
+        int axis = mu_text_rope_axis(d);
+        int pos = position_ids[(size_t)axis * (size_t)seq + (size_t)t];
+        float inv = pow(1000000.0f, -((float)(2 * d) / 64.0f));
+        float angle = (float)pos * inv;
+        float c = cos(angle);
+        float s = sin(angle);
+
+        float lo = k[base_k + d];
+        float hi = k[base_k + d + 32];
+        float rot_lo = lo * c - hi * s;
+        float rot_hi = hi * c + lo * s;
+
+        k_cache[base_cache + (size_t)d] = rot_lo;
+        k_cache[base_cache + (size_t)d + 32u] = rot_hi;
+    }
+
+    if (head == 0) {
+        size_t base_v = (size_t)t * 128u;
+        size_t base_v_cache = (((size_t)layer * (size_t)cache_cap) + (size_t)t) * 128u;
+        for (int d = 0; d < 128; d++) {
+            v_cache[base_v_cache + d] = v[base_v + d];
+        }
+    }
+}
+
