@@ -87,6 +87,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> vision_merge4;
     id<MTLComputePipelineState> argmax_f32;
     id<MTLComputePipelineState> dense_probe_simd;
+    id<MTLComputePipelineState> dense_probe_add_simd;
     id<MTLComputePipelineState> dense_bf16_bias_probe_simd;
     id<MTLComputePipelineState> dense_f32_bias_probe_simd;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simd;
@@ -94,12 +95,15 @@ struct mu_gpu {
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_quick_gelu;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_gelu;
+    id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_qkv;
     id<MTLComputePipelineState> text_decode_fused_ffn;
+    id<MTLComputePipelineState> text_decode_qkv_proj_simd;
     id<MTLComputePipelineState> text_attn_cached_simd;
     id<MTLComputePipelineState> text_prefill_attn_flash;
     id<MTLComputePipelineState> text_prefill_attn_pos_flash;
     MPSMatrixMultiplication *dense_mps_1280_1280;
     MPSMatrixMultiplication *dense_mps_1280_2560;
+    MPSMatrixMultiplication *dense_mps_1280_3840;
     MPSMatrixMultiplication *dense_mps_1280_5120;
     MPSMatrixMultiplication *dense_mps_5120_1280;
     MPSMatrixMultiplication *dense_mps_896_896;
@@ -108,6 +112,7 @@ struct mu_gpu {
     MPSMatrixMultiplication *dense_mps_4864_896;
     int dense_mps_1280_1280_rows;
     int dense_mps_1280_2560_rows;
+    int dense_mps_1280_3840_rows;
     int dense_mps_1280_5120_rows;
     int dense_mps_5120_1280_rows;
     int dense_mps_896_896_rows;
@@ -139,6 +144,8 @@ struct mu_gpu_kv_cache {
     int layers;
     int cap;
 };
+
+static bool mu_gpu_dense_mps_shape(int cols, int out_cols);
 
 static MPSMatrixMultiplication *mu_gpu_dense_mps_kernel(mu_gpu *gpu,
                                                        int rows, int cols, int out_cols);
@@ -601,6 +608,8 @@ int mu_gpu_create(mu_gpu **out) {
                                                @"mu_argmax_f32");
         gpu->dense_probe_simd = mu_gpu_make_pipeline(device, @"mu_dense.metal",
                                                      @"mu_dense_probe_simd");
+        gpu->dense_probe_add_simd = mu_gpu_make_pipeline(device, @"mu_dense.metal",
+                                                         @"mu_dense_probe_add_simd");
         gpu->dense_bf16_bias_probe_simd = mu_gpu_make_pipeline(device, @"mu_dense.metal",
                                                                @"mu_dense_bf16_bias_probe_simd");
         gpu->dense_f32_bias_probe_simd = mu_gpu_make_pipeline(device, @"mu_dense.metal",
@@ -615,8 +624,12 @@ int mu_gpu_create(mu_gpu **out) {
                                                                               @"mu_dense_bf16_bias_rows_simdgroup_quick_gelu");
         gpu->dense_bf16_bias_rows_simdgroup_gelu = mu_gpu_make_pipeline(device, @"mu_dense.metal",
                                                                         @"mu_dense_bf16_bias_rows_simdgroup_gelu");
+        gpu->dense_bf16_bias_rows_simdgroup_qkv = mu_gpu_make_pipeline(device, @"mu_dense.metal",
+                                                                       @"mu_dense_bf16_bias_rows_simdgroup_qkv");
         gpu->text_decode_fused_ffn = mu_gpu_make_pipeline(device, @"mu_text_fused_ffn.metal",
                                                           @"mu_text_decode_fused_ffn");
+        gpu->text_decode_qkv_proj_simd = mu_gpu_make_pipeline(device, @"mu_dense.metal",
+                                                              @"mu_text_decode_qkv_proj_simd");
         gpu->text_attn_cached_simd = mu_gpu_make_pipeline(device, @"mu_attn.metal",
                                                           @"mu_text_attn_cached_simd");
         gpu->text_prefill_rope_cache_update = mu_gpu_make_pipeline(device, @"mu_attn.metal",
@@ -664,6 +677,7 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->vision_merge4 = nil;
     gpu->argmax_f32 = nil;
     gpu->dense_probe_simd = nil;
+    gpu->dense_probe_add_simd = nil;
     gpu->dense_bf16_bias_probe_simd = nil;
     gpu->dense_f32_bias_probe_simd = nil;
     gpu->dense_bf16_bias_rows_simd = nil;
@@ -671,10 +685,13 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->dense_bf16_bias_rows_simdgroup = nil;
     gpu->dense_bf16_bias_rows_simdgroup_quick_gelu = nil;
     gpu->dense_bf16_bias_rows_simdgroup_gelu = nil;
+    gpu->dense_bf16_bias_rows_simdgroup_qkv = nil;
     gpu->text_decode_fused_ffn = nil;
+    gpu->text_decode_qkv_proj_simd = nil;
     gpu->text_attn_cached_simd = nil;
     gpu->dense_mps_1280_1280 = nil;
     gpu->dense_mps_1280_2560 = nil;
+    gpu->dense_mps_1280_3840 = nil;
     gpu->dense_mps_1280_5120 = nil;
     gpu->dense_mps_5120_1280 = nil;
     gpu->dense_mps_896_896 = nil;
@@ -1697,15 +1714,39 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
             rc = mu_gpu_layernorm_bf16_rows_ctx(ctx, current_in, norm1_w_buf, norm1_b_buf, rows, 1280, 1e-6f, temp_normed);
             if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
 
-            rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, temp_normed, qkv_w_buf, qkv_b_buf, rows, 1280, 1280, temp_q);
-            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+            bool request_mps = getenv("MU_DENSE_ROWS_MPS") != NULL;
+            bool use_simdgroup = mu_gpu_dense_mps_shape(1280, 3840) &&
+                                 gpu->dense_bf16_bias_rows_simdgroup_qkv &&
+                                 getenv("MU_DENSE_ROWS_NO_SIMDGROUP") == NULL &&
+                                 !request_mps;
 
-            mu_gpu_buf kv_w_buf = mu_gpu_get_weight_buf(gpu, qkv_w + (size_t)1280 * 1280, 2560 * 1280 * sizeof(unsigned short));
-            mu_gpu_buf kv_b_buf = mu_gpu_get_weight_buf(gpu, qkv_b + 1280, 2560 * sizeof(unsigned short));
-            if (!kv_w_buf.ptr || !kv_b_buf.ptr) { mu_gpu_cmd_discard(ctx); return -5; }
+            if (use_simdgroup) {
+                [ctx->encoder setComputePipelineState:gpu->dense_bf16_bias_rows_simdgroup_qkv];
+                [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_normed.ptr offset:temp_normed.offset atIndex:0];
+                [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)qkv_w_buf.ptr offset:qkv_w_buf.offset atIndex:1];
+                [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)qkv_b_buf.ptr offset:qkv_b_buf.offset atIndex:2];
+                [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_q.ptr offset:temp_q.offset atIndex:3];
+                [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_kv.ptr offset:temp_kv.offset atIndex:4];
+                int cols = 1280;
+                int out_cols = 3840;
+                [ctx->encoder setBytes:&cols length:sizeof(cols) atIndex:5];
+                [ctx->encoder setBytes:&out_cols length:sizeof(out_cols) atIndex:6];
+                [ctx->encoder setBytes:&rows length:sizeof(rows) atIndex:7];
 
-            rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, temp_normed, kv_w_buf, kv_b_buf, rows, 1280, 2560, temp_kv);
-            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+                MTLSize grid = MTLSizeMake(((NSUInteger)3840 + 31u) / 32u, ((NSUInteger)rows + 7u) / 8u, 1);
+                MTLSize threads = MTLSizeMake(32, 1, 1);
+                [ctx->encoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+            } else {
+                rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, temp_normed, qkv_w_buf, qkv_b_buf, rows, 1280, 1280, temp_q);
+                if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+
+                mu_gpu_buf kv_w_buf = mu_gpu_get_weight_buf(gpu, qkv_w + (size_t)1280 * 1280, 2560 * 1280 * sizeof(unsigned short));
+                mu_gpu_buf kv_b_buf = mu_gpu_get_weight_buf(gpu, qkv_b + 1280, 2560 * sizeof(unsigned short));
+                if (!kv_w_buf.ptr || !kv_b_buf.ptr) { mu_gpu_cmd_discard(ctx); return -5; }
+
+                rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, temp_normed, kv_w_buf, kv_b_buf, rows, 1280, 2560, temp_kv);
+                if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+            }
 
             if (rows <= 16) {
                 for (int r = 0; rc == 0 && r < rows; r++) {
@@ -2298,6 +2339,77 @@ int mu_gpu_dense_f32_bias_probe_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_bu
     return 0;
 }
 
+int mu_gpu_text_decode_qkv_proj_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x,
+                                    mu_gpu_buf qw, mu_gpu_buf qb,
+                                    mu_gpu_buf kw, mu_gpu_buf kb,
+                                    mu_gpu_buf vw, mu_gpu_buf vb,
+                                    mu_gpu_buf q_out, mu_gpu_buf k_out, mu_gpu_buf v_out,
+                                    int cols) {
+    if (!ctx || !x.ptr || !qw.ptr || !qb.ptr || !kw.ptr || !kb.ptr || !vw.ptr || !vb.ptr ||
+        !q_out.ptr || !k_out.ptr || !v_out.ptr || cols <= 0) return -1;
+    if (!ctx->gpu->text_decode_qkv_proj_simd) return -2;
+
+    id<MTLBuffer> x_buf = (__bridge id<MTLBuffer>)x.ptr;
+    id<MTLBuffer> qw_buf = (__bridge id<MTLBuffer>)qw.ptr;
+    id<MTLBuffer> qb_buf = (__bridge id<MTLBuffer>)qb.ptr;
+    id<MTLBuffer> kw_buf = (__bridge id<MTLBuffer>)kw.ptr;
+    id<MTLBuffer> kb_buf = (__bridge id<MTLBuffer>)kb.ptr;
+    id<MTLBuffer> vw_buf = (__bridge id<MTLBuffer>)vw.ptr;
+    id<MTLBuffer> vb_buf = (__bridge id<MTLBuffer>)vb.ptr;
+    id<MTLBuffer> q_out_buf = (__bridge id<MTLBuffer>)q_out.ptr;
+    id<MTLBuffer> k_out_buf = (__bridge id<MTLBuffer>)k_out.ptr;
+    id<MTLBuffer> v_out_buf = (__bridge id<MTLBuffer>)v_out.ptr;
+
+    [ctx->encoder setComputePipelineState:ctx->gpu->text_decode_qkv_proj_simd];
+    [ctx->encoder setBuffer:x_buf offset:x.offset atIndex:0];
+    [ctx->encoder setBuffer:qw_buf offset:qw.offset atIndex:1];
+    [ctx->encoder setBuffer:qb_buf offset:qb.offset atIndex:2];
+    [ctx->encoder setBuffer:kw_buf offset:kw.offset atIndex:3];
+    [ctx->encoder setBuffer:kb_buf offset:kb.offset atIndex:4];
+    [ctx->encoder setBuffer:vw_buf offset:vw.offset atIndex:5];
+    [ctx->encoder setBuffer:vb_buf offset:vb.offset atIndex:6];
+    [ctx->encoder setBuffer:q_out_buf offset:q_out.offset atIndex:7];
+    [ctx->encoder setBuffer:k_out_buf offset:k_out.offset atIndex:8];
+    [ctx->encoder setBuffer:v_out_buf offset:v_out.offset atIndex:9];
+    [ctx->encoder setBytes:&cols length:sizeof(cols) atIndex:10];
+
+    MTLSize grid = MTLSizeMake(32, 1152, 1);
+    MTLSize threads = MTLSizeMake(32, 1, 1);
+    [ctx->encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+
+    return 0;
+}
+
+int mu_gpu_dense_probe_add_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
+                               mu_gpu_buf residual, mu_gpu_buf out, int rows, int cols) {
+    if (!ctx || !x.ptr || !w.ptr || !residual.ptr || !out.ptr || rows <= 0 || cols <= 0) return -1;
+    if (getenv("MU_TEXT_DECODE_NO_PROBE_ADD_FUSION") || !ctx->gpu->dense_probe_add_simd) {
+        mu_gpu_buf proj = mu_gpu_scratch_alloc_a_ctx(ctx, (unsigned long)rows * sizeof(float));
+        if (!proj.ptr) return -2;
+        int rc = mu_gpu_dense_probe_ctx(ctx, x, w, proj, rows, cols);
+        if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, residual, proj, out, rows);
+        return rc;
+    }
+
+    id<MTLBuffer> x_buf = (__bridge id<MTLBuffer>)x.ptr;
+    id<MTLBuffer> w_buf = (__bridge id<MTLBuffer>)w.ptr;
+    id<MTLBuffer> res_buf = (__bridge id<MTLBuffer>)residual.ptr;
+    id<MTLBuffer> out_buf = (__bridge id<MTLBuffer>)out.ptr;
+
+    [ctx->encoder setComputePipelineState:ctx->gpu->dense_probe_add_simd];
+    [ctx->encoder setBuffer:x_buf offset:x.offset atIndex:0];
+    [ctx->encoder setBuffer:w_buf offset:w.offset atIndex:1];
+    [ctx->encoder setBuffer:res_buf offset:residual.offset atIndex:2];
+    [ctx->encoder setBuffer:out_buf offset:out.offset atIndex:3];
+    [ctx->encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+
+    MTLSize grid = MTLSizeMake(32, (NSUInteger)rows, 1);
+    MTLSize threads = MTLSizeMake(32, 1, 1);
+    [ctx->encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+
+    return 0;
+}
+
 int mu_gpu_dense_probe_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
                            mu_gpu_buf out, int rows, int cols) {
     if (!ctx || !x.ptr || !w.ptr || !out.ptr || rows <= 0 || cols <= 0) return -1;
@@ -2452,7 +2564,7 @@ int mu_gpu_layernorm_bf16_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf
 }
 
 static bool mu_gpu_dense_mps_shape(int cols, int out_cols) {
-    return (cols == 1280 && (out_cols == 1280 || out_cols == 2560 || out_cols == 5120)) ||
+    return (cols == 1280 && (out_cols == 1280 || out_cols == 2560 || out_cols == 3840 || out_cols == 5120)) ||
            (cols == 5120 && out_cols == 1280);
 }
 
@@ -2494,6 +2606,21 @@ static MPSMatrixMultiplication *mu_gpu_dense_mps_kernel(mu_gpu *gpu,
             gpu->dense_mps_1280_2560_rows = rows;
         }
         return gpu->dense_mps_1280_2560;
+    }
+    if (cols == 1280 && out_cols == 3840) {
+        if (!gpu->dense_mps_1280_3840 || gpu->dense_mps_1280_3840_rows != rows) {
+            gpu->dense_mps_1280_3840 =
+                [[MPSMatrixMultiplication alloc] initWithDevice:gpu->device
+                                                  transposeLeft:NO
+                                                 transposeRight:YES
+                                                     resultRows:(NSUInteger)rows
+                                                  resultColumns:3840
+                                                interiorColumns:1280
+                                                          alpha:1.0
+                                                           beta:0.0];
+            gpu->dense_mps_1280_3840_rows = rows;
+        }
+        return gpu->dense_mps_1280_3840;
     }
     if (cols == 1280 && out_cols == 5120) {
         if (!gpu->dense_mps_1280_5120 || gpu->dense_mps_1280_5120_rows != rows) {

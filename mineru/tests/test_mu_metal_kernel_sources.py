@@ -148,6 +148,22 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn("text_decode_resident_logits", source)
         self.assertIn("mu_gpu_text_logits_argmax_ctx(ctx", source)
 
+    def test_text_decoder_projection_fusion_kernels_are_wired(self):
+        metal = (ROOT / "mineru/metal/mu_dense.metal").read_text()
+        header = (ROOT / "mineru/mu_gpu.h").read_text()
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+        source = (ROOT / "mineru/mu.c").read_text()
+
+        self.assertIn("kernel void mu_text_decode_qkv_proj_simd", metal)
+        self.assertIn("kernel void mu_dense_probe_add_simd", metal)
+        self.assertIn("mu_gpu_text_decode_qkv_proj_ctx", header)
+        self.assertIn("mu_gpu_dense_probe_add_ctx", header)
+        self.assertIn('"mu_text_decode_qkv_proj_simd"', host)
+        self.assertIn('"mu_dense_probe_add_simd"', host)
+        self.assertIn('getenv("MU_TEXT_DECODE_NO_PROBE_ADD_FUSION")', host)
+        self.assertIn("mu_gpu_text_decode_qkv_proj_ctx(ctx", source)
+        self.assertIn("mu_gpu_dense_probe_add_ctx(ctx", source)
+
     def test_text_prefill_flash_attention_is_wired(self):
         metal = (ROOT / "mineru/metal/mu_attn.metal").read_text()
         host = (ROOT / "mineru/mu_metal.m").read_text()

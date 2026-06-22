@@ -4982,9 +4982,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                     goto fail;
                 }
                 rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, cur_hs_buf, input_norm_buf, normed_buf, hidden, eps);
-                if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, qw_buf, qb_buf, q_resident, q_out, hidden);
-                if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, kw_buf, kb_buf, k_buf, kv_out, hidden);
-                if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, vw_buf, vb_buf, v_buf, kv_out, hidden);
+                if (rc == 0) rc = mu_gpu_text_decode_qkv_proj_ctx(ctx, normed_buf, qw_buf, qb_buf, kw_buf, kb_buf, vw_buf, vb_buf, q_resident, k_buf, v_buf, hidden);
                 if (rc == 0) rc = mu_gpu_text_rope_cache_update_ctx(ctx, q_resident, k_buf, v_buf,
                                                                     gpu_cache, layer,
                                                                     cache_pos, pos3);
@@ -5032,14 +5030,12 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                 }
                 rc = mu_gpu_text_attn_cached_resident_ctx(ctx, q_resident, gpu_cache, layer,
                                                           cache_pos + 1, attn_buf);
-                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, attn_buf, ow_buf, proj_buf, hidden, hidden);
-                if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, cur_hs_buf, proj_buf, hs_buf2, hidden);
+                if (rc == 0) rc = mu_gpu_dense_probe_add_ctx(ctx, attn_buf, ow_buf, cur_hs_buf, hs_buf2, hidden, hidden);
                 if (rc == 0) rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, hs_buf2, post_norm_buf, normed_buf2, hidden, eps);
                 if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, gate_w_buf, gate_buf, inter, hidden);
                 if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, up_w_buf, up_buf, inter, hidden);
                 if (rc == 0) rc = mu_gpu_silu_mul_f32_ctx(ctx, gate_buf, up_buf, mid_buf, inter);
-                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, mid_buf, down_w_buf, proj_buf, hidden, inter);
-                if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, hs_buf2, proj_buf, next_hs_buf, hidden);
+                if (rc == 0) rc = mu_gpu_dense_probe_add_ctx(ctx, mid_buf, down_w_buf, hs_buf2, next_hs_buf, hidden, inter);
                 if (rc == 0) {
                     rc = mu_gpu_cmd_commit_and_wait(ctx);
                 } else {
@@ -5144,9 +5140,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
 
                 double qkv_start = timing_stats ? mu_time_now_seconds() : 0.0;
                 rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, cur_hs_buf, input_norm_buf, normed_buf, hidden, eps);
-                if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, qw_buf, qb_buf, q_buf, q_out, hidden);
-                if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, kw_buf, kb_buf, k_buf, kv_out, hidden);
-                if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, vw_buf, vb_buf, v_buf, kv_out, hidden);
+                if (rc == 0) rc = mu_gpu_text_decode_qkv_proj_ctx(ctx, normed_buf, qw_buf, qb_buf, kw_buf, kb_buf, vw_buf, vb_buf, q_buf, k_buf, v_buf, hidden);
                 if (rc == 0) rc = mu_gpu_text_rope_cache_update_ctx(ctx, q_buf, k_buf, v_buf,
                                                                     gpu_cache, layer,
                                                                     cache_pos, pos3);
@@ -5157,8 +5151,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                 double attn_mlp_start = timing_stats ? mu_time_now_seconds() : 0.0;
                 if (rc == 0) rc = mu_gpu_text_attn_cached_resident_ctx(ctx, q_buf, gpu_cache, layer,
                                                                        cache_pos + 1, attn_buf);
-                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, attn_buf, ow_buf, proj_buf, hidden, hidden);
-                if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, cur_hs_buf, proj_buf, hs_buf2, hidden);
+                if (rc == 0) rc = mu_gpu_dense_probe_add_ctx(ctx, attn_buf, ow_buf, cur_hs_buf, hs_buf2, hidden, hidden);
                 if (rc == 0) rc = mu_gpu_text_decode_fused_ffn_ctx(ctx, hs_buf2, post_norm_buf, gate_w_buf, up_w_buf, down_w_buf, eps, out_hs_buf);
                 if (rc != 0) {
                     mu_gpu_cmd_discard(ctx);
@@ -5284,9 +5277,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
             mu_gpu_buf_copy_to(hs_buf, hidden_state, hidden * sizeof(float));
 
             rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, hs_buf, input_norm_buf, normed_buf, hidden, eps);
-            if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, qw_buf, qb_buf, q_buf, q_out, hidden);
-            if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, kw_buf, kb_buf, k_buf, kv_out, hidden);
-            if (rc == 0) rc = mu_gpu_dense_f32_bias_probe_ctx(ctx, normed_buf, vw_buf, vb_buf, v_buf, kv_out, hidden);
+            if (rc == 0) rc = mu_gpu_text_decode_qkv_proj_ctx(ctx, normed_buf, qw_buf, qb_buf, kw_buf, kb_buf, vw_buf, vb_buf, q_buf, k_buf, v_buf, hidden);
 
             if (use_gpu_rope) {
                 if (rc == 0) {
@@ -5341,14 +5332,12 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
 
                 rc = mu_gpu_text_attn_cached_resident_ctx(ctx, q_buf, gpu_cache, layer,
                                                           cache_pos + 1, attn_buf);
-                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, attn_buf, ow_buf, proj_buf, hidden, hidden);
-                if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, hs_buf, proj_buf, hs_buf2, hidden);
+                if (rc == 0) rc = mu_gpu_dense_probe_add_ctx(ctx, attn_buf, ow_buf, hs_buf, hs_buf2, hidden, hidden);
                 if (rc == 0) rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, hs_buf2, post_norm_buf, normed_buf2, hidden, eps);
                 if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, gate_w_buf, gate_buf, inter, hidden);
                 if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, up_w_buf, up_buf, inter, hidden);
                 if (rc == 0) rc = mu_gpu_silu_mul_f32_ctx(ctx, gate_buf, up_buf, mid_buf, inter);
-                if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, mid_buf, down_w_buf, proj_buf, hidden, inter);
-                if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, hs_buf2, proj_buf, out_hs_buf, hidden);
+                if (rc == 0) rc = mu_gpu_dense_probe_add_ctx(ctx, mid_buf, down_w_buf, hs_buf2, out_hs_buf, hidden, inter);
 
                 if (rc == 0) {
                     rc = mu_gpu_cmd_commit_and_wait(ctx);
@@ -5443,14 +5432,12 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                                                  v_cache + mu_text_cache_offset(layer, 0, cache_cap),
                                                  cache_pos + 1, attn_buf);
             }
-            if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, attn_buf, ow_buf, proj_buf, hidden, hidden);
-            if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, res_buf, proj_buf, hs_buf2, hidden);
+            if (rc == 0) rc = mu_gpu_dense_probe_add_ctx(ctx, attn_buf, ow_buf, res_buf, hs_buf2, hidden, hidden);
             if (rc == 0) rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, hs_buf2, post_norm_buf, normed_buf2, hidden, eps);
             if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, gate_w_buf, gate_buf, inter, hidden);
             if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, normed_buf2, up_w_buf, up_buf, inter, hidden);
             if (rc == 0) rc = mu_gpu_silu_mul_f32_ctx(ctx, gate_buf, up_buf, mid_buf, inter);
-            if (rc == 0) rc = mu_gpu_dense_probe_ctx(ctx, mid_buf, down_w_buf, proj_buf, hidden, inter);
-            if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, hs_buf2, proj_buf, out_hs_buf, hidden);
+            if (rc == 0) rc = mu_gpu_dense_probe_add_ctx(ctx, mid_buf, down_w_buf, hs_buf2, out_hs_buf, hidden, inter);
 
             if (rc == 0) {
                 rc = mu_gpu_cmd_commit_and_wait(ctx);

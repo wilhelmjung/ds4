@@ -108,6 +108,14 @@ int mu_gpu_rmsnorm_bf16_probe_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf 
                                   mu_gpu_buf out, int n, float eps);
 int mu_gpu_dense_f32_bias_probe_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
                                     mu_gpu_buf bias, mu_gpu_buf out, int rows, int cols);
+int mu_gpu_text_decode_qkv_proj_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x,
+                                    mu_gpu_buf qw, mu_gpu_buf qb,
+                                    mu_gpu_buf kw, mu_gpu_buf kb,
+                                    mu_gpu_buf vw, mu_gpu_buf vb,
+                                    mu_gpu_buf q_out, mu_gpu_buf k_out, mu_gpu_buf v_out,
+                                    int cols);
+int mu_gpu_dense_probe_add_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
+                               mu_gpu_buf residual, mu_gpu_buf out, int rows, int cols);
 int mu_gpu_dense_probe_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
                            mu_gpu_buf out, int rows, int cols);
 int mu_gpu_add_f32_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf a, mu_gpu_buf b,

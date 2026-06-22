@@ -2680,4 +2680,182 @@ Mean stage timings under the pipelined execution:
 - **Warm MPS State**: Once the PyTorch MPS Graph Cache is fully warmed up (Page 241 onwards), PyTorch is able to utilize global Apple Silicon-specific MPSGraph fusions and optimizations, driving down execution time on table-heavy pages to 51s - 75s.
 
 
+## Direction 1: Vision Tower QKV Projection Fusion
 
+Date: 2026-06-22
+Branch: `codex/mineru-metal-backend`
+
+### Optimization Mechanics
+- **Vision Tower QKV Fusion**: Fused the independent Q, K, and V projections in the Vision Tower (`dense_bf16_bias_rows_simdgroup_qkv`) into a single kernel dispatch. This reduces Vision Tower GEMV launches and intermediate VRAM roundtrips, resulting in significant savings in `vision_encode` and `layout_vision_encode` times.
+- **VRAM Scratch Preservation**: Re-allocated separate scratch buffers (`temp_q` and `temp_kv`) in the baseline scratchpad locations to preserve layout compatibility and exact trace parity.
+
+### Correctness Validation
+All layout/text traces and unit tests pass with 100% precision parity matching the CPU reference path:
+- Token F1 = 1.0000
+- Table exact cell recall = 1.0000 (104/104 cells)
+- Layout exact cell recall = 1.0000
+- Mean content token F1 = 1.0000
+- Ordered mean bbox IoU = 1.0000
+
+### 10-Page Full-Content 512 E2E Benchmark Rerun
+Below is the A/B test comparing the previous Pipelined Engine Re-use baseline and the new Direction 1 (Vision Tower QKV Projection Fusion) optimized Metal backend under identical throttled GPU conditions:
+
+| Page | CPU Reference (s) | PyTorch MPS (Warm Rerun) (s) | Metal (Pipelined Engine Re-use Baseline) (s) | Metal (Direction 1 Fused QKV) (s) | Speedup vs Baseline |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| Page 224 | 145.41s | 118.81s | 136.90s | 118.79s | 1.15x |
+| Page 234 | 148.16s | 157.22s | 144.38s | 124.10s | 1.16x |
+| Page 237 | 150.31s | 169.46s | 147.85s | 135.48s | 1.09x |
+| Page 241 | 147.23s | 75.94s | 145.85s | 125.55s | 1.16x |
+| Page 244 | 146.90s | 65.08s | 148.52s | 123.97s | 1.20x |
+| Page 247 | 148.55s | 51.55s | 141.13s | 120.27s | 1.17x |
+| Page 258 | 149.12s | 25.60s | 58.44s | 51.61s | 1.13x |
+| Page 281 | 147.88s | 17.88s | 56.71s | 50.72s | 1.12x |
+| Page 303 | 98.31s | 15.18s | 56.65s | 49.90s | 1.14x |
+| Page 334 | 99.45s | 15.62s | 59.34s | 50.70s | 1.17x |
+| **Total** | **1381.32s** | **712.32s** | **1095.77s** | **951.09s** | **1.15x** |
+| **Mean** | **138.13s** | **71.23s** | **109.58s** | **95.11s** | **1.15x** |
+
+### Stage Timing Analysis
+Mean stage timings under the Direction 1 execution:
+
+| Stage | Mean s/page |
+| --- | ---: |
+| `page_total` | 95.11 |
+| `vision_encode` | 49.51 |
+| `layout_vision_encode` | 34.48 |
+| `text_generate_decode` | 42.94 |
+| `text_generate_prefill` | 2.03 |
+| `layout_prompt_tokenize` | 0.39 |
+
+
+## Direction 2: Text Decoder QKV Projection Fusion
+
+Date: 2026-06-22
+Branch: `codex/mineru-metal-backend`
+
+### Optimization Mechanics
+- **Text Decoder QKV Fusion**: Replaced the separate Q, K, and V projection dispatches in `mu_text_cached_step` with a single unified call to `mu_gpu_text_decode_qkv_proj_ctx`. This fuses the three GEMV dispatches into a single thread grid dispatch (1152 threads in y-dimension), reducing kernel enqueueing and launch overhead by 2x.
+
+### Correctness Validation
+All layout/text traces and unit tests pass with 100% precision parity matching the CPU reference path:
+- Token F1 = 1.0000
+- Table exact cell recall = 1.0000 (104/104 cells)
+- Layout exact cell recall = 1.0000
+- Mean content token F1 = 1.0000
+- Ordered mean bbox IoU = 1.0000
+
+### 10-Page Full-Content 512 E2E Benchmark Rerun
+Below is the A/B test comparing Direction 1 (Vision Tower QKV Projection Fusion) and the new Direction 2 (Text Decoder QKV Projection Fusion) optimized Metal backend under identical throttled GPU conditions:
+
+| Page | CPU Reference (s) | Metal (Direction 1 Fused QKV) (s) | Metal (Direction 2 Fused Decoder QKV) (s) | Speedup vs Direction 1 | Speedup vs Baseline |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| Page 224 | 145.41s | 118.79s | 112.85s | 1.05x | 1.21x |
+| Page 234 | 148.16s | 124.10s | 118.06s | 1.05x | 1.22x |
+| Page 237 | 150.31s | 135.48s | 119.19s | 1.14x | 1.24x |
+| Page 241 | 147.23s | 125.55s | 119.27s | 1.05x | 1.22x |
+| Page 244 | 146.90s | 123.97s | 118.12s | 1.05x | 1.26x |
+| Page 247 | 148.55s | 120.27s | 114.58s | 1.05x | 1.23x |
+| Page 258 | 149.12s | 51.61s | 49.62s | 1.04x | 1.18x |
+| Page 281 | 147.88s | 50.72s | 49.07s | 1.03x | 1.16x |
+| Page 303 | 98.31s | 49.90s | 49.42s | 1.01x | 1.15x |
+| Page 334 | 99.45s | 50.70s | 50.18s | 1.01x | 1.18x |
+| **Total** | **1381.32s** | **951.09s** | **900.37s** | **1.06x** | **1.22x** |
+| **Mean** | **138.13s** | **95.11s** | **90.04s** | **1.06x** | **1.22x** |
+
+### Stage Timing Analysis
+Mean stage timings under the Direction 2 execution:
+
+| Stage | Mean s/page |
+| --- | ---: |
+| `page_total` | 90.04 |
+| `vision_encode` | 49.63 |
+| `layout_vision_encode` | 34.50 |
+| `text_generate_decode` | 38.64 |
+| `text_generate_prefill` | 2.03 |
+| `layout_prompt_tokenize` | 0.39 |
+
+## Direction 3: Text Decoder O-Projection and Residual Add Fusion
+
+Date: 2026-06-22
+Branch: `codex/mineru-metal-backend`
+
+### Optimization Mechanics
+- **Probe Add Fusion**: Added `mu_dense_probe_add_simd` and
+  `mu_gpu_dense_probe_add_ctx` to fuse a decoder projection and residual add
+  into one dispatch.
+- **Integration Points**: Replaced the attention output projection + residual
+  add and the MLP down projection + residual add call sites in
+  `mu_text_cached_step`.
+- **Escape Hatch**: `MU_TEXT_DECODE_NO_PROBE_ADD_FUSION=1` falls back to the
+  prior dense + add sequence for diagnostics and regression checks.
+
+### Correctness Validation
+The Direction 3 outputs match Direction 2 outputs exactly on the 10-page
+full-content512 sample:
+
+| Metric | Value |
+| --- | ---: |
+| Block count exact pages | 10 / 10 |
+| Ordered type accuracy | 1.0000 |
+| Ordered mean bbox IoU | 1.0000 |
+| Mean content token F1 | 1.0000 |
+| Table exact cell recall | 1.0000 |
+
+Artifacts:
+
+```text
+/tmp/metal_direction3_10pages.json
+/tmp/metal_direction3_outputs/metal_page_*.json
+/tmp/metal_direction3_vs_direction2.metrics.json
+/tmp/mu-benchmark-metal-probe-add-fusion-pages224-258.json
+/tmp/mu-benchmark-metal-no-probe-add-fusion-pages224-258.json
+/tmp/mu-probe-add-fusion-pages224-258.metrics.json
+```
+
+### 2-Page Same-Run A/B
+
+The same-run A/B uses pages `224,258` with full content and
+`--max-new-tokens 512`.
+
+| Path | Completed | Failed | Fallback rows | Total s | Mean page total s | Mean decode s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Probe-add fusion default | 2 / 2 | 0 | 0 | 226.5122 | 113.2561 | 47.3365 |
+| `MU_TEXT_DECODE_NO_PROBE_ADD_FUSION=1` | 2 / 2 | 0 | 0 | 241.9028 | 120.9514 | 51.2916 |
+
+Same-run speedups:
+
+| Metric | Value |
+| --- | ---: |
+| Page total speedup | 1.0679x |
+| `text_generate_decode` speedup | 1.0836x |
+
+Output comparison for the same-run A/B:
+
+| Metric | Value |
+| --- | ---: |
+| Block count exact pages | 2 / 2 |
+| Ordered type accuracy | 1.0000 |
+| Mean content token F1 | 1.0000 |
+| Table exact cell recall | 1.0000 |
+
+### 10-Page Artifact Check
+
+The existing Direction 3 long-run artifact is correct but slower than the
+Direction 2 artifact:
+
+| Path | Completed | Failed | Fallback rows | Total s | Mean page total s | Mean decode s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Direction 2 artifact | 10 / 10 | 0 | 0 | 900.3740 | 90.0374 | 40.4131 |
+| Direction 3 artifact | 10 / 10 | 0 | 0 | 1096.4408 | 109.6441 | 47.5823 |
+
+Interpreting this as a pure kernel regression is unsafe because the Direction 3
+run also had much slower vision stages. Treat it as a long-run risk signal, not
+as a same-run A/B.
+
+Decision:
+
+- Keep probe-add fusion enabled by default for now because the focused same-run
+  A/B is positive and correctness is exact.
+- Keep `MU_TEXT_DECODE_NO_PROBE_ADD_FUSION=1` as the rollback switch.
+- Before claiming final 10-page E2E improvement, rerun a fresh same-run 10-page
+  default-vs-escape-hatch A/B under stable thermal conditions.
