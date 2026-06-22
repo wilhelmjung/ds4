@@ -2810,6 +2810,9 @@ Artifacts:
 /tmp/mu-benchmark-metal-probe-add-fusion-pages224-258.json
 /tmp/mu-benchmark-metal-no-probe-add-fusion-pages224-258.json
 /tmp/mu-probe-add-fusion-pages224-258.metrics.json
+/tmp/mu-benchmark-metal-10page-probe-add-fusion-fresh.json
+/tmp/mu-benchmark-metal-10page-no-probe-add-fusion-fresh.json
+/tmp/mu-probe-add-fusion-10page-fresh.metrics.json
 ```
 
 ### 2-Page Same-Run A/B
@@ -2852,10 +2855,64 @@ Interpreting this as a pure kernel regression is unsafe because the Direction 3
 run also had much slower vision stages. Treat it as a long-run risk signal, not
 as a same-run A/B.
 
+### Fresh 10-Page Same-Run A/B
+
+The fresh same-run A/B uses the full 10-page sample with full content and
+`--max-new-tokens 512`. The two runs were executed sequentially in the same
+thermal/OS state window:
+
+| Path | Completed | Failed | Fallback rows | Total s | Mean page total s | Mean decode s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Probe-add fusion default | 10 / 10 | 0 | 0 | 1185.0147 | 118.5015 | 53.8313 |
+| `MU_TEXT_DECODE_NO_PROBE_ADD_FUSION=1` | 10 / 10 | 0 | 0 | 1355.3741 | 135.5374 | 67.5882 |
+
+Same-run speedups:
+
+| Metric | Value |
+| --- | ---: |
+| Page total speedup | 1.1438x |
+| `text_generate_decode` speedup | 1.2556x |
+| `vision_encode` ratio | 1.0438x |
+
+Output comparison for the fresh 10-page A/B:
+
+| Metric | Value |
+| --- | ---: |
+| Block count exact pages | 10 / 10 |
+| Ordered type accuracy | 1.0000 |
+| Ordered mean bbox IoU | 1.0000 |
+| Mean content token F1 | 1.0000 |
+| Table exact cell recall | 1.0000 |
+
+Against the current full-content512 CPU/MPS comparison baselines:
+
+| Path | Total s | Mean s/page | Comparison |
+| --- | ---: | ---: | --- |
+| CPU reference | 1381.32 | 138.13 | baseline |
+| PyTorch MPS warm rerun | 712.32 | 71.23 | baseline |
+| Metal Direction 2 artifact | 900.3740 | 90.0374 | 1.53x faster than CPU; 1.26x slower than warm MPS |
+| Metal Direction 3 fresh default | 1185.0147 | 118.5015 | 1.17x faster than CPU; 1.66x slower than warm MPS |
+| Metal Direction 3 fresh no-fusion | 1355.3741 | 135.5374 | 1.02x faster than CPU; 1.90x slower than warm MPS |
+
+Interpretation:
+
+- The probe-add fusion itself is positive in the fresh 10-page A/B: decode is
+  `1.2556x` faster than the escape hatch and output remains exact.
+- The absolute Direction 3 long-run result is still weaker than the Direction 2
+  artifact, so the latest default should not be described as a new best E2E
+  baseline.
+- The current Metal backend remains faster than the CPU reference on this
+  full-content512 sample, but it is still materially slower than the warm
+  PyTorch MPS reference.
+- The next optimization target should move back to larger bottlenecks:
+  resident decode scheduling, MPS/MSL GEMM quality, and vision/content crop
+  execution stability.
+
 Decision:
 
-- Keep probe-add fusion enabled by default for now because the focused same-run
-  A/B is positive and correctness is exact.
+- Keep probe-add fusion enabled by default because both same-run A/B tests are
+  positive and correctness is exact.
 - Keep `MU_TEXT_DECODE_NO_PROBE_ADD_FUSION=1` as the rollback switch.
-- Before claiming final 10-page E2E improvement, rerun a fresh same-run 10-page
-  default-vs-escape-hatch A/B under stable thermal conditions.
+- Do not claim Direction 3 as a new best 10-page E2E baseline; use Direction 2
+  (`900.3740s`) as the faster historical artifact until a future run beats it
+  under comparable conditions.
