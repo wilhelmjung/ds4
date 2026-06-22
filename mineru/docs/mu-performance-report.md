@@ -3008,3 +3008,23 @@ only the QKV group to `48` dispatches/token; attention/MLP stays at
 Interpretation: logits is not the next bottleneck, and QKV/RoPE micro-fusion
 has already hit diminishing returns. The next high-value target is the
 attention/MLP group.
+
+### Attention/MLP Dispatch Breakdown
+
+Added finer `MU_TIMING` counters inside the attention/MLP group:
+
+| Trace | Attention | O projection | MLP |
+| --- | ---: | ---: | ---: |
+| Default text | 168 | 168 | 168 |
+| `MU_TEXT_DECODE_QKV_ROPE_FUSION=1` text | 168 | 168 | 168 |
+| `MU_TEXT_DECODE_QKV_ROPE_FUSION=1` layout | 72 | 72 | 72 |
+
+Per token, the default resident decode path is `24` attention dispatches,
+`24` O-projection dispatches, and `24` MLP dispatches. The current MLP path is
+already a fused FFN dispatch per layer, so a simple "fuse MLP" task is not the
+next shortest win.
+
+Interpretation: dispatch count alone no longer picks a single winner inside the
+attention/MLP group. The next step should either measure per-kernel GPU time or
+attempt a targeted fusion/MPS path that removes one full per-layer dispatch,
+such as attention + O-projection, with the same 2-page A/B gate.

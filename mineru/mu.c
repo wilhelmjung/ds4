@@ -161,6 +161,9 @@ typedef struct mu_text_decode_timing {
     int kernel_dispatches;
     int qkv_dispatches;
     int attn_mlp_dispatches;
+    int attention_dispatches;
+    int o_proj_dispatches;
+    int mlp_dispatches;
     int logits_dispatches;
     int steps;
 } mu_text_decode_timing;
@@ -194,6 +197,9 @@ static void mu_text_decode_timing_add(mu_text_decode_timing *dst,
     dst->kernel_dispatches += src->kernel_dispatches;
     dst->qkv_dispatches += src->qkv_dispatches;
     dst->attn_mlp_dispatches += src->attn_mlp_dispatches;
+    dst->attention_dispatches += src->attention_dispatches;
+    dst->o_proj_dispatches += src->o_proj_dispatches;
+    dst->mlp_dispatches += src->mlp_dispatches;
     dst->logits_dispatches += src->logits_dispatches;
     dst->steps += src->steps;
 }
@@ -4568,6 +4574,12 @@ int mu_text_generate_greedy(mu_engine *e, const int *input_ids, int n_ids,
                                   (double)decode_timing.qkv_dispatches);
             mu_timing_log_seconds(timing, "text_generate_decode_attn_mlp_dispatches",
                                   (double)decode_timing.attn_mlp_dispatches);
+            mu_timing_log_seconds(timing, "text_generate_decode_attention_dispatches",
+                                  (double)decode_timing.attention_dispatches);
+            mu_timing_log_seconds(timing, "text_generate_decode_o_proj_dispatches",
+                                  (double)decode_timing.o_proj_dispatches);
+            mu_timing_log_seconds(timing, "text_generate_decode_mlp_dispatches",
+                                  (double)decode_timing.mlp_dispatches);
             mu_timing_log_seconds(timing, "text_generate_decode_logits_dispatches",
                                   (double)decode_timing.logits_dispatches);
         }
@@ -5070,6 +5082,9 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                     local_timing.command_buffers += 1;
                     local_timing.kernel_dispatches += 7;
                     local_timing.attn_mlp_dispatches += 7;
+                    local_timing.attention_dispatches += 1;
+                    local_timing.o_proj_dispatches += 1;
+                    local_timing.mlp_dispatches += 5;
                     local_timing.cached_attn_mlp += mu_time_now_seconds() - attn_mlp_start;
                 }
                 mu_gpu_buf tmp = cur_hs_buf;
@@ -5199,6 +5214,9 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                     local_timing.kernel_dispatches += use_qkv_rope_fusion ? 5 : 6;
                     local_timing.qkv_dispatches += use_qkv_rope_fusion ? 2 : 3;
                     local_timing.attn_mlp_dispatches += 3;
+                    local_timing.attention_dispatches += 1;
+                    local_timing.o_proj_dispatches += 1;
+                    local_timing.mlp_dispatches += 1;
                     local_timing.cached_attn_mlp += mu_time_now_seconds() - attn_mlp_start;
                 }
                 cur_hs_buf = out_hs_buf;
@@ -5753,6 +5771,12 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
                                       (double)decode_timing.qkv_dispatches);
                 mu_timing_log_seconds(timing, "text_generate_decode_attn_mlp_dispatches",
                                       (double)decode_timing.attn_mlp_dispatches);
+                mu_timing_log_seconds(timing, "text_generate_decode_attention_dispatches",
+                                      (double)decode_timing.attention_dispatches);
+                mu_timing_log_seconds(timing, "text_generate_decode_o_proj_dispatches",
+                                      (double)decode_timing.o_proj_dispatches);
+                mu_timing_log_seconds(timing, "text_generate_decode_mlp_dispatches",
+                                      (double)decode_timing.mlp_dispatches);
                 mu_timing_log_seconds(timing, "text_generate_decode_logits_dispatches",
                                       (double)decode_timing.logits_dispatches);
             }
@@ -5781,6 +5805,12 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
                               (double)decode_timing.qkv_dispatches);
         mu_timing_log_seconds(timing, "text_generate_decode_attn_mlp_dispatches",
                               (double)decode_timing.attn_mlp_dispatches);
+        mu_timing_log_seconds(timing, "text_generate_decode_attention_dispatches",
+                              (double)decode_timing.attention_dispatches);
+        mu_timing_log_seconds(timing, "text_generate_decode_o_proj_dispatches",
+                              (double)decode_timing.o_proj_dispatches);
+        mu_timing_log_seconds(timing, "text_generate_decode_mlp_dispatches",
+                              (double)decode_timing.mlp_dispatches);
         mu_timing_log_seconds(timing, "text_generate_decode_logits_dispatches",
                               (double)decode_timing.logits_dispatches);
     }
