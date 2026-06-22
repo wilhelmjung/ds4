@@ -378,6 +378,12 @@ a real Metal speed number.
 
 ## Advanced Performance Optimization Strategy (Closing the MPS/Transformers Gap)
 
+![MinerU Metal kernel fusion progress](kernel-fusion-progress.svg)
+
+Current kernel fusion status: default fusions are kept only when they help the
+same-run benchmark, while the QKV + RoPE + KV-cache fusion remains opt-in
+because it reduces dispatches (`145 -> 121/token`) but did not improve E2E time.
+
 To achieve parity or superior performance compared to PyTorch/MPS and Apple MLX, the Metal backend can adopt the design principles established by `ggml-metal` and `mlx`:
 
 ### 1. End-to-End GPU Residency (Eliminating CPU-GPU Syncs)
