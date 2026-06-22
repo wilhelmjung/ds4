@@ -2624,3 +2624,56 @@ Result:
 - **CPU Outperformed**: The optimized Metal backend remains faster than CPU execution, delivering a **1.23x speedup** on average (112.00s/page vs 138.13s/page).
 - **Exact Parity**: Absolute correctness is maintained with zero CPU fallbacks.
 
+
+## CPU-GPU Page-Level Optimization Checkpoint (Engine Re-use & Multi-Page CLI)
+
+Date: 2026-06-22
+Branch: `codex/mineru-metal-backend`
+Measurement code commits: Refactored `mu_cli.c` to accept multiple `--image` parameters and an `--output-dir` parameter, processing images within a single engine lifecycle. Updated `mu_benchmark_pages.py` to invoke all target pages in a single CLI subprocess execution.
+
+### Optimization Mechanics
+- **Engine Re-use**: By refactoring the native C entrypoint to run multiple images in a loop using a single `mu_engine` instance, we fully reuse model weights and tokenizer memory across pages. This avoids reloading model files (~0.17s) and reparsing the 150K-vocab tokenizer (~4.15s) on every page.
+- **Single subprocess execution**: Running a single command for all target images reduces subprocess spawning overhead and timing multiplexing issues. Timing stages are isolated via `mu_page_start` and `mu_page_end` markers written to `stderr`.
+
+### Correctness Validation
+All layout/text traces and unit tests pass with 100% precision parity matching the CPU reference path:
+- Token F1 = 1.0000
+- Table exact cell recall = 1.0000 (104/104 cells)
+- Layout exact cell recall = 1.0000
+- All 27 Python unit tests pass successfully.
+
+### 10-Page Full-Content 512 E2E Benchmark Rerun
+We executed the full 10-page benchmark run using the refactored pipeline. Below is the updated timing comparison under identical throttled GPU conditions:
+
+| Page | CPU Reference (s) | PyTorch MPS (Throttled) (s) | Metal (Cooperative Coalesced, Throttled) (s) | Metal (Pipelined Engine Re-use) (s) | Speedup (vs Coalesced Metal) |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| Page 224 | 145.41s | 58.96s | 134.94s | 136.90s | 0.99x |
+| Page 234 | 148.16s | 84.57s | 146.67s | 144.38s | 1.02x |
+| Page 237 | 150.31s | 94.43s | 147.38s | 147.85s | 1.00x |
+| Page 241 | 147.23s | 107.15s | 146.61s | 145.85s | 1.01x |
+| Page 244 | 146.90s | 114.04s | 145.74s | 148.52s | 0.98x |
+| Page 247 | 148.55s | 97.05s | 142.77s | 141.13s | 1.01x |
+| Page 258 | 149.12s | 56.40s | 64.89s | 58.44s | 1.11x |
+| Page 281 | 147.88s | 49.63s | 63.26s | 56.71s | 1.12x |
+| Page 303 | 98.31s | 50.02s | 63.56s | 56.65s | 1.12x |
+| Page 334 | 99.45s | 43.68s | 64.15s | 59.34s | 1.08x |
+| **Total** | **1381.32s** | **755.93s** | **1119.97s** | **1095.77s** | **1.02x** |
+| **Mean** | **138.13s** | **75.59s** | **112.00s** | **109.58s** | **1.02x** |
+
+### Stage Timing Analysis
+Mean stage timings under the pipelined execution:
+
+| Stage | Mean s/page |
+| --- | ---: |
+| `page_total` | 109.58 |
+| `vision_encode` | 54.25 |
+| `layout_vision_encode` | 37.50 |
+| `text_generate_decode` | 51.71 |
+| `text_generate_prefill` | 2.86 |
+| `layout_prompt_tokenize` | 0.39 |
+
+### Analysis of Speedup
+- **Tokenizer & Weight Overhead Eliminated**: The layout tokenizer prompt encoding (`layout_prompt_tokenize`) previously took **3.90s** on the first page. For all subsequent pages, it dropped to **<9ms** (specifically **<1ms** for pages 247, 258, 281, 303, 334).
+- **Short-Content Speedup**: On pages with shorter layout/text sequences, the relative overhead of initialization was disproportionately high. Reusing the engine/tokenizer cut the execution times of pages 258, 281, and 303 by **11-12%** (saving **~7 seconds** per page).
+
+

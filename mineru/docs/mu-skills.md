@@ -38,10 +38,10 @@ The skills assume the current full-content512 checkpoint:
 | CPU-vs-Metal content token F1 | 1.0000 |
 | CPU-vs-Metal table cells | 104 / 104 |
 | CPU total time | 1381.32s |
-| Metal no-fallback total time | 1119.97s |
+| Metal no-fallback total time | 1095.77s |
 | PyTorch/MPS (Throttled) total time | 755.93s |
-| Metal / CPU speed gap | 1.23x faster |
-| Metal / PyTorch MPS speed gap | 1.48x slower |
+| Metal / CPU speed gap | 1.26x faster |
+| Metal / PyTorch MPS speed gap | 1.45x slower |
 
 The authoritative performance record is
 `mineru/docs/mu-performance-report.md`.

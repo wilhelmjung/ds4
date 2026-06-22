@@ -24,6 +24,20 @@ TIMING_RE = re.compile(
 )
 
 
+def parse_multipage_stderr(stderr: str) -> dict[str, list[str]]:
+    page_stderr_lines = {}
+    current_page = None
+    for line in stderr.splitlines():
+        if line.startswith("mu_page_start page="):
+            current_page = line.split("=", 1)[1].strip()
+            page_stderr_lines[current_page] = []
+        elif line.startswith("mu_page_end page="):
+            current_page = None
+        elif current_page is not None:
+            page_stderr_lines[current_page].append(line)
+    return page_stderr_lines
+
+
 def parse_pages(text: str) -> list[int]:
     pages: list[int] = []
     for part in text.split(","):
@@ -215,6 +229,7 @@ def main() -> None:
     parser.add_argument("--keep-going", action="store_true")
     parser.add_argument("--save-output-dir", type=Path)
     parser.add_argument("--timing", action="store_true")
+    parser.add_argument("--markdown", action="store_true")
     args = parser.parse_args()
 
     rows = load_resume_rows(args)
@@ -223,30 +238,132 @@ def main() -> None:
         for r in rows
         if r.get("returncode") == 0 and "error" not in r and "page" in r
     }
+
+    pages_to_run = [p for p in args.pages if p not in done_pages]
+    if not pages_to_run:
+        print("All pages already processed.")
+        write_summary(args, rows)
+        return
+
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        for page in args.pages:
-            if page in done_pages:
-                continue
-            image = tmp / f"page_{page:04d}.png"
+        images_to_run = []
+        for page in pages_to_run:
+            image = tmp / f"{args.backend}_page_{page:04d}.png"
             render_page(page, image)
-            row = run_one(
-                args.backend,
-                image,
-                max_new_tokens=args.max_new_tokens,
-                skip_content=args.skip_content,
+            images_to_run.append(image)
+
+        # Build CLI command
+        cmd = [str(MU), "--backend", args.backend]
+        if args.backend == "metal":
+            cmd.append("--no-cpu-fallback")
+        if args.max_new_tokens is not None:
+            cmd.extend(["--max-new-tokens", str(args.max_new_tokens)])
+        if args.skip_content:
+            cmd.append("--skip-content")
+        if args.markdown:
+            cmd.append("--markdown")
+        else:
+            cmd.append("--json")
+
+        for img in images_to_run:
+            cmd.extend(["--image", str(img)])
+
+        if args.save_output_dir is not None:
+            out_dir = args.save_output_dir
+        else:
+            out_dir = tmp / "outputs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        cmd.extend(["--output-dir", str(out_dir)])
+
+        env = None
+        if args.content_max_new_tokens is not None or args.timing:
+            env = os.environ.copy()
+        if args.content_max_new_tokens is not None:
+            env["MU_CONTENT_MAX_NEW_TOKENS"] = str(args.content_max_new_tokens)
+        if args.timing:
+            env["MU_TIMING"] = "1"
+
+        print(f"Running command: {' '.join(cmd)}")
+        start = time.perf_counter()
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=ROOT,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 timeout=args.timeout,
-                output_dir=args.save_output_dir,
-                page=page,
-                content_max_new_tokens=args.content_max_new_tokens,
-                timing=args.timing,
+                env=env,
             )
-            row["page"] = page
+            returncode = result.returncode
+            stderr_out = result.stderr
+        except subprocess.TimeoutExpired as exc:
+            returncode = -1
+            stderr_out = exc.stderr or ""
+            if isinstance(stderr_out, bytes):
+                stderr_out = stderr_out.decode("utf-8", errors="replace")
+            print(f"Process timed out: {exc}")
+
+        # Parse stderr by page
+        page_stderr_lines = parse_multipage_stderr(stderr_out)
+
+        # Process each page row
+        for idx, page in enumerate(pages_to_run):
+            img_path_str = str(images_to_run[idx])
+            page_lines = page_stderr_lines.get(img_path_str, [])
+            page_stderr = "\n".join(page_lines)
+            stage_timings = parse_stage_timings(page_stderr)
+            fallback_detected = "fallback" in page_stderr.lower()
+
+            row = {
+                "page": page,
+                "command": cmd,
+                "returncode": returncode,
+                "content_max_new_tokens": args.content_max_new_tokens,
+                "fallback_detected": fallback_detected,
+                "stderr_tail": page_stderr[-4000:],
+            }
+
+            if stage_timings:
+                row["stage_timings"] = stage_timings
+                row["seconds"] = stage_timings.get("page_total", 0.0)
+            else:
+                row["seconds"] = 0.0
+
+            if returncode != 0:
+                row["error"] = f"mu process failed/timed out with code {returncode}"
+            elif img_path_str not in page_stderr_lines:
+                row["error"] = "page execution did not start or complete"
+            elif args.backend == "metal" and fallback_detected:
+                row["error"] = "metal fallback appeared in page stderr"
+            else:
+                # Read outputs from generated file
+                out_ext = "md" if args.markdown else "json"
+                out_filename = out_dir / f"{images_to_run[idx].stem}.{out_ext}"
+                if out_filename.exists():
+                    if not args.markdown:
+                        try:
+                            blocks = json.loads(out_filename.read_text(encoding="utf-8"))
+                            row["blocks"] = len(blocks)
+                            row["types"] = [b.get("type") for b in blocks]
+                            row["output_json"] = str(out_filename)
+                        except Exception as e:
+                            row["error"] = f"failed to parse json output: {e}"
+                    else:
+                        row["blocks"] = 0
+                        row["types"] = []
+                        row["output_json"] = str(out_filename)
+                else:
+                    row["error"] = f"output file {out_filename} was not created"
+
             rows.append(row)
             print(json.dumps(row, ensure_ascii=False), flush=True)
             write_summary(args, rows)
             if "error" in row and not args.keep_going:
                 raise SystemExit(row["error"])
+
     write_summary(args, rows)
 
 

@@ -1897,6 +1897,28 @@ static int parse_image_json_with_backend(const mu_engine_options *base_opt,
     return rc;
 }
 
+static void get_output_filename(const char *image_path, const char *output_dir, bool is_json, char *out, size_t out_max) {
+    const char *base = strrchr(image_path, '/');
+#ifdef _WIN32
+    const char *base_win = strrchr(image_path, '\\');
+    if (base_win && (!base || base_win > base)) base = base_win;
+#endif
+    if (base) base++;
+    else base = image_path;
+
+    char name[256];
+    size_t len = strlen(base);
+    const char *dot = strrchr(base, '.');
+    if (dot && dot > base) {
+        len = (size_t)(dot - base);
+    }
+    if (len >= sizeof(name)) len = sizeof(name) - 1;
+    memcpy(name, base, len);
+    name[len] = 0;
+
+    snprintf(out, out_max, "%s/%s.%s", output_dir, name, is_json ? "json" : "md");
+}
+
 int main(int argc, char **argv) {
     mu_engine_options opt = mu_engine_options_default();
     const char *trace_path = NULL;
@@ -1904,6 +1926,10 @@ int main(int argc, char **argv) {
     int write_json = 0;
     int write_markdown = 0;
     int compare_backends = 0;
+    const char *images[512];
+    int n_images = 0;
+    const char *output_dir = NULL;
+
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model-dir") && i + 1 < argc) {
             opt.model_dir = argv[++i];
@@ -1936,16 +1962,33 @@ int main(int argc, char **argv) {
         } else if (!strcmp(argv[i], "--check-trace") && i + 1 < argc) {
             trace_path = argv[++i];
         } else if (!strcmp(argv[i], "--image") && i + 1 < argc) {
-            image_path = argv[++i];
+            if (n_images < 512) {
+                images[n_images++] = argv[++i];
+            } else {
+                fprintf(stderr, "too many images (max 512)\n");
+                return 2;
+            }
+        } else if (!strcmp(argv[i], "--output-dir") && i + 1 < argc) {
+            output_dir = argv[++i];
         } else if (!strcmp(argv[i], "--json")) {
             write_json = 1;
         } else if (!strcmp(argv[i], "--markdown")) {
             write_markdown = 1;
         } else {
-            fprintf(stderr, "usage: %s [--model-dir PATH] [--backend cpu|metal] [--no-cpu-fallback] [--max-new-tokens N] [--skip-content] [--compare-backends] [--inspect] [--check-trace PATH] [--image PATH (--json|--markdown)]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--model-dir PATH] [--backend cpu|metal] [--no-cpu-fallback] [--max-new-tokens N] [--skip-content] [--compare-backends] [--inspect] [--check-trace PATH] [--image PATH (--json|--markdown)] [--output-dir PATH]\n", argv[0]);
             return 2;
         }
     }
+
+    if (n_images > 0) {
+        image_path = images[0];
+    }
+
+    if (n_images > 1 && !output_dir) {
+        fprintf(stderr, "error: --output-dir is required when processing multiple images\n");
+        return 2;
+    }
+
     if (trace_path && (image_path || compare_backends)) {
         fprintf(stderr, "--check-trace is mutually exclusive with --image/--compare-backends\n");
         return 2;
@@ -2019,20 +2062,63 @@ int main(int argc, char **argv) {
         return rc;
     }
     if (image_path) {
-        mu_result *result = NULL;
-        rc = mu_parse_image_file(engine, image_path, &result);
-        if (rc) {
-            fprintf(stderr, "mu_parse_image_file failed: %d\n", rc);
+        if (n_images > 1 || output_dir) {
+            for (int idx = 0; idx < n_images; idx++) {
+                const char *path = images[idx];
+                fprintf(stderr, "mu_page_start page=%s\n", path);
+                mu_result *result = NULL;
+                rc = mu_parse_image_file(engine, path, &result);
+                fprintf(stderr, "mu_page_end page=%s\n", path);
+                if (rc) {
+                    fprintf(stderr, "mu_parse_image_file failed for %s: %d\n", path, rc);
+                    mu_result_free(result);
+                    mu_engine_close(engine);
+                    return 1;
+                }
+                if (output_dir) {
+                    char out_filename[512];
+                    get_output_filename(path, output_dir, write_json != 0, out_filename, sizeof(out_filename));
+                    FILE *fp = fopen(out_filename, "wb");
+                    if (!fp) {
+                        fprintf(stderr, "failed to open output file %s\n", out_filename);
+                        mu_result_free(result);
+                        mu_engine_close(engine);
+                        return 1;
+                    }
+                    rc = write_json ? mu_result_write_json(result, fp)
+                                    : mu_result_write_markdown(result, fp);
+                    fclose(fp);
+                    if (rc) {
+                        fprintf(stderr, "failed to write output to %s\n", out_filename);
+                        mu_result_free(result);
+                        mu_engine_close(engine);
+                        return 1;
+                    }
+                } else {
+                    rc = write_json ? mu_result_write_json(result, stdout)
+                                    : mu_result_write_markdown(result, stdout);
+                    if (rc == 0) fputc('\n', stdout);
+                }
+                mu_result_free(result);
+            }
+            mu_engine_close(engine);
+            return 0;
+        } else {
+            mu_result *result = NULL;
+            rc = mu_parse_image_file(engine, image_path, &result);
+            if (rc) {
+                fprintf(stderr, "mu_parse_image_file failed: %d\n", rc);
+                mu_result_free(result);
+                mu_engine_close(engine);
+                return 1;
+            }
+            rc = write_json ? mu_result_write_json(result, stdout)
+                            : mu_result_write_markdown(result, stdout);
+            if (rc == 0) fputc('\n', stdout);
             mu_result_free(result);
             mu_engine_close(engine);
-            return 1;
+            return rc == 0 ? 0 : 1;
         }
-        rc = write_json ? mu_result_write_json(result, stdout)
-                        : mu_result_write_markdown(result, stdout);
-        if (rc == 0) fputc('\n', stdout);
-        mu_result_free(result);
-        mu_engine_close(engine);
-        return rc == 0 ? 0 : 1;
     }
     mu_engine_summary(engine, stdout);
     mu_engine_close(engine);
