@@ -2989,3 +2989,22 @@ Interpretation: the fused kernel correctly reduces dispatches and improves the
 tiny `cached_qkv` substage, but it is not worth enabling by default. The next
 useful target needs to remove larger work, likely attention/MLP dispatch groups
 or MPS-backed GEMM paths, not only the QKV/RoPE boundary.
+
+### Decode Dispatch Group Breakdown
+
+Added `MU_TIMING` counters for resident decode dispatch groups:
+
+| Trace | Total dispatches | QKV dispatches | Attention/MLP dispatches | Logits dispatches |
+| --- | ---: | ---: | ---: | ---: |
+| Default text | 1015 | 504 | 504 | 7 |
+| `MU_TEXT_DECODE_QKV_ROPE_FUSION=1` text | 847 | 336 | 504 | 7 |
+| `MU_TEXT_DECODE_QKV_ROPE_FUSION=1` layout | 363 | 144 | 216 | 3 |
+
+Per token, the default path is `72` QKV dispatches, `72` attention/MLP
+dispatches, and `1` logits dispatch. The opt-in QKV + RoPE cache fusion reduces
+only the QKV group to `48` dispatches/token; attention/MLP stays at
+`72` dispatches/token.
+
+Interpretation: logits is not the next bottleneck, and QKV/RoPE micro-fusion
+has already hit diminishing returns. The next high-value target is the
+attention/MLP group.
