@@ -2816,6 +2816,10 @@ Artifacts:
 /tmp/mu-profile-default-224-258.json
 /tmp/mu-profile-no-fusion-224-258.json
 /tmp/mu-profile-224-258.metrics.json
+/tmp/mu-dispatch-count-text-trace.log
+/tmp/mu-dispatch-count-layout-trace.log
+/tmp/mu-dispatch-count-profile-224-258.json
+/tmp/mu-dispatch-count-profile-224-258.metrics.json
 ```
 
 ### 2-Page Same-Run A/B
@@ -2939,3 +2943,23 @@ Result:
 - `vision_encode` is effectively unchanged, so the next meaningful work should
   target resident decode scheduling or larger GEMM/attention paths, not more
   projection/add micro-fusions.
+
+### Resident Decode Dispatch Count
+
+Added timing counters for resident decode command buffers and kernel dispatches:
+
+| Check | Command buffers | Kernel dispatches | Dispatches / command buffer |
+| --- | ---: | ---: | ---: |
+| Text trace | 7 | 1015 | 145 |
+| Layout trace | 3 | 435 | 145 |
+| 2-page profile mean | 341.5/page | 49517.5/page | 145 |
+
+The 2-page profile completed `2 / 2` pages with zero fallback and exact output
+against the previous default profile (`mean_content_token_f1=1.0000`,
+`table_exact_cell_recall=1.0000`). Mean page total was `112.4990s`, mean decode
+was `49.8390s`, and mean vision was `56.8582s`.
+
+Interpretation: the current default path already keeps each decode token in one
+command buffer. The next useful optimization is not command-buffer batching; it
+is reducing the 145 per-token kernel dispatches with larger fused decoder
+kernels or moving high-value pieces to MPS/MSL GEMM paths.

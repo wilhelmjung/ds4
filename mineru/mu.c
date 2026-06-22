@@ -157,6 +157,8 @@ typedef struct mu_text_decode_timing {
     double cached_qkv;
     double cached_attn_mlp;
     double cached_logits;
+    int command_buffers;
+    int kernel_dispatches;
     int steps;
 } mu_text_decode_timing;
 
@@ -185,6 +187,8 @@ static void mu_text_decode_timing_add(mu_text_decode_timing *dst,
     dst->cached_qkv += src->cached_qkv;
     dst->cached_attn_mlp += src->cached_attn_mlp;
     dst->cached_logits += src->cached_logits;
+    dst->command_buffers += src->command_buffers;
+    dst->kernel_dispatches += src->kernel_dispatches;
     dst->steps += src->steps;
 }
 
@@ -4550,6 +4554,10 @@ int mu_text_generate_greedy(mu_engine *e, const int *input_ids, int n_ids,
                                   decode_timing.cached_attn_mlp);
             mu_timing_log_seconds(timing, "text_generate_decode_cached_logits",
                                   decode_timing.cached_logits);
+            mu_timing_log_seconds(timing, "text_generate_decode_command_buffers",
+                                  (double)decode_timing.command_buffers);
+            mu_timing_log_seconds(timing, "text_generate_decode_kernel_dispatches",
+                                  (double)decode_timing.kernel_dispatches);
         }
         free(ids);
         free(hidden_states);
@@ -4993,6 +5001,8 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                 }
                 if (rc != 0) goto fail;
                 if (timing_stats) {
+                    local_timing.command_buffers += 1;
+                    local_timing.kernel_dispatches += 3;
                     local_timing.cached_qkv += mu_time_now_seconds() - qkv_start;
                 }
 
@@ -5043,6 +5053,8 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                 }
                 if (rc != 0) goto fail;
                 if (timing_stats) {
+                    local_timing.command_buffers += 1;
+                    local_timing.kernel_dispatches += 7;
                     local_timing.cached_attn_mlp += mu_time_now_seconds() - attn_mlp_start;
                 }
                 mu_gpu_buf tmp = cur_hs_buf;
@@ -5068,6 +5080,9 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
             rc = mu_gpu_cmd_begin(e->gpu, &ctx);
             if (rc != 0) goto fail;
             mu_gpu_cmd_set_label(ctx, "text_decode_layer_resident");
+            if (timing_stats) {
+                local_timing.command_buffers += 1;
+            }
 
             mu_gpu_buf cur_hs_buf = mu_gpu_scratch_alloc_a_ctx(ctx, hidden * sizeof(float));
             if (!cur_hs_buf.ptr) {
@@ -5158,6 +5173,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                     goto fail;
                 }
                 if (timing_stats) {
+                    local_timing.kernel_dispatches += 6;
                     local_timing.cached_attn_mlp += mu_time_now_seconds() - attn_mlp_start;
                 }
                 cur_hs_buf = out_hs_buf;
@@ -5181,6 +5197,9 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                                                                     out_val_buf);
                     double logits_end = timing_stats ? mu_time_now_seconds() : 0.0;
                     if (resident_rc == 0) {
+                        if (timing_stats) {
+                            local_timing.kernel_dispatches += 1;
+                        }
                         rc = mu_gpu_cmd_commit_and_wait(ctx);
                         if (rc != 0) goto fail;
 
@@ -5700,6 +5719,10 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
                                       decode_timing.cached_attn_mlp);
                 mu_timing_log_seconds(timing, "text_generate_decode_cached_logits",
                                       decode_timing.cached_logits);
+                mu_timing_log_seconds(timing, "text_generate_decode_command_buffers",
+                                      (double)decode_timing.command_buffers);
+                mu_timing_log_seconds(timing, "text_generate_decode_kernel_dispatches",
+                                      (double)decode_timing.kernel_dispatches);
             }
             free(ids); free(pos); free(hidden_states); free(k_cache); free(v_cache);
             if (gpu_cache) {
@@ -5718,6 +5741,10 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
                               decode_timing.cached_attn_mlp);
         mu_timing_log_seconds(timing, "text_generate_decode_cached_logits",
                               decode_timing.cached_logits);
+        mu_timing_log_seconds(timing, "text_generate_decode_command_buffers",
+                              (double)decode_timing.command_buffers);
+        mu_timing_log_seconds(timing, "text_generate_decode_kernel_dispatches",
+                              (double)decode_timing.kernel_dispatches);
     }
     free(ids);
     free(pos);
