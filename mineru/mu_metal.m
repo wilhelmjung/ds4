@@ -98,6 +98,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_qkv;
     id<MTLComputePipelineState> text_decode_fused_ffn;
     id<MTLComputePipelineState> text_decode_qkv_proj_simd;
+    id<MTLComputePipelineState> text_decode_qkv_rope_cache_simd;
     id<MTLComputePipelineState> text_attn_cached_simd;
     id<MTLComputePipelineState> text_prefill_attn_flash;
     id<MTLComputePipelineState> text_prefill_attn_pos_flash;
@@ -630,6 +631,8 @@ int mu_gpu_create(mu_gpu **out) {
                                                           @"mu_text_decode_fused_ffn");
         gpu->text_decode_qkv_proj_simd = mu_gpu_make_pipeline(device, @"mu_dense.metal",
                                                               @"mu_text_decode_qkv_proj_simd");
+        gpu->text_decode_qkv_rope_cache_simd = mu_gpu_make_pipeline(device, @"mu_attn.metal",
+                                                                    @"mu_text_decode_qkv_rope_cache_simd");
         gpu->text_attn_cached_simd = mu_gpu_make_pipeline(device, @"mu_attn.metal",
                                                           @"mu_text_attn_cached_simd");
         gpu->text_prefill_rope_cache_update = mu_gpu_make_pipeline(device, @"mu_attn.metal",
@@ -688,6 +691,7 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->dense_bf16_bias_rows_simdgroup_qkv = nil;
     gpu->text_decode_fused_ffn = nil;
     gpu->text_decode_qkv_proj_simd = nil;
+    gpu->text_decode_qkv_rope_cache_simd = nil;
     gpu->text_attn_cached_simd = nil;
     gpu->dense_mps_1280_1280 = nil;
     gpu->dense_mps_1280_2560 = nil;
@@ -2377,6 +2381,51 @@ int mu_gpu_text_decode_qkv_proj_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x,
     MTLSize threads = MTLSizeMake(32, 1, 1);
     [ctx->encoder dispatchThreads:grid threadsPerThreadgroup:threads];
 
+    return 0;
+}
+
+int mu_gpu_text_decode_qkv_rope_cache_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x,
+                                          mu_gpu_buf qw, mu_gpu_buf qb,
+                                          mu_gpu_buf kw, mu_gpu_buf kb,
+                                          mu_gpu_buf vw, mu_gpu_buf vb,
+                                          mu_gpu_buf q_out,
+                                          mu_gpu_kv_cache *cache, int layer,
+                                          int cache_pos, const int pos3[3],
+                                          int cols) {
+    if (!ctx || !x.ptr || !qw.ptr || !qb.ptr || !kw.ptr || !kb.ptr || !vw.ptr || !vb.ptr ||
+        !q_out.ptr || !cache || !pos3 || cols <= 0 ||
+        layer < 0 || layer >= cache->layers ||
+        cache_pos < 0 || cache_pos >= cache->cap) return -1;
+    if (!ctx->gpu->text_decode_qkv_rope_cache_simd) return -2;
+
+    id<MTLBuffer> x_buf = (__bridge id<MTLBuffer>)x.ptr;
+    id<MTLBuffer> qw_buf = (__bridge id<MTLBuffer>)qw.ptr;
+    id<MTLBuffer> qb_buf = (__bridge id<MTLBuffer>)qb.ptr;
+    id<MTLBuffer> kw_buf = (__bridge id<MTLBuffer>)kw.ptr;
+    id<MTLBuffer> kb_buf = (__bridge id<MTLBuffer>)kb.ptr;
+    id<MTLBuffer> vw_buf = (__bridge id<MTLBuffer>)vw.ptr;
+    id<MTLBuffer> vb_buf = (__bridge id<MTLBuffer>)vb.ptr;
+    id<MTLBuffer> q_out_buf = (__bridge id<MTLBuffer>)q_out.ptr;
+    NSUInteger kv_offset = (NSUInteger)layer * (NSUInteger)cache->cap * 128u * sizeof(float);
+
+    [ctx->encoder setComputePipelineState:ctx->gpu->text_decode_qkv_rope_cache_simd];
+    [ctx->encoder setBuffer:x_buf offset:x.offset atIndex:0];
+    [ctx->encoder setBuffer:qw_buf offset:qw.offset atIndex:1];
+    [ctx->encoder setBuffer:qb_buf offset:qb.offset atIndex:2];
+    [ctx->encoder setBuffer:kw_buf offset:kw.offset atIndex:3];
+    [ctx->encoder setBuffer:kb_buf offset:kb.offset atIndex:4];
+    [ctx->encoder setBuffer:vw_buf offset:vw.offset atIndex:5];
+    [ctx->encoder setBuffer:vb_buf offset:vb.offset atIndex:6];
+    [ctx->encoder setBuffer:q_out_buf offset:q_out.offset atIndex:7];
+    [ctx->encoder setBuffer:cache->k_cache offset:kv_offset atIndex:8];
+    [ctx->encoder setBuffer:cache->v_cache offset:kv_offset atIndex:9];
+    [ctx->encoder setBytes:pos3 length:3 * sizeof(pos3[0]) atIndex:10];
+    [ctx->encoder setBytes:&cache_pos length:sizeof(cache_pos) atIndex:11];
+    [ctx->encoder setBytes:&cols length:sizeof(cols) atIndex:12];
+
+    MTLSize grid = MTLSizeMake(32, 640, 1);
+    MTLSize threads = MTLSizeMake(32, 1, 1);
+    [ctx->encoder dispatchThreads:grid threadsPerThreadgroup:threads];
     return 0;
 }
 

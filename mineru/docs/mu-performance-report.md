@@ -2820,6 +2820,12 @@ Artifacts:
 /tmp/mu-dispatch-count-layout-trace.log
 /tmp/mu-dispatch-count-profile-224-258.json
 /tmp/mu-dispatch-count-profile-224-258.metrics.json
+/tmp/mu-qkv-rope-optin-default-text-trace.log
+/tmp/mu-qkv-rope-optin-fused-text-trace.log
+/tmp/mu-qkv-rope-optin-fused-layout-trace.log
+/tmp/mu-qkv-rope-fusion-224-258.json
+/tmp/mu-qkv-rope-no-fusion-224-258.json
+/tmp/mu-qkv-rope-fusion-224-258.metrics.json
 ```
 
 ### 2-Page Same-Run A/B
@@ -2963,3 +2969,23 @@ Interpretation: the current default path already keeps each decode token in one
 command buffer. The next useful optimization is not command-buffer batching; it
 is reducing the 145 per-token kernel dispatches with larger fused decoder
 kernels or moving high-value pieces to MPS/MSL GEMM paths.
+
+### Opt-in QKV + RoPE Cache Fusion
+
+Added an opt-in fused decoder kernel behind
+`MU_TEXT_DECODE_QKV_ROPE_FUSION=1`. It combines text decoder QKV projection with
+RoPE and KV-cache update. The default path remains unchanged because the small
+same-run A/B did not show an end-to-end win.
+
+| Path | Mean page s | Mean decode s | Mean qkv s | Dispatches / token |
+| --- | ---: | ---: | ---: | ---: |
+| Default | 87.4687 | 35.4210 | 0.0090 | 145 |
+| `MU_TEXT_DECODE_QKV_ROPE_FUSION=1` | 108.7354 | 46.3054 | 0.0063 | 121 |
+
+Output comparison for pages `224,258` stayed exact:
+`mean_content_token_f1=1.0000`, `table_exact_cell_recall=1.0000`.
+
+Interpretation: the fused kernel correctly reduces dispatches and improves the
+tiny `cached_qkv` substage, but it is not worth enabling by default. The next
+useful target needs to remove larger work, likely attention/MLP dispatch groups
+or MPS-backed GEMM paths, not only the QKV/RoPE boundary.

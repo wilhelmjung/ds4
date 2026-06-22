@@ -1,6 +1,11 @@
 #include <metal_stdlib>
 using namespace metal;
 
+static inline float mu_bf16_to_f32(ushort v) {
+    uint bits = ((uint)v) << 16;
+    return as_type<float>(bits);
+}
+
 kernel void mu_text_attn_token0(device const float *v [[buffer(0)]],
                                 device float *out [[buffer(1)]],
                                 uint gid [[thread_position_in_grid]]) {
@@ -272,6 +277,118 @@ kernel void mu_text_rope_cache_update(device float *q [[buffer(0)]],
 
     if (gid < 128) {
         v_cache[(size_t)cache_pos * 128u + (size_t)gid] = v[gid];
+    }
+}
+
+kernel void mu_text_decode_qkv_rope_cache_simd(device const float *x [[buffer(0)]],
+                                               device const ushort *qw [[buffer(1)]],
+                                               device const ushort *qb [[buffer(2)]],
+                                               device const ushort *kw [[buffer(3)]],
+                                               device const ushort *kb [[buffer(4)]],
+                                               device const ushort *vw [[buffer(5)]],
+                                               device const ushort *vb [[buffer(6)]],
+                                               device float *q_out [[buffer(7)]],
+                                               device float *k_cache [[buffer(8)]],
+                                               device float *v_cache [[buffer(9)]],
+                                               constant int *pos3 [[buffer(10)]],
+                                               constant int &cache_pos [[buffer(11)]],
+                                               constant int &cols [[buffer(12)]],
+                                               uint2 gid [[thread_position_in_grid]],
+                                               uint simd_lane [[thread_index_in_simdgroup]]) {
+    uint row = gid.y;
+    if (row >= 640) return;
+
+    device const ushort *w0;
+    device const ushort *b0;
+    device const ushort *w1 = nullptr;
+    device const ushort *b1 = nullptr;
+    uint out0 = 0;
+    uint out1 = 0;
+    bool pair = row < 512;
+    bool is_q = row < 448;
+    bool is_k = row >= 448 && row < 512;
+
+    if (is_q) {
+        uint head = row / 32;
+        uint d = row - head * 32;
+        out0 = head * 64 + d;
+        out1 = out0 + 32;
+        w0 = qw + (size_t)out0 * (size_t)cols;
+        b0 = qb + out0;
+        w1 = qw + (size_t)out1 * (size_t)cols;
+        b1 = qb + out1;
+    } else if (is_k) {
+        uint krow = row - 448;
+        uint head = krow / 32;
+        uint d = krow - head * 32;
+        out0 = head * 64 + d;
+        out1 = out0 + 32;
+        w0 = kw + (size_t)out0 * (size_t)cols;
+        b0 = kb + out0;
+        w1 = kw + (size_t)out1 * (size_t)cols;
+        b1 = kb + out1;
+    } else {
+        out0 = row - 512;
+        w0 = vw + (size_t)out0 * (size_t)cols;
+        b0 = vb + out0;
+    }
+
+    float local0 = 0.0f;
+    float local1 = 0.0f;
+    if ((cols & 3) == 0) {
+        device const float4 *x_vec = (device const float4 *)x;
+        device const ushort4 *w0_vec = (device const ushort4 *)w0;
+        device const ushort4 *w1_vec = (device const ushort4 *)w1;
+        int cols_vec = cols / 4;
+        for (int c = (int)simd_lane; c < cols_vec; c += 32) {
+            float4 xv = x_vec[c];
+            ushort4 wv0 = w0_vec[c];
+            local0 += xv.x * mu_bf16_to_f32(wv0.x) +
+                      xv.y * mu_bf16_to_f32(wv0.y) +
+                      xv.z * mu_bf16_to_f32(wv0.z) +
+                      xv.w * mu_bf16_to_f32(wv0.w);
+            if (pair) {
+                ushort4 wv1 = w1_vec[c];
+                local1 += xv.x * mu_bf16_to_f32(wv1.x) +
+                          xv.y * mu_bf16_to_f32(wv1.y) +
+                          xv.z * mu_bf16_to_f32(wv1.z) +
+                          xv.w * mu_bf16_to_f32(wv1.w);
+            }
+        }
+    } else {
+        for (int c = (int)simd_lane; c < cols; c += 32) {
+            float xv = x[c];
+            local0 += xv * mu_bf16_to_f32(w0[c]);
+            if (pair) local1 += xv * mu_bf16_to_f32(w1[c]);
+        }
+    }
+
+    float acc0 = simd_sum(local0);
+    float acc1 = simd_sum(local1);
+    if (simd_lane != 0) return;
+
+    acc0 += mu_bf16_to_f32(*b0);
+    if (pair) acc1 += mu_bf16_to_f32(*b1);
+
+    if (is_q || is_k) {
+        uint d = out0 & 31u;
+        int axis = mu_text_rope_axis((int)d);
+        float inv = pow(1000000.0f, -((float)(2u * d) / 64.0f));
+        float angle = (float)pos3[axis] * inv;
+        float c = cos(angle);
+        float s = sin(angle);
+        float rot0 = acc0 * c - acc1 * s;
+        float rot1 = acc1 * c + acc0 * s;
+        if (is_q) {
+            q_out[out0] = rot0;
+            q_out[out1] = rot1;
+        } else {
+            size_t base = (size_t)cache_pos * 128u;
+            k_cache[base + (size_t)out0] = rot0;
+            k_cache[base + (size_t)out1] = rot1;
+        }
+    } else {
+        v_cache[(size_t)cache_pos * 128u + (size_t)out0] = acc0;
     }
 }
 

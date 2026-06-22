@@ -4935,6 +4935,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
         int hidden_resident = getenv("MU_TEXT_CACHED_HIDDEN_RESIDENT") != NULL && gpu_cache;
         int request_layer_resident = getenv("MU_TEXT_CACHED_LAYER_RESIDENT") != NULL;
         int disable_layer_resident = getenv("MU_TEXT_CACHED_LAYER_RESIDENT_DISABLE") != NULL;
+        int request_qkv_rope_fusion = getenv("MU_TEXT_DECODE_QKV_ROPE_FUSION") != NULL;
         int layer_resident = gpu_cache && (request_layer_resident || !disable_layer_resident);
         if (hidden_resident) {
             unsigned long hidden_bytes = hidden * sizeof(float);
@@ -5154,11 +5155,19 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                 }
 
                 double qkv_start = timing_stats ? mu_time_now_seconds() : 0.0;
+                int use_qkv_rope_fusion = request_qkv_rope_fusion;
                 rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, cur_hs_buf, input_norm_buf, normed_buf, hidden, eps);
-                if (rc == 0) rc = mu_gpu_text_decode_qkv_proj_ctx(ctx, normed_buf, qw_buf, qb_buf, kw_buf, kb_buf, vw_buf, vb_buf, q_buf, k_buf, v_buf, hidden);
-                if (rc == 0) rc = mu_gpu_text_rope_cache_update_ctx(ctx, q_buf, k_buf, v_buf,
-                                                                    gpu_cache, layer,
-                                                                    cache_pos, pos3);
+                if (use_qkv_rope_fusion) {
+                    if (rc == 0) rc = mu_gpu_text_decode_qkv_rope_cache_ctx(ctx, normed_buf, qw_buf, qb_buf,
+                                                                            kw_buf, kb_buf, vw_buf, vb_buf,
+                                                                            q_buf, gpu_cache, layer,
+                                                                            cache_pos, pos3, hidden);
+                } else {
+                    if (rc == 0) rc = mu_gpu_text_decode_qkv_proj_ctx(ctx, normed_buf, qw_buf, qb_buf, kw_buf, kb_buf, vw_buf, vb_buf, q_buf, k_buf, v_buf, hidden);
+                    if (rc == 0) rc = mu_gpu_text_rope_cache_update_ctx(ctx, q_buf, k_buf, v_buf,
+                                                                        gpu_cache, layer,
+                                                                        cache_pos, pos3);
+                }
                 if (timing_stats) {
                     local_timing.cached_qkv += mu_time_now_seconds() - qkv_start;
                 }
@@ -5173,7 +5182,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                     goto fail;
                 }
                 if (timing_stats) {
-                    local_timing.kernel_dispatches += 6;
+                    local_timing.kernel_dispatches += use_qkv_rope_fusion ? 5 : 6;
                     local_timing.cached_attn_mlp += mu_time_now_seconds() - attn_mlp_start;
                 }
                 cur_hs_buf = out_hs_buf;

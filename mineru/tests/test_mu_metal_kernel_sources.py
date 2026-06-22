@@ -164,6 +164,18 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn("mu_gpu_text_decode_qkv_proj_ctx(ctx", source)
         self.assertIn("mu_gpu_dense_probe_add_ctx(ctx", source)
 
+    def test_text_decoder_qkv_rope_cache_fusion_is_wired(self):
+        metal = (ROOT / "mineru/metal/mu_attn.metal").read_text()
+        header = (ROOT / "mineru/mu_gpu.h").read_text()
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+        source = (ROOT / "mineru/mu.c").read_text()
+
+        self.assertIn("kernel void mu_text_decode_qkv_rope_cache_simd", metal)
+        self.assertIn("mu_gpu_text_decode_qkv_rope_cache_ctx", header)
+        self.assertIn('"mu_text_decode_qkv_rope_cache_simd"', host)
+        self.assertIn('getenv("MU_TEXT_DECODE_QKV_ROPE_FUSION")', source)
+        self.assertIn("mu_gpu_text_decode_qkv_rope_cache_ctx(ctx", source)
+
     def test_text_prefill_flash_attention_is_wired(self):
         metal = (ROOT / "mineru/metal/mu_attn.metal").read_text()
         host = (ROOT / "mineru/mu_metal.m").read_text()

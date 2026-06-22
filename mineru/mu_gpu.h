@@ -4,6 +4,7 @@
 #include <stdbool.h>
 
 typedef struct mu_gpu mu_gpu;
+typedef struct mu_gpu_kv_cache mu_gpu_kv_cache;
 
 int mu_gpu_create(mu_gpu **out);
 void mu_gpu_destroy(mu_gpu *gpu);
@@ -114,6 +115,14 @@ int mu_gpu_text_decode_qkv_proj_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x,
                                     mu_gpu_buf vw, mu_gpu_buf vb,
                                     mu_gpu_buf q_out, mu_gpu_buf k_out, mu_gpu_buf v_out,
                                     int cols);
+int mu_gpu_text_decode_qkv_rope_cache_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x,
+                                          mu_gpu_buf qw, mu_gpu_buf qb,
+                                          mu_gpu_buf kw, mu_gpu_buf kb,
+                                          mu_gpu_buf vw, mu_gpu_buf vb,
+                                          mu_gpu_buf q_out,
+                                          mu_gpu_kv_cache *cache, int layer,
+                                          int cache_pos, const int pos3[3],
+                                          int cols);
 int mu_gpu_dense_probe_add_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
                                mu_gpu_buf residual, mu_gpu_buf out, int rows, int cols);
 int mu_gpu_dense_probe_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
@@ -159,8 +168,6 @@ int mu_gpu_vision_gelu_bf16_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x,
                                  int n, mu_gpu_buf out);
 int mu_gpu_vision_merge4_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf hidden,
                              int rows, mu_gpu_buf out);
-
-typedef struct mu_gpu_kv_cache mu_gpu_kv_cache;
 
 int mu_gpu_kv_cache_create(mu_gpu *gpu, int layers, int cap, mu_gpu_kv_cache **out);
 void mu_gpu_kv_cache_destroy(mu_gpu_kv_cache *cache);
