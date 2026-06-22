@@ -2813,6 +2813,9 @@ Artifacts:
 /tmp/mu-benchmark-metal-10page-probe-add-fusion-fresh.json
 /tmp/mu-benchmark-metal-10page-no-probe-add-fusion-fresh.json
 /tmp/mu-probe-add-fusion-10page-fresh.metrics.json
+/tmp/mu-profile-default-224-258.json
+/tmp/mu-profile-no-fusion-224-258.json
+/tmp/mu-profile-224-258.metrics.json
 ```
 
 ### 2-Page Same-Run A/B
@@ -2916,3 +2919,23 @@ Decision:
 - Do not claim Direction 3 as a new best 10-page E2E baseline; use Direction 2
   (`900.3740s`) as the faster historical artifact until a future run beats it
   under comparable conditions.
+
+### Follow-up 2-Page Stage Profile
+
+Pages `224,258` were rerun as a small same-run profile to choose the next
+optimization target.
+
+| Path | Total s | Mean page s | Mean vision s | Mean decode s |
+| --- | ---: | ---: | ---: | ---: |
+| Probe-add fusion default | 222.8329 | 111.4165 | 56.8346 | 48.0550 |
+| `MU_TEXT_DECODE_NO_PROBE_ADD_FUSION=1` | 225.3579 | 112.6789 | 56.5676 | 50.2975 |
+
+Result:
+
+- Output remained exact (`mean_content_token_f1=1.0000`,
+  `table_exact_cell_recall=1.0000`).
+- Probe-add fusion is only a small local win here: `1.0113x` total and
+  `1.0467x` decode speedup.
+- `vision_encode` is effectively unchanged, so the next meaningful work should
+  target resident decode scheduling or larger GEMM/attention paths, not more
+  projection/add micro-fusions.
