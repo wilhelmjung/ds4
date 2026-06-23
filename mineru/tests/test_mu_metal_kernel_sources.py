@@ -259,3 +259,14 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn("vision_attn_mpsgraph_pack_qkv", host)
         self.assertIn("vision_attn_mpsgraph_graph", host)
         self.assertIn("vision_attn_mpsgraph_copy_round", host)
+
+    def test_vision_attention_packed_msl_5476_lane_is_wired(self):
+        metal = (ROOT / "mineru/metal/mu_vision.metal").read_text()
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn("kernel void mu_vision_attn_rows_packed_flash", metal)
+        self.assertIn("vision_attn_rows_packed_flash", host)
+        self.assertIn('"mu_vision_attn_rows_packed_flash"', host)
+        self.assertIn('getenv("MU_VISION_ATTN_MSL_PACKED_5476")', host)
+        self.assertIn("rows == 5476", host)
+        self.assertIn("path=packed_flash_5476", host)

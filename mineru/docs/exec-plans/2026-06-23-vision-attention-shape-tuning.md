@@ -356,6 +356,35 @@ Updated decision:
   `rows=5476`, using MPSGraph as the correctness oracle and keeping MPSGraph as
   default until the 2-page and 10-page gates prove a faster exact path.
 
+Packed MSL 5476 result, 2026-06-23:
+
+- Added an opt-in packed MSL comparison lane:
+
+  ```text
+  MU_VISION_ATTN_MSL_PACKED_5476=1
+  ```
+
+- The lane applies only when `rows == 5476`; other shapes continue using the
+  default MPSGraph path.
+- It reuses the existing MPSGraph Q/K/V pack layout and then runs
+  `mu_vision_attn_rows_packed_flash`.
+- Page `258` skip-content, same `max_new_tokens=512` gate:
+
+| Path | Total s | Layout vision s | Fallback rows | Output parity |
+| --- | ---: | ---: | ---: | --- |
+| MPSGraph default | 30.6620 | 18.9131 | 0 | baseline |
+| `MU_VISION_ATTN_MSL_PACKED_5476=1` | 46.5352 | 34.0411 | 0 | byte-level exact |
+
+Decision:
+
+- Reject packed MSL 5476 as a promotion candidate. It is exact, but already
+  `1.52x` slower in total page time and `1.80x` slower in layout vision on the
+  fastest realistic gate.
+- Do not run the longer 2-page or 10-page gates for this lane.
+- Keep it as an opt-in diagnostic comparison lane only.
+- The next local M5 candidate needs a materially different attention design
+  such as simdgroup/tiled SDPA, or it should target a non-attention stage.
+
 ## References
 
 - `mineru/mu_metal.m`: current `mu_gpu_vision_encode` and host-side attention

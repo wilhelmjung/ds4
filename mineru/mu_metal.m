@@ -83,6 +83,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> vision_attn_rows_online;
     id<MTLComputePipelineState> vision_attn_rows_flash;
     id<MTLComputePipelineState> vision_attn_rows_flash_k16;
+    id<MTLComputePipelineState> vision_attn_rows_packed_flash;
     id<MTLComputePipelineState> vision_attn_pack_qkv_mpsgraph;
     id<MTLComputePipelineState> vision_attn_copy_mpsgraph;
     id<MTLComputePipelineState> vision_add_bf16;
@@ -168,6 +169,14 @@ static int mu_gpu_vision_attn_rows_mpsgraph_stage(mu_gpu *gpu,
                                                   int rows,
                                                   mu_gpu_buf out,
                                                   bool shape_profile);
+static int mu_gpu_vision_attn_rows_packed_flash_stage(mu_gpu *gpu,
+                                                      mu_gpu_cmd_ctx *ctx,
+                                                      mu_gpu_buf q,
+                                                      mu_gpu_buf kv,
+                                                      const float *rotary,
+                                                      int rows,
+                                                      mu_gpu_buf out,
+                                                      bool shape_profile);
 
 static NSString *mu_gpu_shader_path(NSString *name) {
     NSString *cwd_path = [@"mineru/metal" stringByAppendingPathComponent:name];
@@ -754,6 +763,66 @@ static int mu_gpu_vision_attn_rows_mpsgraph_stage(mu_gpu *gpu,
     return 0;
 }
 
+static int mu_gpu_vision_attn_rows_packed_flash_stage(mu_gpu *gpu,
+                                                      mu_gpu_cmd_ctx *ctx,
+                                                      mu_gpu_buf q,
+                                                      mu_gpu_buf kv,
+                                                      const float *rotary,
+                                                      int rows,
+                                                      mu_gpu_buf out,
+                                                      bool shape_profile) {
+    if (!gpu || !ctx || !q.ptr || !kv.ptr || !rotary || !out.ptr || rows <= 0) return -1;
+    if (!gpu->vision_attn_pack_qkv_mpsgraph || !gpu->vision_attn_rows_packed_flash) return -2;
+
+    id<MTLBuffer> q_buf = (__bridge id<MTLBuffer>)q.ptr;
+    id<MTLBuffer> kv_buf = (__bridge id<MTLBuffer>)kv.ptr;
+    id<MTLBuffer> out_buf = (__bridge id<MTLBuffer>)out.ptr;
+    NSUInteger packed_bytes = (NSUInteger)rows * 1280u * sizeof(float);
+    NSUInteger rotary_bytes = (NSUInteger)rows * 40u * sizeof(float);
+    id<MTLBuffer> rotary_buf = [gpu->device newBufferWithBytes:rotary
+                                                        length:rotary_bytes
+                                                       options:MTLResourceStorageModeShared];
+    id<MTLBuffer> q_pack = [gpu->device newBufferWithLength:packed_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> k_pack = [gpu->device newBufferWithLength:packed_bytes options:MTLResourceStorageModeShared];
+    id<MTLBuffer> v_pack = [gpu->device newBufferWithLength:packed_bytes options:MTLResourceStorageModeShared];
+    if (!rotary_buf || !q_pack || !k_pack || !v_pack) return -3;
+
+    [ctx->encoder setComputePipelineState:gpu->vision_attn_pack_qkv_mpsgraph];
+    [ctx->encoder setBuffer:q_buf offset:q.offset atIndex:0];
+    [ctx->encoder setBuffer:kv_buf offset:kv.offset atIndex:1];
+    [ctx->encoder setBuffer:rotary_buf offset:0 atIndex:2];
+    [ctx->encoder setBuffer:q_pack offset:0 atIndex:3];
+    [ctx->encoder setBuffer:k_pack offset:0 atIndex:4];
+    [ctx->encoder setBuffer:v_pack offset:0 atIndex:5];
+    [ctx->encoder setBytes:&rows length:sizeof(rows) atIndex:6];
+    [ctx->encoder dispatchThreads:MTLSizeMake((NSUInteger)rows * 1280u, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    [ctx->encoder setComputePipelineState:gpu->vision_attn_rows_packed_flash];
+    [ctx->encoder setBuffer:q_pack offset:0 atIndex:0];
+    [ctx->encoder setBuffer:k_pack offset:0 atIndex:1];
+    [ctx->encoder setBuffer:v_pack offset:0 atIndex:2];
+    [ctx->encoder setBuffer:out_buf offset:out.offset atIndex:3];
+    [ctx->encoder setBytes:&rows length:sizeof(rows) atIndex:4];
+    MTLSize grid = MTLSizeMake(((NSUInteger)rows + 31u) / 32u, 16u, 1);
+    MTLSize threads = MTLSizeMake(32, 1, 1);
+    if (shape_profile) {
+        fprintf(stderr,
+                "mu_profile stage=vision_attn_shape path=packed_flash_5476 rows=%d "
+                "threadgroups=%lux%lux%lu threads=%lux%lux%lu "
+                "query_tile_rows=32 key_tile_rows=32 heads=16\n",
+                rows,
+                (unsigned long)grid.width,
+                (unsigned long)grid.height,
+                (unsigned long)grid.depth,
+                (unsigned long)threads.width,
+                (unsigned long)threads.height,
+                (unsigned long)threads.depth);
+    }
+    [ctx->encoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
+    return 0;
+}
+
 int mu_gpu_create(mu_gpu **out) {
     if (!out) return -1;
     *out = NULL;
@@ -825,6 +894,10 @@ int mu_gpu_create(mu_gpu **out) {
         if (getenv("MU_VISION_ATTN_FLASH_K16") != NULL) {
             gpu->vision_attn_rows_flash_k16 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
                                                                    @"mu_vision_attn_rows_flash_k16");
+        }
+        if (getenv("MU_VISION_ATTN_MSL_PACKED_5476") != NULL) {
+            gpu->vision_attn_rows_packed_flash = mu_gpu_make_pipeline(device, @"mu_vision.metal",
+                                                                      @"mu_vision_attn_rows_packed_flash");
         }
         if (getenv("MU_VISION_ATTN_NO_MPSGRAPH") == NULL) {
             gpu->vision_attn_pack_qkv_mpsgraph = mu_gpu_make_pipeline(device, @"mu_vision.metal",
@@ -943,6 +1016,7 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->vision_attn_rows_online = nil;
     gpu->vision_attn_rows_flash = nil;
     gpu->vision_attn_rows_flash_k16 = nil;
+    gpu->vision_attn_rows_packed_flash = nil;
     gpu->vision_attn_pack_qkv_mpsgraph = nil;
     gpu->vision_attn_copy_mpsgraph = nil;
     gpu->vision_attn_mpsgraph = nil;
@@ -2012,12 +2086,18 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
                 if (rc != 0) return rc;
             }
 
+            bool request_packed_msl_5476 = getenv("MU_VISION_ATTN_MSL_PACKED_5476") != NULL;
             bool request_mpsgraph = getenv("MU_VISION_ATTN_MPSGRAPH") != NULL;
             bool disable_mpsgraph = getenv("MU_VISION_ATTN_NO_MPSGRAPH") != NULL;
             bool request_legacy_attention =
                 getenv("MU_VISION_ATTN_FLASH_K16") != NULL ||
                 getenv("MU_VISION_ATTN_NO_FLASH") != NULL ||
                 getenv("MU_VISION_ATTN_ONLINE") != NULL;
+            bool use_packed_msl_5476 =
+                request_packed_msl_5476 &&
+                rows == 5476 &&
+                gpu->vision_attn_rows_packed_flash &&
+                gpu->vision_attn_pack_qkv_mpsgraph;
             bool use_mpsgraph_attention =
                 !disable_mpsgraph &&
                 (request_mpsgraph || !request_legacy_attention) &&
@@ -2032,6 +2112,14 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
                     attn_r.offset += (size_t)r * 1280u * sizeof(float);
                     rc = mu_gpu_vision_attn_concat_probe_ctx(ctx, q_r, temp_kv, rotary, rows, r, attn_r);
                 }
+            } else if (use_packed_msl_5476) {
+                if (shape_profile) {
+                    fprintf(stderr, "mu_profile stage=vision_attn_shape layer=%d rows=%d\n",
+                            layer, rows);
+                }
+                rc = mu_gpu_vision_attn_rows_packed_flash_stage(gpu, ctx, temp_q, temp_kv,
+                                                                rotary, rows, temp_attn,
+                                                                shape_profile);
             } else if (use_mpsgraph_attention) {
                 if (shape_profile) {
                     fprintf(stderr, "mu_profile stage=vision_attn_shape layer=%d rows=%d\n",

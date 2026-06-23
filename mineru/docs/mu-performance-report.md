@@ -3712,3 +3712,56 @@ Next direction:
    shape `rows=5476`, using the MPSGraph path as the correctness oracle.
 3. Keep MPSGraph as default until a 2-page and then 10-page gate beats the
    current default `516.3763s` fresh 10-page result with exact output parity.
+
+### Packed MSL 5476 Attention Prototype
+
+Date: 2026-06-23
+
+Added an opt-in custom MSL attention comparison lane:
+
+```text
+MU_VISION_ATTN_MSL_PACKED_5476=1
+```
+
+Scope:
+
+- Applies only to the stable layout attention shape `rows == 5476`.
+- Other shapes continue using the default MPSGraph path.
+- Reuses the existing MPSGraph Q/K/V pack layout, then runs
+  `mu_vision_attn_rows_packed_flash` directly in MSL.
+- MPSGraph remains the default and the correctness oracle.
+
+Single-page gate:
+
+```text
+page=258
+skip-content=true
+max_new_tokens=512
+```
+
+Results:
+
+| Path | Total s | Layout vision s | Fallback rows | Output parity |
+| --- | ---: | ---: | ---: | --- |
+| MPSGraph default | 30.6620 | 18.9131 | 0 | baseline |
+| `MU_VISION_ATTN_MSL_PACKED_5476=1` | 46.5352 | 34.0411 | 0 | byte-level exact |
+
+Artifacts:
+
+```text
+/tmp/mu-vision-mpsgraph-default-258-skip-512-20260623.json
+/tmp/mu-vision-mpsgraph-default-258-skip-512-20260623/metal_page_0258.json
+/tmp/mu-vision-packed-msl-5476-258-skip-20260623.json
+/tmp/mu-vision-packed-msl-5476-258-skip-20260623/metal_page_0258.json
+```
+
+Decision:
+
+- Reject the packed MSL 5476 lane as a promotion candidate.
+- It is exact, but `1.52x` slower in total page time and `1.80x` slower in
+  layout vision on the fastest realistic gate.
+- Do not run the longer 2-page or 10-page gates for this prototype.
+- Keep it as an opt-in diagnostic comparison lane only.
+- The next local M5 optimization should avoid another naive online-softmax MSL
+  attention kernel. Either test a materially different simdgroup/tiled SDPA
+  design or move to the next largest non-attention stage.
