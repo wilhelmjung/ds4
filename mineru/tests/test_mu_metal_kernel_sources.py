@@ -224,3 +224,13 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn("vision_attn_shape", host)
         self.assertIn("path=flash", host)
         self.assertIn("threadgroups=", host)
+
+    def test_vision_attention_flash_k16_variant_is_wired(self):
+        metal = (ROOT / "mineru/metal/mu_vision.metal").read_text()
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn("kernel void mu_vision_attn_rows_flash_k16", metal)
+        self.assertIn("vision_attn_rows_flash_k16", host)
+        self.assertIn('"mu_vision_attn_rows_flash_k16"', host)
+        self.assertIn('getenv("MU_VISION_ATTN_FLASH_K16")', host)
+        self.assertIn("key_tile_rows=16", host)

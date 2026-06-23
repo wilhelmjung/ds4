@@ -81,6 +81,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> vision_softmax_pv_head;
     id<MTLComputePipelineState> vision_attn_rows_online;
     id<MTLComputePipelineState> vision_attn_rows_flash;
+    id<MTLComputePipelineState> vision_attn_rows_flash_k16;
     id<MTLComputePipelineState> vision_add_bf16;
     id<MTLComputePipelineState> vision_quick_gelu_bf16;
     id<MTLComputePipelineState> vision_gelu_bf16;
@@ -633,6 +634,10 @@ int mu_gpu_create(mu_gpu **out) {
                                                             @"mu_vision_attn_rows_online");
         gpu->vision_attn_rows_flash = mu_gpu_make_pipeline(device, @"mu_vision.metal",
                                                            @"mu_vision_attn_rows_flash");
+        if (getenv("MU_VISION_ATTN_FLASH_K16") != NULL) {
+            gpu->vision_attn_rows_flash_k16 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
+                                                                   @"mu_vision_attn_rows_flash_k16");
+        }
         gpu->vision_add_bf16 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
                                                     @"mu_vision_add_bf16");
         gpu->vision_quick_gelu_bf16 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
@@ -743,6 +748,7 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->vision_add_bf16 = nil;
     gpu->vision_attn_rows_online = nil;
     gpu->vision_attn_rows_flash = nil;
+    gpu->vision_attn_rows_flash_k16 = nil;
     gpu->vision_softmax_pv_head = nil;
     gpu->vision_pv_head = nil;
     gpu->vision_softmax_bf16_rows = nil;
@@ -3282,8 +3288,13 @@ int mu_gpu_vision_attn_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q, mu_gpu_buf kv
 
     bool request_flash = getenv("MU_VISION_ATTN_NO_FLASH") == NULL;
     bool shape_profile = getenv("MU_VISION_ATTN_SHAPE_PROFILE") != NULL;
-    if (request_flash && ctx->gpu->vision_attn_rows_flash) {
-        [ctx->encoder setComputePipelineState:ctx->gpu->vision_attn_rows_flash];
+    bool request_flash_k16 = getenv("MU_VISION_ATTN_FLASH_K16") != NULL;
+    bool use_flash_k16 = request_flash_k16 && ctx->gpu->vision_attn_rows_flash_k16 != nil;
+    id<MTLComputePipelineState> flash_pipeline = use_flash_k16
+        ? ctx->gpu->vision_attn_rows_flash_k16
+        : ctx->gpu->vision_attn_rows_flash;
+    if (request_flash && flash_pipeline) {
+        [ctx->encoder setComputePipelineState:flash_pipeline];
         [ctx->encoder setBuffer:q_buf offset:q.offset atIndex:0];
         [ctx->encoder setBuffer:kv_buf offset:kv.offset atIndex:1];
         [ctx->encoder setBuffer:rotary_buf offset:rotary_offset atIndex:2];
@@ -3293,17 +3304,31 @@ int mu_gpu_vision_attn_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q, mu_gpu_buf kv
         MTLSize grid = MTLSizeMake(((NSUInteger)rows + 31u) / 32u, 16u, 1);
         MTLSize threads = MTLSizeMake(32, 1, 1);
         if (shape_profile) {
-            fprintf(stderr,
-                    "mu_profile stage=vision_attn_shape path=flash rows=%d "
-                    "threadgroups=%lux%lux%lu threads=%lux%lux%lu "
-                    "query_tile_rows=32 key_tile_rows=32 heads=16\n",
-                    rows,
-                    (unsigned long)grid.width,
-                    (unsigned long)grid.height,
-                    (unsigned long)grid.depth,
-                    (unsigned long)threads.width,
-                    (unsigned long)threads.height,
-                    (unsigned long)threads.depth);
+            if (use_flash_k16) {
+                fprintf(stderr,
+                        "mu_profile stage=vision_attn_shape path=flash_k16 rows=%d "
+                        "threadgroups=%lux%lux%lu threads=%lux%lux%lu "
+                        "query_tile_rows=32 key_tile_rows=16 heads=16\n",
+                        rows,
+                        (unsigned long)grid.width,
+                        (unsigned long)grid.height,
+                        (unsigned long)grid.depth,
+                        (unsigned long)threads.width,
+                        (unsigned long)threads.height,
+                        (unsigned long)threads.depth);
+            } else {
+                fprintf(stderr,
+                        "mu_profile stage=vision_attn_shape path=flash rows=%d "
+                        "threadgroups=%lux%lux%lu threads=%lux%lux%lu "
+                        "query_tile_rows=32 key_tile_rows=32 heads=16\n",
+                        rows,
+                        (unsigned long)grid.width,
+                        (unsigned long)grid.height,
+                        (unsigned long)grid.depth,
+                        (unsigned long)threads.width,
+                        (unsigned long)threads.height,
+                        (unsigned long)threads.depth);
+            }
         }
         [ctx->encoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
         return 0;

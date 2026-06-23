@@ -3446,3 +3446,70 @@ Interpretation:
   first. If no simple flash tile variant is obvious, use the documented
   attention-only `MU_VISION_ATTN_MPSGRAPH=1` comparison lane as the next
   prototype.
+
+### Vision Attention K16 Tile Candidate
+
+Date: 2026-06-23
+
+Tested a narrow flash-attention tile variant behind an opt-in flag:
+
+```text
+MU_VISION_ATTN_FLASH_K16=1
+```
+
+The variant keeps the current query tile at `32` rows but changes the key/value
+tile from `32` to `16` rows. It is wired as a separate Metal kernel
+(`mu_vision_attn_rows_flash_k16`) and is not used or loaded unless explicitly
+requested.
+
+Verification:
+
+```text
+python3 -m unittest mineru.tests.test_mu_benchmark_pages mineru.tests.test_mu_text_timing_sources mineru.tests.test_mu_metal_kernel_sources
+make -B mu-test mu
+git diff --check
+```
+
+Path check:
+
+```text
+/tmp/mu-vision-flash-k16-path-check-258.json
+/tmp/mu-vision-flash-k16-path-check-postlazy-258.json
+```
+
+The path check confirmed `path=flash_k16`, `query_tile_rows=32`, and
+`key_tile_rows=16` for the stable layout shape `rows=5476`.
+
+Back-to-back 2-page A/B on pages `224,258`:
+
+| Path | Total s | Mean s/page | Mean layout vision s/page | Mean content vision s/page | Fallback rows | Output parity |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Default flash | 176.4189 | 88.2094 | 42.7684 | 15.4080 | 0 | baseline |
+| `MU_VISION_ATTN_FLASH_K16=1` | 136.6505 | 68.3253 | 37.2810 | 11.7571 | 0 | exact |
+
+The 2-page result was positive, so the candidate was tested on the 10-page
+promotion gate:
+
+```text
+/tmp/mu-vision-flash-k16-10page-20260623.json
+/tmp/mu-vision-flash-k16-10page-20260623/metal_page_*.json
+```
+
+10-page result:
+
+| Path | Completed | Fallback rows | Total s | Mean s/page | Mean layout vision s/page | Mean content vision s/page |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Current default baseline | 10 / 10 | 0 | 651.6244 | 65.1624 | 33.7636 | 14.4387 |
+| `MU_VISION_ATTN_FLASH_K16=1` | 10 / 10 | 0 | 768.2557 | 76.8256 | 36.5858 | 15.6319 |
+
+Decision:
+
+- Do not promote K16. It failed the 10-page promotion threshold and did not
+  improve mean `layout_vision_encode` or `content_region_vision_encode` versus
+  the current default baseline.
+- Keep `MU_VISION_ATTN_FLASH_K16=1` as an opt-in diagnostic/tile comparison
+  lane only.
+- Stop blind tile-size tuning for the current flash kernel. The next useful
+  comparison is a bounded `MU_VISION_ATTN_MPSGRAPH=1` attention-only prototype
+  for the stable `rows=5476` layout shape, with graph/pipeline caching by
+  shape.

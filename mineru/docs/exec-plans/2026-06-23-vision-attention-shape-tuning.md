@@ -120,6 +120,11 @@ Exit criteria:
   - or add a shape gate that chooses the existing no-flash path only where the
     10-page evidence supports it.
 
+`tile variant` means the same flash attention algorithm compiled with a
+different query/key block shape, for example changing the current
+`query_tile_rows=32`, `key_tile_rows=32` split. It is a narrow kernel A/B for a
+specific shape such as `rows=5476`, not a rewrite of the attention path.
+
 Result, 2026-06-23:
 
 - Implemented `MU_VISION_ATTN_SHAPE_PROFILE=1`.
@@ -149,7 +154,7 @@ Decision:
 Implement the smallest candidate from Step 2 behind an opt-in flag first:
 
 ```text
-MU_VISION_ATTN_FLASH_TUNE=1
+MU_VISION_ATTN_FLASH_K16=1
 ```
 
 If the shape matrix does not identify a simple flash-tile change, implement a
@@ -175,14 +180,42 @@ make -B mu-test mu
 Then run the 2-page gate:
 
 ```text
-MU_VISION_ATTN_FLASH_TUNE=1 MU_TIMING=1 \
+MU_VISION_ATTN_FLASH_K16=1 MU_TIMING=1 \
   /Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_benchmark_pages.py \
   --backend metal --pages 224,258 --max-new-tokens 512 --timeout 1800 --timing \
-  --out /tmp/mu-vision-flash-tune-224-258.json \
-  --save-output-dir /tmp/mu-vision-flash-tune-224-258
+  --out /tmp/mu-vision-flash-k16-224-258.json \
+  --save-output-dir /tmp/mu-vision-flash-k16-224-258
 ```
 
 Compare output against the current default artifact before continuing.
+
+Result, 2026-06-23:
+
+- Added an opt-in `mu_vision_attn_rows_flash_k16` kernel and host dispatch
+  switch:
+
+  ```text
+  MU_VISION_ATTN_FLASH_K16=1
+  ```
+
+- The default flash path is unchanged unless the flag is set; the K16 pipeline
+  is loaded only when `MU_VISION_ATTN_FLASH_K16=1` is present.
+- Verified the K16 path with `MU_VISION_ATTN_SHAPE_PROFILE=1`; profile rows
+  report `path=flash_k16`, `query_tile_rows=32`, `key_tile_rows=16`.
+- Source/build verification passed:
+  - `python3 -m unittest mineru.tests.test_mu_benchmark_pages mineru.tests.test_mu_text_timing_sources mineru.tests.test_mu_metal_kernel_sources`
+  - `make -B mu-test mu`
+  - `git diff --check`
+
+Back-to-back 2-page A/B on pages `224,258`:
+
+| Path | Total s | Mean s/page | Mean layout vision s/page | Mean content vision s/page | Fallback rows | Output parity |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Default flash | 176.4189 | 88.2094 | 42.7684 | 15.4080 | 0 | baseline |
+| `MU_VISION_ATTN_FLASH_K16=1` | 136.6505 | 68.3253 | 37.2810 | 11.7571 | 0 | exact |
+
+The 2-page result justified a 10-page promotion gate, but was not sufficient to
+promote the candidate by itself.
 
 ### 4. Run The 10-Page Promotion Gate
 
@@ -190,12 +223,12 @@ Only run this if the 2-page gate is exact and faster or clearly moves the target
 stage in the right direction:
 
 ```text
-MU_VISION_ATTN_FLASH_TUNE=1 MU_TIMING=1 \
+MU_VISION_ATTN_FLASH_K16=1 MU_TIMING=1 \
   /Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_benchmark_pages.py \
   --backend metal --pages 224,234,237,241,244,247,258,281,303,334 \
   --max-new-tokens 512 --timeout 7200 --timing \
-  --out /tmp/mu-vision-flash-tune-10page-20260623.json \
-  --save-output-dir /tmp/mu-vision-flash-tune-10page-20260623
+  --out /tmp/mu-vision-flash-k16-10page-20260623.json \
+  --save-output-dir /tmp/mu-vision-flash-k16-10page-20260623
 ```
 
 Promotion criteria:
@@ -204,6 +237,38 @@ Promotion criteria:
 - output comparison exact against current default
 - total time beats `651.6244s`
 - no severe page-level regression on pages `244` or `247`
+
+Result, 2026-06-23:
+
+| Path | Completed | Fallback rows | Total s | Mean s/page | Mean layout vision s/page | Mean content vision s/page |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Current default baseline | 10 / 10 | 0 | 651.6244 | 65.1624 | 33.7636 | 14.4387 |
+| `MU_VISION_ATTN_FLASH_K16=1` | 10 / 10 | 0 | 768.2557 | 76.8256 | 36.5858 | 15.6319 |
+
+Page-level K16 timings:
+
+| Page | Total s | Layout vision s | Content vision s | Decode s |
+| ---: | ---: | ---: | ---: | ---: |
+| 224 | 103.4306 | 40.5307 | 22.8193 | 30.8133 |
+| 234 | 101.1797 | 36.5407 | 24.1772 | 36.9858 |
+| 237 | 84.9311 | 34.9069 | 22.3345 | 24.4867 |
+| 241 | 78.2097 | 31.6461 | 20.5536 | 23.3037 |
+| 244 | 76.9071 | 30.4405 | 20.5493 | 23.3760 |
+| 247 | 99.1699 | 36.1946 | 27.6420 | 31.4590 |
+| 258 | 56.2694 | 39.2638 | 4.3986 | 9.8833 |
+| 281 | 55.4792 | 39.7893 | 4.1067 | 9.0669 |
+| 303 | 53.6441 | 36.7479 | 4.6785 | 9.2936 |
+| 334 | 59.0349 | 39.7979 | 5.0594 | 10.9374 |
+
+Decision:
+
+- Reject K16 as a promoted/default path. It failed the 10-page total-time
+  threshold and did not improve the mean layout/content vision stages versus
+  the current default baseline.
+- Keep `MU_VISION_ATTN_FLASH_K16=1` only as an opt-in diagnostic/tile
+  comparison lane for now.
+- Do not spend another cycle on blind key tile-size changes without per-kernel
+  or MPSGraph evidence.
 
 ### 5. Promote Or Reject
 
@@ -221,6 +286,14 @@ If the 10-page gate fails:
 - document the rejected shape/tile hypothesis,
 - choose the next single candidate from the shape matrix instead of expanding
   scope.
+
+Current decision:
+
+- K16 is retained as opt-in diagnostic only.
+- The next single candidate is the bounded
+  `MU_VISION_ATTN_MPSGRAPH=1` attention-only comparison lane. It should start
+  with the stable layout shape `rows=5476`, cache the graph/pipeline by shape,
+  and run the same 2-page and 10-page gates before any promotion.
 
 ## References
 
