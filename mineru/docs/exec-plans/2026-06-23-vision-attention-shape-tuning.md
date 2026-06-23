@@ -120,6 +120,30 @@ Exit criteria:
   - or add a shape gate that chooses the existing no-flash path only where the
     10-page evidence supports it.
 
+Result, 2026-06-23:
+
+- Implemented `MU_VISION_ATTN_SHAPE_PROFILE=1`.
+- Updated `mineru/tests/mu_benchmark_pages.py` so `mu_profile` rows are
+  preserved in each benchmark row's `profiles` field.
+- Ran the shape matrix on `224,244,247,258,281`.
+- All pages share the same layout attention shape:
+  `rows=5476`, `threadgroups=172x16x1`, `query_tile_rows=32`,
+  `key_tile_rows=32`, `heads=16`.
+- Table-heavy pages add large content-region shapes:
+  - page `224`: `3920`
+  - pages `244,247`: `4144`
+- Short/simple pages add small content-region shapes around `272-348`.
+
+Decision:
+
+- Do not add a no-flash row-shape gate. The earlier no-flash regression on
+  pages `244` and `247` cannot be explained by layout row shape because layout
+  rows are identical across the sampled pages.
+- Target `rows=5476` first; it is the fixed layout cost on every page.
+- If there is no simple flash tile variant, use the bounded
+  `MU_VISION_ATTN_MPSGRAPH=1` attention-only comparison lane as the next
+  prototype.
+
 ### 3. Implement One Candidate
 
 Implement the smallest candidate from Step 2 behind an opt-in flag first:

@@ -22,6 +22,7 @@ TIMING_RE = re.compile(
     r"^mu_timing\s+stage=([A-Za-z0-9_.:-]+)\s+seconds=([0-9]+(?:\.[0-9]+)?)$",
     re.MULTILINE,
 )
+PROFILE_RE = re.compile(r"^mu_profile\s+stage=([A-Za-z0-9_.:-]+)\s*(.*)$", re.MULTILINE)
 
 
 def parse_multipage_stderr(stderr: str) -> dict[str, list[str]]:
@@ -63,6 +64,19 @@ def parse_stage_timings(stderr: str) -> dict[str, float]:
         stage = match.group(1)
         timings[stage] = timings.get(stage, 0.0) + float(match.group(2))
     return timings
+
+
+def parse_profiles(stderr: str) -> dict[str, list[dict[str, str]]]:
+    profiles: dict[str, list[dict[str, str]]] = {}
+    for match in PROFILE_RE.finditer(stderr):
+        stage = match.group(1)
+        fields = {}
+        for part in match.group(2).split():
+            if "=" in part:
+                key, value = part.split("=", 1)
+                fields[key] = value
+        profiles.setdefault(stage, []).append(fields)
+    return profiles
 
 
 def run_one(
@@ -127,6 +141,7 @@ def run_one(
     elapsed = time.perf_counter() - start
     fallback_detected = "fallback" in result.stderr.lower()
     stage_timings = parse_stage_timings(result.stderr)
+    profiles = parse_profiles(result.stderr)
     row = {
         "seconds": elapsed,
         "command": cmd,
@@ -137,6 +152,8 @@ def run_one(
     }
     if stage_timings:
         row["stage_timings"] = stage_timings
+    if profiles:
+        row["profiles"] = profiles
     if result.returncode != 0:
         row["error"] = f"mu exited with {result.returncode}"
         row["stdout_tail"] = result.stdout[-4000:]
@@ -315,6 +332,7 @@ def main() -> None:
             page_lines = page_stderr_lines.get(img_path_str, [])
             page_stderr = "\n".join(page_lines)
             stage_timings = parse_stage_timings(page_stderr)
+            profiles = parse_profiles(page_stderr)
             fallback_detected = "fallback" in page_stderr.lower()
 
             row = {
@@ -331,6 +349,8 @@ def main() -> None:
                 row["seconds"] = stage_timings.get("page_total", 0.0)
             else:
                 row["seconds"] = 0.0
+            if profiles:
+                row["profiles"] = profiles
 
             if returncode != 0:
                 row["error"] = f"mu process failed/timed out with code {returncode}"

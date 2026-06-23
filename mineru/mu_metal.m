@@ -1707,6 +1707,7 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
         mu_gpu_buf current_out = pong_buf;
 
         int layers = mu_engine_vision_layers((const mu_engine *)engine);
+        bool shape_profile = getenv("MU_VISION_ATTN_SHAPE_PROFILE") != NULL;
 
         NSUInteger base_offset_a = ctx->alloc.offset_a;
         NSUInteger base_offset_b = ctx->alloc.offset_b;
@@ -1813,6 +1814,10 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
                     rc = mu_gpu_vision_attn_concat_probe_ctx(ctx, q_r, temp_kv, rotary, rows, r, attn_r);
                 }
             } else {
+                if (shape_profile) {
+                    fprintf(stderr, "mu_profile stage=vision_attn_shape layer=%d rows=%d\n",
+                            layer, rows);
+                }
                 rc = mu_gpu_vision_attn_rows_ctx(ctx, temp_q, temp_kv, rotary, rows, temp_attn);
             }
             if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
@@ -3276,6 +3281,7 @@ int mu_gpu_vision_attn_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q, mu_gpu_buf kv
     }
 
     bool request_flash = getenv("MU_VISION_ATTN_NO_FLASH") == NULL;
+    bool shape_profile = getenv("MU_VISION_ATTN_SHAPE_PROFILE") != NULL;
     if (request_flash && ctx->gpu->vision_attn_rows_flash) {
         [ctx->encoder setComputePipelineState:ctx->gpu->vision_attn_rows_flash];
         [ctx->encoder setBuffer:q_buf offset:q.offset atIndex:0];
@@ -3286,6 +3292,19 @@ int mu_gpu_vision_attn_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q, mu_gpu_buf kv
         
         MTLSize grid = MTLSizeMake(((NSUInteger)rows + 31u) / 32u, 16u, 1);
         MTLSize threads = MTLSizeMake(32, 1, 1);
+        if (shape_profile) {
+            fprintf(stderr,
+                    "mu_profile stage=vision_attn_shape path=flash rows=%d "
+                    "threadgroups=%lux%lux%lu threads=%lux%lux%lu "
+                    "query_tile_rows=32 key_tile_rows=32 heads=16\n",
+                    rows,
+                    (unsigned long)grid.width,
+                    (unsigned long)grid.height,
+                    (unsigned long)grid.depth,
+                    (unsigned long)threads.width,
+                    (unsigned long)threads.height,
+                    (unsigned long)threads.depth);
+        }
         [ctx->encoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
         return 0;
     }

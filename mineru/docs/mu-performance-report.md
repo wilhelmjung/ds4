@@ -3375,3 +3375,74 @@ References:
   https://developer.apple.com/documentation/metalperformanceshadersgraph/mpsgraph/scaleddotproductattention%28query%3Akey%3Avalue%3Amask%3Ascale%3Aname%3A%29
 - Apple `MPSGraphSDPADescriptor`:
   https://developer.apple.com/documentation/metalperformanceshadersgraph/mpsgraphsdpadescriptor
+
+### Vision Attention Shape Telemetry
+
+Date: 2026-06-23
+
+Added shape telemetry for the current vision attention path:
+
+```text
+MU_VISION_ATTN_SHAPE_PROFILE=1
+```
+
+When enabled, `mu_gpu_vision_encode` records layer/row shape at the call site
+and `mu_gpu_vision_attn_rows_ctx` records the selected flash path, dispatch
+grid, threadgroup shape, and current tile constants. These lines use
+`mu_profile`, not `mu_timing`, so they do not pollute timing aggregation.
+
+The benchmark harness now preserves `mu_profile` lines under each row's
+`profiles` field instead of relying on the truncated `stderr_tail`.
+
+Verification artifacts:
+
+```text
+/tmp/mu-vision-flash-shape-profile-224-258-v2.json
+/tmp/mu-vision-flash-shape-matrix-20260623.json
+/tmp/mu-vision-flash-shape-matrix-20260623/metal_page_*.json
+```
+
+Two-page telemetry smoke, pages `224,258`:
+
+| Page | Profile entries | Flash row shapes | Flash grids |
+| ---: | ---: | --- | --- |
+| 224 | 256 | `5476`, `3920`, `360`, `272` | `172x16x1`, `123x16x1`, `12x16x1`, `9x16x1` |
+| 258 | 320 | `5476`, `288`, `324`, `348`, `272` | `172x16x1`, `11x16x1`, `9x16x1` |
+
+Five-page shape matrix:
+
+| Page | Wall s | Layout vision s | Content vision s | Vision attention profile s | Flash row shapes |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 224 | 86.428 | 36.223 | 21.325 | 38.720 | `5476`, `3920`, `360`, `272` |
+| 244 | 84.658 | 34.936 | 23.408 | 40.172 | `5476`, `4144`, `360`, `272` |
+| 247 | 97.463 | 34.614 | 27.844 | 41.827 | `5476`, `4144`, `360`, `272` |
+| 258 | 57.680 | 37.095 | 5.259 | 26.622 | `5476`, `288`, `324`, `348`, `272` |
+| 281 | 53.256 | 39.223 | 4.194 | 27.122 | `5476`, `324`, `336`, `348`, `272` |
+
+Aggregate flash row distribution:
+
+| Rows | Calls |
+| ---: | ---: |
+| 272 | 160 |
+| 288 | 32 |
+| 324 | 64 |
+| 336 | 32 |
+| 348 | 64 |
+| 360 | 96 |
+| 3920 | 32 |
+| 4144 | 64 |
+| 5476 | 160 |
+
+Interpretation:
+
+- The layout tower shape is identical across these pages:
+  `rows=5476`, `threadgroups=172x16x1`, one call per layer.
+- A row-shape gate does not explain the earlier no-flash layout regression on
+  pages `244` and `247`; those pages use the same layout row shape as the other
+  pages.
+- Table-heavy pages add large content-region shapes (`3920` or `4144`), while
+  short/simple pages mostly add small content-region shapes around `272-348`.
+- The next candidate should target the universal large shape `rows=5476`
+  first. If no simple flash tile variant is obvious, use the documented
+  attention-only `MU_VISION_ATTN_MPSGRAPH=1` comparison lane as the next
+  prototype.

@@ -216,3 +216,11 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn("mu_gpu_profile_commit_stage", host)
         self.assertIn("vision_profile_attention", host)
         self.assertIn("vision_profile_merger_fc2", host)
+
+    def test_vision_attention_shape_profile_is_wired(self):
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn('getenv("MU_VISION_ATTN_SHAPE_PROFILE")', host)
+        self.assertIn("vision_attn_shape", host)
+        self.assertIn("path=flash", host)
+        self.assertIn("threadgroups=", host)

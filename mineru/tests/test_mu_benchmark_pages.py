@@ -100,6 +100,43 @@ class MuBenchmarkPagesTest(unittest.TestCase):
         env = run_mock.call_args.kwargs["env"]
         self.assertEqual(env["MU_TIMING"], "1")
 
+    def test_run_one_records_profile_lines_from_stderr(self) -> None:
+        completed = SimpleNamespace(
+            returncode=0,
+            stdout="[]",
+            stderr=(
+                "mu_profile stage=vision_attn_shape layer=3 rows=5476\n"
+                "mu_profile stage=vision_attn_shape path=flash rows=5476 "
+                "threadgroups=172x16x1 threads=32x1x1 "
+                "query_tile_rows=32 key_tile_rows=32 heads=16\n"
+            ),
+        )
+        with mock.patch.object(mu_benchmark_pages.subprocess, "run",
+                               return_value=completed):
+            row = mu_benchmark_pages.run_one(
+                "metal",
+                Path("/tmp/page.png"),
+                max_new_tokens=1,
+                skip_content=True,
+                timeout=10,
+            )
+
+        self.assertEqual(
+            row["profiles"]["vision_attn_shape"],
+            [
+                {"layer": "3", "rows": "5476"},
+                {
+                    "path": "flash",
+                    "rows": "5476",
+                    "threadgroups": "172x16x1",
+                    "threads": "32x1x1",
+                    "query_tile_rows": "32",
+                    "key_tile_rows": "32",
+                    "heads": "16",
+                },
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
