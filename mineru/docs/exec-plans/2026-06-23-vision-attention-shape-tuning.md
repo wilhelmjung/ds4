@@ -326,6 +326,36 @@ Decision:
   (`450.9345s`), so the next target is reducing MPSGraph pack/copy and command
   boundary overhead before attempting deeper MSL rewrites.
 
+MPSGraph split profile, 2026-06-23:
+
+- Added diagnostic-only split timing:
+
+  ```text
+  MU_VISION_ATTN_MPSGRAPH_PROFILE=1
+  ```
+
+- Full-content512 results:
+
+| Page | Split total s | Pack QKV | MPSGraph SDPA | Copy/round | Alloc + boundary |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 224 | 4.3584 | 15.8% | 81.8% | 2.0% | 0.4% |
+| 258 | 2.9407 | 11.9% | 84.0% | 3.5% | 0.6% |
+
+- Skip-content page `258` showed the same shape: MPSGraph SDPA was `88.7%` of
+  the split.
+- Page `224` and `258` profile outputs were byte-level exact against the
+  current MPSGraph default artifacts.
+
+Updated decision:
+
+- Buffer allocation and copy/round are not the next useful target.
+- Pack QKV is visible but still secondary.
+- The dominant remaining local M5 cost is the MPSGraph SDPA call itself.
+- Per the latest user instruction, ignore GB10 for this optimization choice.
+- Next candidate: one opt-in custom MSL SDPA/attention lane for stable layout
+  `rows=5476`, using MPSGraph as the correctness oracle and keeping MPSGraph as
+  default until the 2-page and 10-page gates prove a faster exact path.
+
 ## References
 
 - `mineru/mu_metal.m`: current `mu_gpu_vision_encode` and host-side attention

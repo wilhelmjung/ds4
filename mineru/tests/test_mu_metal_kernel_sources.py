@@ -249,3 +249,13 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn("runWithMTLCommandQueue", host)
         self.assertIn("path=mpsgraph", host)
         self.assertIn("kernel void mu_vision_attn_pack_qkv_mpsgraph", metal)
+
+    def test_vision_attention_mpsgraph_split_profile_is_wired(self):
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn('getenv("MU_VISION_ATTN_MPSGRAPH_PROFILE")', host)
+        self.assertIn("vision_attn_mpsgraph_prepack_boundary", host)
+        self.assertIn("vision_attn_mpsgraph_buffer_alloc", host)
+        self.assertIn("vision_attn_mpsgraph_pack_qkv", host)
+        self.assertIn("vision_attn_mpsgraph_graph", host)
+        self.assertIn("vision_attn_mpsgraph_copy_round", host)

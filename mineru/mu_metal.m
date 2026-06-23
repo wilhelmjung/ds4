@@ -624,11 +624,28 @@ static int mu_gpu_vision_attn_rows_mpsgraph_stage(mu_gpu *gpu,
     if (!gpu || !ctx || !*ctx || !q.ptr || !kv.ptr || !rotary || !out.ptr || rows <= 0) return -1;
     if (!gpu->vision_attn_pack_qkv_mpsgraph || !gpu->vision_attn_copy_mpsgraph) return -2;
 
+    bool mpsgraph_profile = getenv("MU_VISION_ATTN_MPSGRAPH_PROFILE") != NULL;
+    unsigned long offset_a = 0;
+    unsigned long offset_b = 0;
+    if (mpsgraph_profile) {
+        mu_gpu_cmd_get_scratch_offsets(*ctx, &offset_a, &offset_b);
+        double t_boundary = local_time_now_seconds();
+        int rc = mu_gpu_cmd_commit_and_wait(*ctx);
+        fprintf(stderr, "mu_timing stage=vision_attn_mpsgraph_prepack_boundary seconds=%.6f\n",
+                local_time_now_seconds() - t_boundary);
+        *ctx = NULL;
+        if (rc != 0) return rc;
+        rc = mu_gpu_cmd_begin_with_scratch_offsets(gpu, offset_a, offset_b, ctx);
+        if (rc != 0) return rc;
+        mu_gpu_cmd_set_label(*ctx, "vision_attn_mpsgraph_pack_qkv");
+    }
+
     id<MTLBuffer> q_buf = (__bridge id<MTLBuffer>)q.ptr;
     id<MTLBuffer> kv_buf = (__bridge id<MTLBuffer>)kv.ptr;
     id<MTLBuffer> out_buf = (__bridge id<MTLBuffer>)out.ptr;
     NSUInteger packed_bytes = (NSUInteger)rows * 1280u * sizeof(float);
     NSUInteger rotary_bytes = (NSUInteger)rows * 40u * sizeof(float);
+    double t_alloc = local_time_now_seconds();
     id<MTLBuffer> rotary_buf = [gpu->device newBufferWithBytes:rotary
                                                         length:rotary_bytes
                                                        options:MTLResourceStorageModeShared];
@@ -636,6 +653,10 @@ static int mu_gpu_vision_attn_rows_mpsgraph_stage(mu_gpu *gpu,
     id<MTLBuffer> k_pack = [gpu->device newBufferWithLength:packed_bytes options:MTLResourceStorageModeShared];
     id<MTLBuffer> v_pack = [gpu->device newBufferWithLength:packed_bytes options:MTLResourceStorageModeShared];
     id<MTLBuffer> graph_out = [gpu->device newBufferWithLength:packed_bytes options:MTLResourceStorageModeShared];
+    if (mpsgraph_profile) {
+        fprintf(stderr, "mu_timing stage=vision_attn_mpsgraph_buffer_alloc seconds=%.6f\n",
+                local_time_now_seconds() - t_alloc);
+    }
     if (!rotary_buf || !q_pack || !k_pack || !v_pack || !graph_out) return -3;
 
     [(*ctx)->encoder setComputePipelineState:gpu->vision_attn_pack_qkv_mpsgraph];
@@ -650,13 +671,17 @@ static int mu_gpu_vision_attn_rows_mpsgraph_stage(mu_gpu *gpu,
     MTLSize pack_threads = MTLSizeMake(256, 1, 1);
     [(*ctx)->encoder dispatchThreads:pack_grid threadsPerThreadgroup:pack_threads];
 
-    unsigned long offset_a = 0;
-    unsigned long offset_b = 0;
     mu_gpu_cmd_get_scratch_offsets(*ctx, &offset_a, &offset_b);
+    double t_pack = local_time_now_seconds();
     int rc = mu_gpu_cmd_commit_and_wait(*ctx);
+    if (mpsgraph_profile) {
+        fprintf(stderr, "mu_timing stage=vision_attn_mpsgraph_pack_qkv seconds=%.6f\n",
+                local_time_now_seconds() - t_pack);
+    }
     *ctx = NULL;
     if (rc != 0) return rc;
 
+    double t_graph = local_time_now_seconds();
     rc = mu_gpu_vision_attn_mpsgraph_ensure(gpu, rows);
     if (rc != 0) return rc;
 
@@ -694,9 +719,14 @@ static int mu_gpu_vision_attn_rows_mpsgraph_stage(mu_gpu *gpu,
         }
         return -5;
     }
+    if (mpsgraph_profile) {
+        fprintf(stderr, "mu_timing stage=vision_attn_mpsgraph_graph seconds=%.6f\n",
+                local_time_now_seconds() - t_graph);
+    }
 
     rc = mu_gpu_cmd_begin_with_scratch_offsets(gpu, offset_a, offset_b, ctx);
     if (rc != 0) return rc;
+    if (mpsgraph_profile) mu_gpu_cmd_set_label(*ctx, "vision_attn_mpsgraph_copy_round");
     [(*ctx)->encoder setComputePipelineState:gpu->vision_attn_copy_mpsgraph];
     [(*ctx)->encoder setBuffer:graph_out offset:0 atIndex:0];
     [(*ctx)->encoder setBuffer:out_buf offset:out.offset atIndex:1];
@@ -704,6 +734,16 @@ static int mu_gpu_vision_attn_rows_mpsgraph_stage(mu_gpu *gpu,
     [(*ctx)->encoder setBytes:&n length:sizeof(n) atIndex:2];
     [(*ctx)->encoder dispatchThreads:MTLSizeMake((NSUInteger)n, 1, 1)
                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (mpsgraph_profile) {
+        double t_copy = local_time_now_seconds();
+        rc = mu_gpu_cmd_commit_and_wait(*ctx);
+        fprintf(stderr, "mu_timing stage=vision_attn_mpsgraph_copy_round seconds=%.6f\n",
+                local_time_now_seconds() - t_copy);
+        *ctx = NULL;
+        if (rc != 0) return rc;
+        rc = mu_gpu_cmd_begin_with_scratch_offsets(gpu, offset_a, offset_b, ctx);
+        if (rc != 0) return rc;
+    }
 
     if (shape_profile) {
         fprintf(stderr,

@@ -3563,3 +3563,152 @@ Decision:
   (`450.9345s`), so the next optimization should target the remaining
   MPSGraph pack/copy and command-boundary overhead, not another blind flash tile
   change.
+
+### GB10 NSK MinerU Back-To-Back Comparison
+
+Date: 2026-06-23
+
+Ran a fresh comparison against the NSK MinerU deployment on the GB10 host from:
+
+```text
+/Users/will/gitlab/deepnova/nova-stack/.env
+```
+
+Remote state:
+
+- `mineru` vLLM was ready on port `18085`.
+- The installed `mineru-client` process was unhealthy for this benchmark
+  because it still pointed at `127.0.0.1:9015` while the active MinerU vLLM
+  port was `18085`.
+- For measurement only, a temporary local client was started on the GB10 host:
+
+  ```text
+  127.0.0.1:19014 -> http://127.0.0.1:18085
+  ```
+
+  It was stopped after the run.
+
+Benchmark input:
+
+- Same NASA PDF source pages as the local 10-page set:
+  `224,234,237,241,244,247,258,281,303,334`.
+- A temporary 10-page PDF was created from those pages and uploaded to:
+
+  ```text
+  /tmp/mineru-b2b/nasa-10pages.pdf
+  ```
+
+Artifacts:
+
+```text
+/tmp/mineru-b2b/nsk-gb10-nasa-10page-20260623-185906.json
+/tmp/mu-metal-current-mpsgraph-b2b-10page-20260623.json
+/tmp/mu-metal-current-mpsgraph-b2b-10page-20260623/metal_page_*.json
+```
+
+Results:
+
+| Path | Scope | Completed | Total s | Mean s/page | Notes |
+| --- | --- | ---: | ---: | ---: | --- |
+| GB10 NSK MinerU `/file_parse` | PDF API E2E | 10 / 10 | 10.392 | 1.039 | HTTP 200, task completed |
+| Current native Metal on M5 | `mu_benchmark_pages.py` E2E | 10 / 10 | 516.3763 | 51.6376 | fallback rows `0` |
+| PyTorch/Transformers MPS warm baseline on M5 | historical warm baseline | 10 / 10 | 450.9345 | 45.0935 | not rerun in this step |
+
+Current Metal stage means from the fresh run:
+
+| Stage | Mean s/page |
+| --- | ---: |
+| `layout_vision_encode` | 16.4858 |
+| `content_region_vision_encode` | 8.8258 |
+| `vision_encode` | 25.3115 |
+| `text_generate_decode` | 22.3525 |
+| `content_total` | 27.3681 |
+
+Ratios:
+
+- Current native Metal is `49.69x` slower than GB10 NSK MinerU on this E2E
+  comparison.
+- M5 warm PyTorch/MPS baseline is `43.39x` slower than GB10 NSK MinerU.
+- Current native Metal is `1.1451x` slower than the M5 warm PyTorch/MPS
+  baseline.
+
+Important scope note:
+
+This is an E2E throughput comparison, not a same-kernel comparison. GB10 NSK
+uses the official MinerU API path over a 10-page PDF and vLLM; local native
+Metal uses the `mu` harness on rendered page images with its own C/Metal
+pipeline and `--max-new-tokens 512`.
+
+### MPSGraph Vision Attention Split Profile
+
+Date: 2026-06-23
+
+Added diagnostic-only split timing for the current default MPSGraph vision
+attention path:
+
+```text
+MU_VISION_ATTN_MPSGRAPH_PROFILE=1
+```
+
+The split is intentionally diagnostic. It adds extra command-buffer boundaries
+around the MPSGraph path, so its wall time should not be used as a promotion
+gate. It is only for locating the remaining attention overhead.
+
+Measured stages:
+
+- `vision_attn_mpsgraph_prepack_boundary`
+- `vision_attn_mpsgraph_buffer_alloc`
+- `vision_attn_mpsgraph_pack_qkv`
+- `vision_attn_mpsgraph_graph`
+- `vision_attn_mpsgraph_copy_round`
+
+Artifacts:
+
+```text
+/tmp/mu-mpsgraph-attn-split-profile-258-skip-20260623.json
+/tmp/mu-mpsgraph-attn-split-profile-224-258-20260623.json
+/tmp/mu-mpsgraph-attn-split-profile-224-258-20260623/metal_page_*.json
+```
+
+Profile commands used `MU_VISION_PROFILE_SPLIT=1` together with the MPSGraph
+split flag so the attention split did not include the preceding QKV projection
+work.
+
+Results:
+
+| Run | Page | Split total s | Boundary s | Alloc s | Pack QKV s | MPSGraph s | Copy/round s |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| skip-content | 258 | 2.7891 | 0.0011 | 0.0044 | 0.2323 | 2.4751 | 0.0761 |
+| full-content512 | 224 | 4.3584 | 0.0043 | 0.0139 | 0.6866 | 3.5646 | 0.0890 |
+| full-content512 | 258 | 2.9407 | 0.0051 | 0.0121 | 0.3497 | 2.4717 | 0.1022 |
+
+Share of split total:
+
+| Run | Page | Pack QKV | MPSGraph | Copy/round | Alloc + boundary |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| skip-content | 258 | 8.3% | 88.7% | 2.7% | 0.2% |
+| full-content512 | 224 | 15.8% | 81.8% | 2.0% | 0.4% |
+| full-content512 | 258 | 11.9% | 84.0% | 3.5% | 0.6% |
+
+Output check:
+
+- The full-content profile outputs for pages `224` and `258` were byte-level
+  JSON equal to the current default MPSGraph 10-page artifacts.
+
+Conclusion:
+
+- Buffer allocation is not the next bottleneck: it is below `1%` of the split.
+- Copy/round is small at roughly `2-4%`.
+- Pack QKV is visible, especially on table-heavy page `224`, but still much
+  smaller than the graph call.
+- The remaining dominant cost is the MPSGraph SDPA call itself
+  (`~82-89%` of the split).
+
+Next direction:
+
+1. Do not spend the next cycle on buffer reuse alone; it cannot materially move
+   the 10-page total.
+2. Prototype one custom MSL SDPA/attention path for the stable large layout
+   shape `rows=5476`, using the MPSGraph path as the correctness oracle.
+3. Keep MPSGraph as default until a 2-page and then 10-page gate beats the
+   current default `516.3763s` fresh 10-page result with exact output parity.
