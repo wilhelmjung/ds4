@@ -2573,7 +2573,8 @@ int mu_gpu_text_attn_cached_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
         v_buf = [ctx->gpu->device newBufferWithBytes:v_cache length:kv_bytes options:MTLResourceStorageModeShared];
     }
 
-    bool use_simd = getenv("MU_USE_SIMD") != NULL;
+    bool disable_simd = getenv("MU_TEXT_ATTN_CACHED_NO_SIMD") != NULL;
+    bool use_simd = !disable_simd;
     if (use_simd && ctx->gpu->text_attn_cached_simd) {
         [ctx->encoder setComputePipelineState:ctx->gpu->text_attn_cached_simd];
         [ctx->encoder setBuffer:q_buf offset:q.offset atIndex:0];
@@ -3503,7 +3504,8 @@ int mu_gpu_text_attn_cached_resident_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
 
     NSUInteger kv_offset = (NSUInteger)layer * (NSUInteger)cache->cap * 128u * sizeof(float);
 
-    bool use_simd = getenv("MU_USE_SIMD") != NULL;
+    bool disable_simd = getenv("MU_TEXT_ATTN_CACHED_NO_SIMD") != NULL;
+    bool use_simd = !disable_simd;
     if (use_simd && ctx->gpu->text_attn_cached_simd) {
         [ctx->encoder setComputePipelineState:ctx->gpu->text_attn_cached_simd];
         [ctx->encoder setBuffer:q_buf offset:q.offset atIndex:0];

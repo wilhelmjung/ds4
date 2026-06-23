@@ -433,6 +433,24 @@ with attention as the next primary optimization target. A small MPP/tensor_ops
 prototype remains useful for the text-only fused FFN/MLP hotspot, but it should
 not replace the attention work as the main next step.
 
+The first action from that decision is to promote the existing cached-attention
+SIMD path to the default. The older scalar cached-attention implementation stays
+available through `MU_TEXT_ATTN_CACHED_NO_SIMD=1`; `MU_USE_SIMD=1` remains only
+for the older dense/debug SIMD paths.
+
+2026-06-23 promotion check:
+
+| Layout trace path | Attention GPU ms | Decode GPU ms | Decode wall time |
+| --- | ---: | ---: | ---: |
+| Default cached attention SIMD | 48.094 | 117.637 | 0.205455s |
+| `MU_TEXT_ATTN_CACHED_NO_SIMD=1` | 286.502 | 355.603 | 0.506507s |
+
+This keeps the optimization strategy conservative: make the measured hot path
+fast by default, keep a narrow rollback switch, then decide whether the next
+attention step should be deeper MSL tiling/fusion or an MPSGraph/MPS SDPA-style
+prototype. MPP/tensor_ops remains a secondary experiment for text-only MLP,
+where the split profile points instead of layout attention.
+
 To achieve parity or superior performance compared to PyTorch/MPS and Apple MLX, the Metal backend can adopt the design principles established by `ggml-metal` and `mlx`:
 
 ### 1. End-to-End GPU Residency (Eliminating CPU-GPU Syncs)

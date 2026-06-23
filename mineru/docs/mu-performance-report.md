@@ -3106,3 +3106,61 @@ Decision:
   FlashAttention-style cached decode kernel.
 - Keep an MPP/tensor_ops prototype as a secondary small experiment for the
   fused FFN/MLP text-only hotspot, guarded behind a capability/env flag.
+
+### Cached Attention SIMD Promotion
+
+Date: 2026-06-23
+
+The cached decode attention SIMD kernel is now the default for both host entry
+points:
+
+- `mu_gpu_text_attn_cached_ctx`
+- `mu_gpu_text_attn_cached_resident_ctx`
+
+The old scalar cached-attention path remains available through the explicit
+rollback switch:
+
+```text
+MU_TEXT_ATTN_CACHED_NO_SIMD=1
+```
+
+`MU_USE_SIMD=1` still controls the older dense/debug SIMD paths only; cached
+attention no longer requires this broad opt-in flag.
+
+Fresh layout trace A/B with split GPU timing:
+
+| Layout trace path | Attention GPU ms | Decode GPU ms | `text_generate_decode` |
+| --- | ---: | ---: | ---: |
+| Default cached attention SIMD | 48.094 | 117.637 | 0.205455s |
+| `MU_TEXT_ATTN_CACHED_NO_SIMD=1` | 286.502 | 355.603 | 0.506507s |
+
+This is a `5.96x` reduction in attention GPU time and a `2.47x` reduction in
+layout decode wall time for the trace case. The trace output stayed exact in
+both default and rollback runs.
+
+Fresh text trace validation also passed for both paths. The text trace is not
+the performance gate for this change because its split profile is dominated by
+unrelated MLP variance, but attention itself still improved from `14.876ms` to
+`4.877ms` in that run.
+
+Existing two-page A/B on pages `224,258` remains the page-level decision gate:
+
+| Path | Total | Mean page | Mean decode | Fallback rows |
+| --- | ---: | ---: | ---: | ---: |
+| Previous default cached attention | 189.9068s | 94.9534s | 38.8707s | 0 |
+| SIMD cached attention path | 137.7987s | 68.8993s | 13.4485s | 0 |
+
+Output comparison stayed exact:
+
+- `mean_content_token_f1=1.0000`
+- `table_exact_cell_recall=1.0000`
+- block/type/bbox metrics exact on the sampled pages
+
+Decision:
+
+- Promote cached attention SIMD to default because it addresses the measured
+  VL/layout hotspot directly.
+- Keep `MU_TEXT_ATTN_CACHED_NO_SIMD=1` for rollback and A/B diagnostics.
+- Continue the current MSL/MPS route. The next larger target is either deeper
+  cached-attention tiling/fusion or an MPSGraph/MPS SDPA-style prototype; keep
+  MPP/tensor_ops work secondary for text-only MLP.

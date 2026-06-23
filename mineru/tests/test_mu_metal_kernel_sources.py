@@ -176,6 +176,13 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn('getenv("MU_TEXT_DECODE_QKV_ROPE_FUSION")', source)
         self.assertIn("mu_gpu_text_decode_qkv_rope_cache_ctx(ctx", source)
 
+    def test_text_cached_attention_simd_is_default_with_escape_hatch(self):
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn("text_attn_cached_simd", host)
+        self.assertIn('getenv("MU_TEXT_ATTN_CACHED_NO_SIMD")', host)
+        self.assertIn("!disable_simd", host)
+
     def test_text_prefill_flash_attention_is_wired(self):
         metal = (ROOT / "mineru/metal/mu_attn.metal").read_text()
         host = (ROOT / "mineru/mu_metal.m").read_text()
