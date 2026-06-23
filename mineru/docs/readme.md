@@ -36,3 +36,9 @@ This directory keeps MinerU design notes, execution plans, and benchmark reports
 | [mu-phase6-walkthrough.md](mu-phase6-walkthrough.md) | Phase 1-6 walkthrough |
 | [mu-skills.md](mu-skills.md) | MU-specific workflow notes |
 | [design-docs/ds4-architecture.md](design-docs/ds4-architecture.md) | Archived ds4.c architecture note kept for reference |
+
+## External References
+
+| Reference | Use |
+| --- | --- |
+| [Metal Performance Primitives Programming Guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf) | Metal 4 / MPP tensor_ops GEMM and fusion guidance |

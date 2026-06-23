@@ -3028,3 +3028,81 @@ Interpretation: dispatch count alone no longer picks a single winner inside the
 attention/MLP group. The next step should either measure per-kernel GPU time or
 attempt a targeted fusion/MPS path that removes one full per-layer dispatch,
 such as attention + O-projection, with the same 2-page A/B gate.
+
+### Per-Kernel GPU Timing Split Profile
+
+Date: 2026-06-23
+
+Implemented a diagnostic resident decode profiling path behind
+`MU_TEXT_DECODE_PROFILE_SPLIT=1`. The default path still records one command
+buffer per decode token. The diagnostic path splits each resident decode layer
+into labeled command buffers:
+
+- `text_decode_profile_qkv_lNN`
+- `text_decode_profile_attention_lNN`
+- `text_decode_profile_o_proj_lNN`
+- `text_decode_profile_mlp_lNN`
+- `text_decode_profile_logits`
+
+The split path exists only for `MU_LATENCY_PROFILE=1` analysis. Absolute timings
+include changed command-buffer boundaries, so use the stage distribution and
+default-path command-buffer timing together instead of treating split mode as an
+end-to-end speed sample.
+
+Validation commands:
+
+```text
+MU_TEXT_DECODE_PROFILE_SPLIT=1 MU_LATENCY_PROFILE=1 MU_TIMING=1 ./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/text.json
+MU_TEXT_DECODE_PROFILE_SPLIT=1 MU_LATENCY_PROFILE=1 MU_TIMING=1 ./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/layout.json
+MU_LATENCY_PROFILE=1 MU_TIMING=1 ./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/text.json
+MU_LATENCY_PROFILE=1 MU_TIMING=1 ./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/layout.json
+```
+
+Both split traces preserved exact trace parity.
+
+Default command-buffer GPU timing:
+
+| Trace | Decode command buffers | Decode GPU ms | Avg GPU ms / token CB |
+| --- | ---: | ---: | ---: |
+| Text | 7 | 231.013 | 33.002 |
+| Layout | 3 | 593.937 | 197.979 |
+
+Split text trace GPU timing:
+
+| Group | Count | GPU ms | Avg ms | Share |
+| --- | ---: | ---: | ---: | ---: |
+| QKV | 168 | 70.313 | 0.419 | 22.1% |
+| Attention | 168 | 23.091 | 0.137 | 7.2% |
+| O projection | 168 | 9.255 | 0.055 | 2.9% |
+| MLP | 168 | 188.395 | 1.121 | 59.1% |
+| Logits | 7 | 27.744 | 3.963 | 8.7% |
+
+Split layout trace GPU timing:
+
+| Group | Count | GPU ms | Avg ms | Share |
+| --- | ---: | ---: | ---: | ---: |
+| QKV | 72 | 17.937 | 0.249 | 4.0% |
+| Attention | 72 | 348.535 | 4.841 | 78.2% |
+| O projection | 72 | 4.230 | 0.059 | 0.9% |
+| MLP | 72 | 62.422 | 0.867 | 14.0% |
+| Logits | 3 | 12.841 | 4.280 | 2.9% |
+
+Interpretation:
+
+- Pure text decode is dominated by the current fused FFN kernel. It is a
+  hand-written single-threadgroup MSL kernel that performs gate/up/down dot
+  products without simdgroup matrix/tensor_ops acceleration.
+- The multimodal layout trace is dominated by cached attention. This is the
+  more representative signal for MinerU VL work because image tokens increase
+  the decode cache length.
+- O projection and logits are not the next primary bottlenecks.
+
+Decision:
+
+- Keep `MU_TEXT_DECODE_PROFILE_SPLIT=1` as a diagnostic-only mode.
+- For the next main optimization, continue the MSL/MPS route and target cached
+  attention first: improve `mu_text_attn_cached_simd`, prototype an
+  MPSGraph/MPS SDPA-style path if integration overhead is acceptable, or adapt a
+  FlashAttention-style cached decode kernel.
+- Keep an MPP/tensor_ops prototype as a secondary small experiment for the
+  fused FFN/MLP text-only hotspot, guarded behind a capability/env flag.

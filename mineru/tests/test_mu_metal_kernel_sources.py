@@ -186,3 +186,18 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn("text_prefill_attn_pos_flash", host)
         self.assertIn('getenv("MU_TEXT_PREFILL_ATTN_NO_FLASH")', host)
         self.assertIn("dispatchThreadgroups:grid threadsPerThreadgroup:threads", host)
+
+    def test_latency_profile_uses_metal_gpu_timestamp_selectors(self):
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn("@selector(GPUStartTime)", host)
+        self.assertIn("@selector(GPUEndTime)", host)
+
+    def test_command_context_can_preserve_scratch_offsets_for_profile_splits(self):
+        header = (ROOT / "mineru/mu_gpu.h").read_text()
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn("mu_gpu_cmd_begin_with_scratch_offsets", header)
+        self.assertIn("mu_gpu_cmd_get_scratch_offsets", header)
+        self.assertIn("mu_gpu_cmd_begin_with_scratch_offsets", host)
+        self.assertIn("mu_gpu_cmd_get_scratch_offsets", host)

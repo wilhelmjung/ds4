@@ -29,8 +29,8 @@ static double local_time_now_seconds(void) {
 @protocol MTLCommandBufferProfiling <NSObject>
 @property (readonly) double kernelStartTime;
 @property (readonly) double kernelEndTime;
-@property (readonly) double gpuStartTime;
-@property (readonly) double gpuEndTime;
+@property (readonly) double GPUStartTime;
+@property (readonly) double GPUEndTime;
 @end
 
 #define MU_GPU_WEIGHT_CACHE_CAP 1024
@@ -328,8 +328,11 @@ struct mu_gpu_cmd_ctx {
     mu_scratch_allocator alloc;
 };
 
-int mu_gpu_cmd_begin(mu_gpu *gpu, mu_gpu_cmd_ctx **out_ctx) {
+int mu_gpu_cmd_begin_with_scratch_offsets(mu_gpu *gpu, unsigned long offset_a,
+                                          unsigned long offset_b,
+                                          mu_gpu_cmd_ctx **out_ctx) {
     if (!gpu || !out_ctx) return -1;
+    if (offset_a > gpu->scratch_size || offset_b > gpu->scratch_size) return -5;
     @autoreleasepool {
         id<MTLCommandBuffer> cb = [gpu->queue commandBuffer];
         if (!cb) return -2;
@@ -342,11 +345,15 @@ int mu_gpu_cmd_begin(mu_gpu *gpu, mu_gpu_cmd_ctx **out_ctx) {
         ctx->command_buffer = cb;
         ctx->encoder = enc;
         ctx->alloc.gpu = gpu;
-        ctx->alloc.offset_a = 0;
-        ctx->alloc.offset_b = 0;
+        ctx->alloc.offset_a = (NSUInteger)offset_a;
+        ctx->alloc.offset_b = (NSUInteger)offset_b;
         *out_ctx = ctx;
     }
     return 0;
+}
+
+int mu_gpu_cmd_begin(mu_gpu *gpu, mu_gpu_cmd_ctx **out_ctx) {
+    return mu_gpu_cmd_begin_with_scratch_offsets(gpu, 0, 0, out_ctx);
 }
 
 void mu_gpu_cmd_set_label(mu_gpu_cmd_ctx *ctx, const char *label) {
@@ -355,6 +362,12 @@ void mu_gpu_cmd_set_label(mu_gpu_cmd_ctx *ctx, const char *label) {
             ctx->command_buffer.label = [NSString stringWithUTF8String:label];
         }
     }
+}
+
+void mu_gpu_cmd_get_scratch_offsets(mu_gpu_cmd_ctx *ctx, unsigned long *offset_a,
+                                    unsigned long *offset_b) {
+    if (offset_a) *offset_a = ctx ? (unsigned long)ctx->alloc.offset_a : 0;
+    if (offset_b) *offset_b = ctx ? (unsigned long)ctx->alloc.offset_b : 0;
 }
 
 int mu_gpu_cmd_commit_and_wait(mu_gpu_cmd_ctx *ctx) {
@@ -399,11 +412,11 @@ int mu_gpu_cmd_commit_and_wait(mu_gpu_cmd_ctx *ctx) {
             if ([cb respondsToSelector:@selector(kernelEndTime)]) {
                 kernel_end = cb.kernelEndTime;
             }
-            if ([cb respondsToSelector:@selector(gpuStartTime)]) {
-                gpu_start = cb.gpuStartTime;
+            if ([cb respondsToSelector:@selector(GPUStartTime)]) {
+                gpu_start = cb.GPUStartTime;
             }
-            if ([cb respondsToSelector:@selector(gpuEndTime)]) {
-                gpu_end = cb.gpuEndTime;
+            if ([cb respondsToSelector:@selector(GPUEndTime)]) {
+                gpu_end = cb.GPUEndTime;
             }
 
             NSString *label = ctx->command_buffer.label;

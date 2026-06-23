@@ -56,6 +56,18 @@ class MuTextTimingSourceTests(unittest.TestCase):
         self.assertIn('"vision_block_attention"', source)
         self.assertIn('"vision_block_other"', source)
 
+    def test_text_decode_profile_split_timing_path_is_wired(self):
+        source = (ROOT / "mineru/mu.c").read_text()
+
+        self.assertIn('getenv("MU_TEXT_DECODE_PROFILE_SPLIT")', source)
+        self.assertIn("mu_gpu_cmd_get_scratch_offsets", source)
+        self.assertIn("mu_gpu_cmd_begin_with_scratch_offsets", source)
+        self.assertIn("text_decode_profile_qkv", source)
+        self.assertIn("text_decode_profile_attention", source)
+        self.assertIn("text_decode_profile_o_proj", source)
+        self.assertIn("text_decode_profile_mlp", source)
+        self.assertIn("text_decode_profile_logits", source)
+
 
 if __name__ == "__main__":
     unittest.main()

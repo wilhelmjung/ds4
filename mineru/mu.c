@@ -204,6 +204,22 @@ static void mu_text_decode_timing_add(mu_text_decode_timing *dst,
     dst->steps += src->steps;
 }
 
+#if defined(__APPLE__)
+static int mu_text_decode_profile_split_commit(mu_gpu *gpu, mu_gpu_cmd_ctx **ctx,
+                                               const char *next_label) {
+    if (!gpu || !ctx || !*ctx) return -1;
+    unsigned long offset_a = 0;
+    unsigned long offset_b = 0;
+    mu_gpu_cmd_get_scratch_offsets(*ctx, &offset_a, &offset_b);
+    int rc = mu_gpu_cmd_commit_and_wait(*ctx);
+    *ctx = NULL;
+    if (rc != 0 || !next_label) return rc;
+    rc = mu_gpu_cmd_begin_with_scratch_offsets(gpu, offset_a, offset_b, ctx);
+    if (rc == 0) mu_gpu_cmd_set_label(*ctx, next_label);
+    return rc;
+}
+#endif
+
 static uint64_t mu_read_u64_le(const unsigned char *p) {
     uint64_t v = 0;
     for (int i = 7; i >= 0; i--) {
@@ -4960,6 +4976,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
         int request_layer_resident = getenv("MU_TEXT_CACHED_LAYER_RESIDENT") != NULL;
         int disable_layer_resident = getenv("MU_TEXT_CACHED_LAYER_RESIDENT_DISABLE") != NULL;
         int request_qkv_rope_fusion = getenv("MU_TEXT_DECODE_QKV_ROPE_FUSION") != NULL;
+        int profile_split = getenv("MU_TEXT_DECODE_PROFILE_SPLIT") != NULL;
         int layer_resident = gpu_cache && (request_layer_resident || !disable_layer_resident);
         if (hidden_resident) {
             unsigned long hidden_bytes = hidden * sizeof(float);
@@ -5109,8 +5126,8 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
             mu_gpu_cmd_ctx *ctx = NULL;
             rc = mu_gpu_cmd_begin(e->gpu, &ctx);
             if (rc != 0) goto fail;
-            mu_gpu_cmd_set_label(ctx, "text_decode_layer_resident");
-            if (timing_stats) {
+            mu_gpu_cmd_set_label(ctx, profile_split ? "text_decode_profile_qkv" : "text_decode_layer_resident");
+            if (timing_stats && !profile_split) {
                 local_timing.command_buffers += 1;
             }
 
@@ -5121,6 +5138,8 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
             }
             mu_gpu_buf_copy_to(cur_hs_buf, hidden_state, hidden * sizeof(float));
 
+            int resident_logits = getenv("MU_TEXT_DECODE_NO_RESIDENT_LOGITS") == NULL;
+            char profile_label[64];
             for (int layer = 0; layer < 24; layer++) {
                 snprintf(name, sizeof(name), "model.layers.%d.input_layernorm.weight", layer);
                 const uint16_t *input_norm = mu_tensor_bf16(e, name, 1, hidden, 0);
@@ -5185,6 +5204,11 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
 
                 double qkv_start = timing_stats ? mu_time_now_seconds() : 0.0;
                 int use_qkv_rope_fusion = request_qkv_rope_fusion;
+                if (profile_split) {
+                    snprintf(profile_label, sizeof(profile_label),
+                             "text_decode_profile_qkv_l%02d", layer);
+                    mu_gpu_cmd_set_label(ctx, profile_label);
+                }
                 rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, cur_hs_buf, input_norm_buf, normed_buf, hidden, eps);
                 if (use_qkv_rope_fusion) {
                     if (rc == 0) rc = mu_gpu_text_decode_qkv_rope_cache_ctx(ctx, normed_buf, qw_buf, qb_buf,
@@ -5197,6 +5221,17 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                                                                         gpu_cache, layer,
                                                                         cache_pos, pos3);
                 }
+                if (rc != 0) {
+                    mu_gpu_cmd_discard(ctx);
+                    goto fail;
+                }
+                if (profile_split) {
+                    snprintf(profile_label, sizeof(profile_label),
+                             "text_decode_profile_attention_l%02d", layer);
+                    rc = mu_text_decode_profile_split_commit(e->gpu, &ctx, profile_label);
+                    if (rc != 0) goto fail;
+                    if (timing_stats) local_timing.command_buffers += 1;
+                }
                 if (timing_stats) {
                     local_timing.cached_qkv += mu_time_now_seconds() - qkv_start;
                 }
@@ -5204,11 +5239,44 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                 double attn_mlp_start = timing_stats ? mu_time_now_seconds() : 0.0;
                 if (rc == 0) rc = mu_gpu_text_attn_cached_resident_ctx(ctx, q_buf, gpu_cache, layer,
                                                                        cache_pos + 1, attn_buf);
+                if (profile_split) {
+                    if (rc != 0) {
+                        mu_gpu_cmd_discard(ctx);
+                        goto fail;
+                    }
+                    snprintf(profile_label, sizeof(profile_label),
+                             "text_decode_profile_o_proj_l%02d", layer);
+                    rc = mu_text_decode_profile_split_commit(e->gpu, &ctx, profile_label);
+                    if (rc != 0) goto fail;
+                    if (timing_stats) local_timing.command_buffers += 1;
+                }
                 if (rc == 0) rc = mu_gpu_dense_probe_add_ctx(ctx, attn_buf, ow_buf, cur_hs_buf, hs_buf2, hidden, hidden);
+                if (profile_split) {
+                    if (rc != 0) {
+                        mu_gpu_cmd_discard(ctx);
+                        goto fail;
+                    }
+                    snprintf(profile_label, sizeof(profile_label),
+                             "text_decode_profile_mlp_l%02d", layer);
+                    rc = mu_text_decode_profile_split_commit(e->gpu, &ctx, profile_label);
+                    if (rc != 0) goto fail;
+                    if (timing_stats) local_timing.command_buffers += 1;
+                }
                 if (rc == 0) rc = mu_gpu_text_decode_fused_ffn_ctx(ctx, hs_buf2, post_norm_buf, gate_w_buf, up_w_buf, down_w_buf, eps, out_hs_buf);
                 if (rc != 0) {
                     mu_gpu_cmd_discard(ctx);
                     goto fail;
+                }
+                if (profile_split) {
+                    const char *next_label = NULL;
+                    if (layer + 1 < 24) {
+                        next_label = "text_decode_profile_qkv";
+                    } else if (resident_logits) {
+                        next_label = "text_decode_profile_logits";
+                    }
+                    rc = mu_text_decode_profile_split_commit(e->gpu, &ctx, next_label);
+                    if (rc != 0) goto fail;
+                    if (timing_stats) local_timing.command_buffers += 1;
                 }
                 if (timing_stats) {
                     local_timing.kernel_dispatches += use_qkv_rope_fusion ? 5 : 6;
@@ -5222,7 +5290,6 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                 cur_hs_buf = out_hs_buf;
             }
 
-            int resident_logits = getenv("MU_TEXT_DECODE_NO_RESIDENT_LOGITS") == NULL;
             if (resident_logits) {
                 const uint16_t *final_norm = mu_tensor_bf16(e, "model.norm.weight", 1, hidden, 0);
                 mu_gpu_buf final_norm_buf = mu_gpu_get_weight_buf(e->gpu, final_norm, hidden * sizeof(unsigned short));
@@ -5243,6 +5310,7 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                         if (timing_stats) {
                             local_timing.kernel_dispatches += 1;
                             local_timing.logits_dispatches += 1;
+                            if (profile_split) local_timing.command_buffers += 1;
                         }
                         rc = mu_gpu_cmd_commit_and_wait(ctx);
                         if (rc != 0) goto fail;
@@ -5275,8 +5343,15 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                 }
             }
 
-            rc = mu_gpu_cmd_commit_and_wait(ctx);
-            if (rc != 0) goto fail;
+            if (profile_split) {
+                if (ctx) {
+                    rc = mu_gpu_cmd_commit_and_wait(ctx);
+                    if (rc != 0) goto fail;
+                }
+            } else {
+                rc = mu_gpu_cmd_commit_and_wait(ctx);
+                if (rc != 0) goto fail;
+            }
             mu_gpu_buf_copy_from(hidden_state, cur_hs_buf, hidden * sizeof(float));
             mu_record_metal_stage(e, "text_cached_layer_resident");
             mu_record_metal_stage(e, "text_cached_attn");

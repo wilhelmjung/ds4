@@ -384,6 +384,55 @@ Current kernel fusion status: default fusions are kept only when they help the
 same-run benchmark, while the QKV + RoPE + KV-cache fusion remains opt-in
 because it reduces dispatches (`145 -> 121/token`) but did not improve E2E time.
 
+### Metal Performance Primitives Guide Takeaways
+
+Reference: [Metal Performance Primitives Programming Guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf),
+Version 1, 2026-03-16.
+
+The local optimization machine is an Apple M5 MacBook Pro with 16 GB unified
+memory (`sysctl machdep.cpu.brand_string` reports `Apple M5`), so the guide's
+M5 tuning notes are directly relevant to local benchmarks. Keep any MPP/Metal 4
+implementation behind runtime capability checks so the repo remains buildable
+and testable on older Apple Silicon machines. Useful takeaways for the current
+backend:
+
+- Prefer fixed-shape or function-constant kernels for stable dimensions such as
+  `hidden=896`, `inter=4864`, and vision `1280`; static extents reduce bounds
+  checking in tensor operations.
+- Use postfix fusion when replacing GEMM/GEMV kernels: bias, residual add,
+  activation, and SwiGLU should happen before the matmul result round-trips
+  through device memory.
+- Do not assume threadgroup-memory staging is automatically faster on Apple
+  GPUs. The guide explicitly favors direct device-memory access plus cache
+  behavior for optimized GEMM kernels, with staging only when measurements prove
+  it helps.
+- For large GEMM-style work, start tile tuning near `2x2` simdgroups per
+  threadgroup and `32x32` simdgroup tiles for 16-bit operands, then benchmark
+  the actual model shapes.
+- Consider Morton-style threadgroup walk order for 2D tiled GEMM or attention
+  kernels to improve last-level-cache locality.
+- Use roofline/arithmetic-intensity reasoning before writing another fusion:
+  token-by-token decode GEMV is likely memory-bound, while larger prefill and
+  vision GEMMs are better candidates for MPP/tensor_ops experiments.
+
+Per-kernel/group GPU timing has now been added behind
+`MU_TEXT_DECODE_PROFILE_SPLIT=1`. The diagnostic path keeps the default
+resident decoder unchanged, but splits each decode layer into labeled command
+buffers for QKV, attention, O projection, and fused MLP, then records Metal GPU
+timestamps through `MU_LATENCY_PROFILE=1`.
+
+2026-06-23 trace results:
+
+| Trace | QKV | Attention | O projection | MLP | Logits | Main signal |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Text trace split GPU time | 22.1% | 7.2% | 2.9% | 59.1% | 8.7% | fused FFN is the text-only hotspot |
+| Layout trace split GPU time | 4.0% | 78.2% | 0.9% | 14.0% | 2.9% | cached attention dominates the VL path |
+
+Decision: for MinerU's VL/layout workload, continue the current MSL/MPS route
+with attention as the next primary optimization target. A small MPP/tensor_ops
+prototype remains useful for the text-only fused FFN/MLP hotspot, but it should
+not replace the attention work as the main next step.
+
 To achieve parity or superior performance compared to PyTorch/MPS and Apple MLX, the Metal backend can adopt the design principles established by `ggml-metal` and `mlx`:
 
 ### 1. End-to-End GPU Residency (Eliminating CPU-GPU Syncs)
