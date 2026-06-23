@@ -473,6 +473,29 @@ void mu_gpu_cmd_discard(mu_gpu_cmd_ctx *ctx) {
     }
 }
 
+static int mu_gpu_profile_commit_stage(mu_gpu *gpu, mu_gpu_cmd_ctx **ctx,
+                                       const char *stage,
+                                       const char *next_label) {
+    if (!gpu || !ctx || !*ctx || !stage) return -1;
+    unsigned long offset_a = 0;
+    unsigned long offset_b = 0;
+    mu_gpu_cmd_get_scratch_offsets(*ctx, &offset_a, &offset_b);
+
+    double start = local_time_now_seconds();
+    int rc = mu_gpu_cmd_commit_and_wait(*ctx);
+    double seconds = local_time_now_seconds() - start;
+    *ctx = NULL;
+
+    fprintf(stderr, "mu_timing stage=%s seconds=%.6f\n", stage, seconds);
+
+    if (rc != 0 || !next_label) return rc;
+
+    rc = mu_gpu_cmd_begin_with_scratch_offsets(gpu, offset_a, offset_b, ctx);
+    if (rc != 0) return rc;
+    mu_gpu_cmd_set_label(*ctx, next_label);
+    return 0;
+}
+
 static int mu_gpu_cmd_end_encoder(mu_gpu_cmd_ctx *ctx) {
     if (!ctx) return -1;
     if (ctx->encoder) {
@@ -1648,6 +1671,8 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
         int rc = mu_gpu_cmd_begin(gpu, &ctx);
         if (rc != 0) return rc;
         mu_gpu_cmd_set_label(ctx, "vision_encode_vit_and_merger");
+        bool profile_split = getenv("MU_VISION_PROFILE_SPLIT") != NULL;
+        char profile_label[96];
 
         unsigned long embed_bytes = (unsigned long)rows * 1280u * sizeof(float);
         unsigned long kv_bytes = (unsigned long)rows * 2560u * sizeof(float);
@@ -1689,6 +1714,10 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
         for (int layer = 0; layer < layers; layer++) {
             ctx->alloc.offset_a = base_offset_a;
             ctx->alloc.offset_b = base_offset_b;
+            if (profile_split) {
+                snprintf(profile_label, sizeof(profile_label), "vision_profile_norm1_l%02d", layer);
+                mu_gpu_cmd_set_label(ctx, profile_label);
+            }
             const unsigned short *norm1_w = mu_engine_get_vision_block_tensor(engine, layer, "norm1.weight", 1, 1280, 0);
             const unsigned short *norm1_b = mu_engine_get_vision_block_tensor(engine, layer, "norm1.bias", 1, 1280, 0);
             const unsigned short *qkv_w = mu_engine_get_vision_block_tensor(engine, layer, "attn.qkv.weight", 2, 3840, 1280);
@@ -1730,6 +1759,11 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
 
             rc = mu_gpu_layernorm_bf16_rows_ctx(ctx, current_in, norm1_w_buf, norm1_b_buf, rows, 1280, 1e-6f, temp_normed);
             if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+            if (profile_split) {
+                snprintf(profile_label, sizeof(profile_label), "vision_profile_qkv_l%02d", layer);
+                rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_norm1", profile_label);
+                if (rc != 0) return rc;
+            }
 
             bool request_mps = getenv("MU_DENSE_ROWS_MPS") != NULL;
             bool use_simdgroup = mu_gpu_dense_mps_shape(1280, 3840) &&
@@ -1764,6 +1798,11 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
                 rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, temp_normed, kv_w_buf, kv_b_buf, rows, 1280, 2560, temp_kv);
                 if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
             }
+            if (profile_split) {
+                snprintf(profile_label, sizeof(profile_label), "vision_profile_attention_l%02d", layer);
+                rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_qkv", profile_label);
+                if (rc != 0) return rc;
+            }
 
             if (rows <= 16) {
                 for (int r = 0; rc == 0 && r < rows; r++) {
@@ -1777,24 +1816,58 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
                 rc = mu_gpu_vision_attn_rows_ctx(ctx, temp_q, temp_kv, rotary, rows, temp_attn);
             }
             if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+            if (profile_split) {
+                snprintf(profile_label, sizeof(profile_label), "vision_profile_proj_l%02d", layer);
+                rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_attention", profile_label);
+                if (rc != 0) return rc;
+            }
 
             rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, temp_attn, proj_w_buf, proj_b_buf, rows, 1280, 1280, temp_proj);
             if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+            if (profile_split) {
+                snprintf(profile_label, sizeof(profile_label), "vision_profile_residual1_l%02d", layer);
+                rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_proj", profile_label);
+                if (rc != 0) return rc;
+            }
 
             rc = mu_gpu_vision_add_bf16_ctx(ctx, current_in, temp_proj, rows * 1280, temp_res1);
             if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+            if (profile_split) {
+                snprintf(profile_label, sizeof(profile_label), "vision_profile_norm2_l%02d", layer);
+                rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_residual1", profile_label);
+                if (rc != 0) return rc;
+            }
 
             rc = mu_gpu_layernorm_bf16_rows_ctx(ctx, temp_res1, norm2_w_buf, norm2_b_buf, rows, 1280, 1e-6f, temp_norm2);
             if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+            if (profile_split) {
+                snprintf(profile_label, sizeof(profile_label), "vision_profile_fc1_gelu_l%02d", layer);
+                rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_norm2", profile_label);
+                if (rc != 0) return rc;
+            }
 
             rc = mu_gpu_dense_bf16_bias_rows_quick_gelu_ctx(ctx, temp_norm2, fc1_w_buf, fc1_b_buf, rows, 1280, 5120, temp_fc1_act);
             if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+            if (profile_split) {
+                snprintf(profile_label, sizeof(profile_label), "vision_profile_fc2_l%02d", layer);
+                rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_fc1_gelu", profile_label);
+                if (rc != 0) return rc;
+            }
 
             rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, temp_fc1_act, fc2_w_buf, fc2_b_buf, rows, 5120, 1280, temp_proj);
             if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+            if (profile_split) {
+                snprintf(profile_label, sizeof(profile_label), "vision_profile_residual2_l%02d", layer);
+                rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_fc2", profile_label);
+                if (rc != 0) return rc;
+            }
 
             rc = mu_gpu_vision_add_bf16_ctx(ctx, temp_res1, temp_proj, rows * 1280, current_out);
             if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+            if (profile_split) {
+                rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_residual2", "");
+                if (rc != 0) return rc;
+            }
 
             // Swap ping-pong
             mu_gpu_buf tmp = current_in;
@@ -1835,23 +1908,45 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
         mu_gpu_buf merger_out_buf = mu_gpu_scratch_alloc_a_ctx(ctx, merger_out_bytes);
         if (!merger_out_buf.ptr) { mu_gpu_cmd_discard(ctx); return -8; }
 
+        if (profile_split) {
+            mu_gpu_cmd_set_label(ctx, "vision_profile_merger_norm");
+        }
         rc = mu_gpu_layernorm_bf16_rows_ctx(ctx, current_in, ln_w_buf, ln_b_buf, rows, 1280, 1e-6f, temp_normed);
         if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+        if (profile_split) {
+            rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_merger_norm",
+                                             "vision_profile_merger_merge4");
+            if (rc != 0) return rc;
+        }
 
         // Reuse temp_fc1 for merge4 output (groups * 5120 floats)
         rc = mu_gpu_vision_merge4_ctx(ctx, temp_normed, rows, temp_fc1);
         if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+        if (profile_split) {
+            rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_merger_merge4",
+                                             "vision_profile_merger_fc0_gelu");
+            if (rc != 0) return rc;
+        }
 
         // Dense layer: fc0 (groups * 5120 -> groups * 5120) with fused GELU
         // Reuse temp_fc1_act for activated
         rc = mu_gpu_dense_bf16_bias_rows_gelu_ctx(ctx, temp_fc1, fc0_w_buf, fc0_b_buf, groups, 5120, 5120, temp_fc1_act);
         if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+        if (profile_split) {
+            rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_merger_fc0_gelu",
+                                             "vision_profile_merger_fc2");
+            if (rc != 0) return rc;
+        }
 
         // Dense layer: fc2 (groups * 5120 -> groups * 896)
         rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, temp_fc1_act, fc2_w_buf, fc2_b_buf, groups, 5120, 896, merger_out_buf);
         if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
 
-        rc = mu_gpu_cmd_commit_and_wait(ctx);
+        if (profile_split) {
+            rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_merger_fc2", NULL);
+        } else {
+            rc = mu_gpu_cmd_commit_and_wait(ctx);
+        }
         if (rc == 0) {
             mu_gpu_buf_copy_from(out, merger_out_buf, merger_out_bytes);
         }

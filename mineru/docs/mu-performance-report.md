@@ -3237,3 +3237,102 @@ Decision:
 - Next optimization target should be the vision/layout encoder path: profile
   vision block timing under the current default, then test the smallest MPS/MSL
   bridge that reduces `layout_vision_encode` before writing new custom kernels.
+
+### Current Vision Encode Split Profile And No-Flash Gate
+
+Date: 2026-06-23
+
+Added a diagnostic-only split path for the current `mu_gpu_vision_encode`
+implementation:
+
+```text
+MU_VISION_PROFILE_SPLIT=1
+```
+
+This flag inserts waited command-buffer boundaries inside the current vision
+encoder and emits `mu_timing` buckets for the major block stages. It is not a
+performance mode and is expected to run slower than the default path.
+
+Artifacts:
+
+```text
+/tmp/mu-vision-profile-split-224-258.json
+/tmp/mu-vision-default-rerun-224-258.json
+/tmp/mu-vision-no-flash-224-258.json
+/tmp/mu-vision-no-flash-vs-default-224-258.metrics.json
+/tmp/mu-vision-no-flash-10page-20260623.json
+/tmp/mu-vision-no-flash-10page-20260623/metal_page_*.json
+/tmp/mu-vision-no-flash-vs-default-10page-20260623.metrics.json
+```
+
+Two-page split profile, pages `224,258`:
+
+| Stage | Mean s/page | Share |
+| --- | ---: | ---: |
+| `vision_profile_attention` | 35.3951 | 58.1% |
+| `vision_profile_norm1` | 6.8301 | 11.2% |
+| `vision_profile_norm2` | 6.5893 | 10.8% |
+| `vision_profile_fc1_gelu` | 3.6320 | 6.0% |
+| `vision_profile_fc2` | 2.8576 | 4.7% |
+| `vision_profile_qkv` | 2.7525 | 4.5% |
+| `vision_profile_proj` | 0.8451 | 1.4% |
+| `vision_profile_merger_fc0_gelu` | 0.8252 | 1.4% |
+
+The split confirms that vision attention is the dominant current vision encoder
+bucket. The merger stages are small and should not be optimized next.
+
+The first candidate was disabling the current flash path:
+
+```text
+MU_VISION_ATTN_NO_FLASH=1
+```
+
+Two-page A/B initially looked promising:
+
+| Path | Total s | Mean s/page | Mean layout vision s/page | Fallback rows |
+| --- | ---: | ---: | ---: | ---: |
+| Current default rerun | 134.7697 | 67.3849 | 37.0310 | 0 |
+| `MU_VISION_ATTN_NO_FLASH=1` | 128.3127 | 64.1564 | 29.4362 | 0 |
+
+However, the full 10-page gate rejected this as a default change:
+
+| Path | Completed | Fallback rows | Total s | Mean s/page |
+| --- | ---: | ---: | ---: | ---: |
+| Current default flash | 10 / 10 | 0 | 651.6244 | 65.1624 |
+| `MU_VISION_ATTN_NO_FLASH=1` | 10 / 10 | 0 | 1004.3888 | 100.4389 |
+
+Page-level deltas versus the current default:
+
+| Page | Total delta | Layout vision delta | Decode delta |
+| ---: | ---: | ---: | ---: |
+| 224 | +0.325s | -11.079s | +13.309s |
+| 234 | +23.244s | -1.829s | +22.191s |
+| 237 | +16.234s | -1.810s | +16.609s |
+| 241 | +13.341s | -2.055s | +13.790s |
+| 244 | +190.733s | +160.146s | +4.656s |
+| 247 | +110.201s | +105.296s | +7.443s |
+| 258 | -0.393s | -5.178s | +2.354s |
+| 281 | -0.496s | -5.111s | +1.827s |
+| 303 | -0.062s | -5.103s | +2.393s |
+| 334 | -0.362s | -5.233s | +2.417s |
+
+Output comparison stayed exact despite the performance regression:
+
+| Metric | Value |
+| --- | ---: |
+| Block count exact rate | 1.0000 |
+| Ordered type accuracy | 1.0000 |
+| Ordered mean bbox IoU | 1.0000 |
+| Mean content token F1 | 1.0000 |
+| Table exact cell recall | 1.0000 |
+
+Decision:
+
+- Keep the current flash vision attention path as the default.
+- Do not promote `MU_VISION_ATTN_NO_FLASH=1`; it is shape-sensitive and
+  regresses the 10-page gate by `1.5414x`.
+- Next work should tune or gate `mu_vision_attn_rows_flash` by shape rather
+  than reverting to the older no-flash path.
+- The next measurable target is reducing the fixed `layout_vision_encode`
+  budget on short pages while preserving the table-heavy page behavior where
+  flash remains much safer.

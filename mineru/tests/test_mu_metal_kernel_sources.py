@@ -208,3 +208,11 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn("mu_gpu_cmd_get_scratch_offsets", header)
         self.assertIn("mu_gpu_cmd_begin_with_scratch_offsets", host)
         self.assertIn("mu_gpu_cmd_get_scratch_offsets", host)
+
+    def test_current_vision_encode_has_split_profile_path(self):
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn('getenv("MU_VISION_PROFILE_SPLIT")', host)
+        self.assertIn("mu_gpu_profile_commit_stage", host)
+        self.assertIn("vision_profile_attention", host)
+        self.assertIn("vision_profile_merger_fc2", host)
