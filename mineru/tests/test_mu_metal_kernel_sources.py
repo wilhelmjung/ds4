@@ -234,3 +234,18 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn('"mu_vision_attn_rows_flash_k16"', host)
         self.assertIn('getenv("MU_VISION_ATTN_FLASH_K16")', host)
         self.assertIn("key_tile_rows=16", host)
+
+    def test_vision_attention_mpsgraph_lane_is_wired(self):
+        makefile = (ROOT / "Makefile").read_text()
+        metal = (ROOT / "mineru/metal/mu_vision.metal").read_text()
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn("MetalPerformanceShadersGraph", makefile)
+        self.assertIn("#import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>", host)
+        self.assertIn('getenv("MU_VISION_ATTN_MPSGRAPH")', host)
+        self.assertIn('getenv("MU_VISION_ATTN_NO_MPSGRAPH")', host)
+        self.assertIn("mu_gpu_vision_attn_rows_mpsgraph_stage", host)
+        self.assertIn("scaledDotProductAttentionWithQueryTensor", host)
+        self.assertIn("runWithMTLCommandQueue", host)
+        self.assertIn("path=mpsgraph", host)
+        self.assertIn("kernel void mu_vision_attn_pack_qkv_mpsgraph", metal)

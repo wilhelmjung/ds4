@@ -451,6 +451,14 @@ attention step should be deeper MSL tiling/fusion or an MPSGraph/MPS SDPA-style
 prototype. MPP/tensor_ops remains a secondary experiment for text-only MLP,
 where the split profile points instead of layout attention.
 
+2026-06-23 vision attention update: the bounded MPSGraph SDPA prototype passed
+the 10-page gate and is now the default vision attention path. It only replaces
+the attention segment in `mu_gpu_vision_encode`: Q/K/V are packed to
+`[1,16,rows,80]`, MPSGraph runs scaled-dot-product attention, and the result is
+reshaped back to `[rows,1280]`. The previous flash/K16/no-flash path remains
+available through `MU_VISION_ATTN_NO_MPSGRAPH=1`. The measured 10-page result
+improved from `651.6244s` to `565.2294s` with exact output parity.
+
 To achieve parity or superior performance compared to PyTorch/MPS and Apple MLX, the Metal backend can adopt the design principles established by `ggml-metal` and `mlx`:
 
 ### 1. End-to-End GPU Residency (Eliminating CPU-GPU Syncs)

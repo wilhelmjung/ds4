@@ -20,7 +20,7 @@ ifeq ($(UNAME_S),Darwin)
 METALC ?= $(shell xcrun -sdk macosx -find metal 2>/dev/null)
 METALLIBC ?= $(shell xcrun -sdk macosx -find metallib 2>/dev/null)
 METAL_LDLIBS := $(LDLIBS) -framework Foundation -framework Metal
-MU_LDLIBS := $(LDLIBS) -framework CoreFoundation -framework CoreGraphics -framework ImageIO -framework Accelerate -framework MetalPerformanceShaders
+MU_LDLIBS := $(LDLIBS) -framework CoreFoundation -framework CoreGraphics -framework ImageIO -framework Accelerate -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph
 CORE_OBJS = ds4.o ds4_distributed.o ds4_ssd.o ds4_metal.o
 CPU_CORE_OBJS = ds4_cpu.o ds4_distributed.o ds4_ssd.o
 MU_OBJS = mineru/mu.o mineru/mu_metal.o

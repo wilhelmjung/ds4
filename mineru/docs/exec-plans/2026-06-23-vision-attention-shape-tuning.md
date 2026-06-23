@@ -295,6 +295,37 @@ Current decision:
   with the stable layout shape `rows=5476`, cache the graph/pipeline by shape,
   and run the same 2-page and 10-page gates before any promotion.
 
+MPSGraph result, 2026-06-23:
+
+- Added an MPSGraph SDPA attention-only lane for vision attention.
+- The lane packs Q/K/V to `[1,16,rows,80]`, runs
+  `scaledDotProductAttentionWithQueryTensor`, reshapes back to `[rows,1280]`,
+  and caches the graph by `rows`.
+- The 10-page promotion gate passed, so MPSGraph vision attention is now the
+  default path.
+- Rollback switch:
+
+  ```text
+  MU_VISION_ATTN_NO_MPSGRAPH=1
+  ```
+
+10-page promotion gate:
+
+| Path | Completed | Fallback rows | Total s | Mean s/page | Mean layout vision s/page | Mean content vision s/page | Output parity |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Previous flash default | 10 / 10 | 0 | 651.6244 | 65.1624 | 33.7636 | 14.4387 | baseline |
+| MPSGraph attention default | 10 / 10 | 0 | 565.2294 | 56.5229 | 17.2824 | 9.9374 | exact |
+
+Decision:
+
+- Promote MPSGraph vision attention to default because it is `1.1528x` faster
+  than the previous default and exact on all 10 output JSON files.
+- Keep `MU_VISION_ATTN_NO_MPSGRAPH=1` as the rollback path to the previous
+  flash/K16/no-flash diagnostics.
+- Current Metal remains `1.2535x` slower than same-run warm PyTorch/MPS
+  (`450.9345s`), so the next target is reducing MPSGraph pack/copy and command
+  boundary overhead before attempting deeper MSL rewrites.
+
 ## References
 
 - `mineru/mu_metal.m`: current `mu_gpu_vision_encode` and host-side attention

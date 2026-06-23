@@ -3513,3 +3513,53 @@ Decision:
   comparison is a bounded `MU_VISION_ATTN_MPSGRAPH=1` attention-only prototype
   for the stable `rows=5476` layout shape, with graph/pipeline caching by
   shape.
+
+### Vision Attention MPSGraph Promotion
+
+Date: 2026-06-23
+
+Implemented and promoted the bounded MPSGraph attention-only lane for vision
+attention. It replaces only the SDPA segment inside `mu_gpu_vision_encode`:
+Q/K/V are packed to `[1,16,rows,80]`, MPSGraph
+`scaledDotProductAttentionWithQueryTensor` runs the attention, and the output is
+reshaped back to `[rows,1280]`.
+
+Control flags:
+
+```text
+MU_VISION_ATTN_NO_MPSGRAPH=1  # rollback to the previous flash/K16/no-flash path
+MU_VISION_ATTN_MPSGRAPH=1     # explicit request; default no longer needs it
+```
+
+Route checks:
+
+```text
+/tmp/mu-vision-default-mpsgraph-path-check-258.json
+/tmp/mu-vision-no-mpsgraph-path-check-258.json
+```
+
+The default route reports `path=mpsgraph`; the rollback route reports
+`path=flash`.
+
+10-page promotion gate:
+
+```text
+/tmp/mu-vision-mpsgraph-10page-20260623.json
+/tmp/mu-vision-mpsgraph-10page-20260623/metal_page_*.json
+```
+
+| Path | Completed | Fallback rows | Total s | Mean s/page | Mean layout vision s/page | Mean content vision s/page | Output parity |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Previous flash default | 10 / 10 | 0 | 651.6244 | 65.1624 | 33.7636 | 14.4387 | baseline |
+| MPSGraph attention default | 10 / 10 | 0 | 565.2294 | 56.5229 | 17.2824 | 9.9374 | exact |
+
+Decision:
+
+- Promote MPSGraph vision attention to default.
+- Keep `MU_VISION_ATTN_NO_MPSGRAPH=1` as rollback.
+- MPSGraph improves total time by `1.1528x`, layout vision by `1.9536x`, and
+  content-region vision by `1.4530x` versus the previous default flash path.
+- Current Metal remains `1.2535x` slower than same-run warm PyTorch/MPS
+  (`450.9345s`), so the next optimization should target the remaining
+  MPSGraph pack/copy and command-boundary overhead, not another blind flash tile
+  change.

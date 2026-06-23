@@ -569,3 +569,39 @@ kernel void mu_vision_attn_rows_flash_k16(device const float *q [[buffer(0)]],
         }
     }
 }
+
+kernel void mu_vision_attn_pack_qkv_mpsgraph(device const float *q [[buffer(0)]],
+                                             device const float *kv [[buffer(1)]],
+                                             device const float *rotary [[buffer(2)]],
+                                             device float *q_pack [[buffer(3)]],
+                                             device float *k_pack [[buffer(4)]],
+                                             device float *v_pack [[buffer(5)]],
+                                             constant int &rows [[buffer(6)]],
+                                             uint gid [[thread_position_in_grid]]) {
+    int idx = (int)gid;
+    int total = rows * 1280;
+    if (idx >= total) return;
+
+    const int head_dim = 80;
+    int row = idx / 1280;
+    int col = idx - row * 1280;
+    int head = col / head_dim;
+    int dim = col - head * head_dim;
+    size_t packed_idx = ((size_t)head * (size_t)rows + (size_t)row) * 80u + (size_t)dim;
+
+    device const float *q_head = q + (size_t)row * 1280u + head * head_dim;
+    device const float *k_head = kv + (size_t)row * 2560u + head * head_dim;
+    device const float *v_head = kv + (size_t)row * 2560u + 1280u + head * head_dim;
+    device const float *rope = rotary + (size_t)row * 40u;
+    q_pack[packed_idx] = mu_rope_value(q_head, rope, dim);
+    k_pack[packed_idx] = mu_rope_value(k_head, rope, dim);
+    v_pack[packed_idx] = v_head[dim];
+}
+
+kernel void mu_vision_attn_copy_mpsgraph(device const float *src [[buffer(0)]],
+                                         device float *out [[buffer(1)]],
+                                         constant int &n [[buffer(2)]],
+                                         uint gid [[thread_position_in_grid]]) {
+    if ((int)gid >= n) return;
+    out[gid] = mu_round_bf16(src[gid]);
+}
