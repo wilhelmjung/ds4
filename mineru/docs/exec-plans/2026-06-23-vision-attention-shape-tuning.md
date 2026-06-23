@@ -61,6 +61,8 @@ current flash path is stable.
 - Preserve exact output comparison against the current default:
   `mean_content_token_f1=1.0000`, exact block/type/bbox, and table cell recall
   `1.0000` where tables exist.
+- Treat MPSGraph as an attention-only reference/prototype path. Do not migrate
+  the full vision tower or dynamically create graphs per page/layer.
 
 ## Execution Steps
 
@@ -125,6 +127,17 @@ Implement the smallest candidate from Step 2 behind an opt-in flag first:
 ```text
 MU_VISION_ATTN_FLASH_TUNE=1
 ```
+
+If the shape matrix does not identify a simple flash-tile change, implement a
+bounded MPSGraph SDPA comparison lane instead:
+
+```text
+MU_VISION_ATTN_MPSGRAPH=1
+```
+
+That lane must cache graphs by stable shape, starting with `rows`, and should
+replace only the vision attention segment. It is a benchmark/prototype path, not
+a full vision tower migration.
 
 Do not remove existing rollback flags.
 
@@ -191,5 +204,9 @@ If the 10-page gate fails:
   dispatch.
 - `mineru/metal/mu_vision.metal`: current vision attention kernels.
 - `mineru/docs/mu-performance-report.md`: MPS/Metal comparison, split profile,
-  and no-flash 10-page gate.
+  no-flash 10-page gate, and MPSGraph decision.
 - `mineru/docs/design-docs/mu-metal-design.md`: Metal backend design notes.
+- Apple MPSGraph scaled dot product attention:
+  https://developer.apple.com/documentation/metalperformanceshadersgraph/mpsgraph/scaleddotproductattention%28query%3Akey%3Avalue%3Amask%3Ascale%3Aname%3A%29
+- Apple `MPSGraphSDPADescriptor`:
+  https://developer.apple.com/documentation/metalperformanceshadersgraph/mpsgraphsdpadescriptor

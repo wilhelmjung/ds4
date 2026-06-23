@@ -3336,3 +3336,42 @@ Decision:
 - The next measurable target is reducing the fixed `layout_vision_encode`
   budget on short pages while preserving the table-heavy page behavior where
   flash remains much safer.
+
+### MPSGraph Relevance For The Current Gap
+
+Date: 2026-06-23
+
+MPSGraph is useful, but only in a narrow role for the current bottleneck.
+
+The current measured gap is concentrated in vision attention, not in a broad
+framework integration problem:
+
+- Current Metal is `1.4451x` slower than same-run warm MPS on the 10-page gate.
+- `layout_vision_encode` averages `33.7636s/page`.
+- The split profile shows `vision_profile_attention=35.3951s/page`, `58.1%`
+  of the diagnostic vision profile.
+
+Decision:
+
+- Use MPSGraph as an SDPA/attention reference path and benchmark oracle for
+  `mu_vision_attn_rows_flash`.
+- Do not migrate the full vision tower to MPSGraph.
+- Do not create MPSGraph graphs per layer or per page; any prototype must cache
+  by shape, starting with `rows`.
+- Do not replace dense/norm first. The current split points at attention.
+- Add any MPSGraph experiment behind an opt-in flag such as
+  `MU_VISION_ATTN_MPSGRAPH=1`; promote only after the 10-page gate beats the
+  current `651.6244s` baseline with exact output parity.
+
+The MPSGraph practices worth borrowing are shape-specialized execution,
+graph/kernel caching by stable dimensions, fused SDPA-style softmax/PV behavior,
+and avoiding intermediate memory traffic. The next concrete step still remains
+shape telemetry for the existing flash path; MPSGraph should be a comparison
+lane, not the first rewrite.
+
+References:
+
+- Apple MPSGraph scaled dot product attention:
+  https://developer.apple.com/documentation/metalperformanceshadersgraph/mpsgraph/scaleddotproductattention%28query%3Akey%3Avalue%3Amask%3Ascale%3Aname%3A%29
+- Apple `MPSGraphSDPADescriptor`:
+  https://developer.apple.com/documentation/metalperformanceshadersgraph/mpsgraphsdpadescriptor
