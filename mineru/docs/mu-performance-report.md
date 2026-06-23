@@ -3164,3 +3164,76 @@ Decision:
 - Continue the current MSL/MPS route. The next larger target is either deeper
   cached-attention tiling/fusion or an MPSGraph/MPS SDPA-style prototype; keep
   MPP/tensor_ops work secondary for text-only MLP.
+
+### Back-To-Back MPS vs Current Metal
+
+Date: 2026-06-23
+
+Ran the full 10-page full-content512 gate back-to-back on the local Apple
+Silicon M5 machine:
+
+1. PyTorch/Transformers MPS warm-up run, not counted.
+2. PyTorch/Transformers MPS measured run.
+3. Current `mu` Metal measured run with cached attention SIMD default.
+
+Artifacts:
+
+```text
+/tmp/mu-mps-b2b-10page-warm-20260623/summary.json
+/tmp/mu-mps-b2b-10page-measured-20260623/summary.json
+/tmp/mu-mps-b2b-10page-measured-20260623/pages.jsonl
+/tmp/mu-metal-b2b-10page-current-20260623.json
+/tmp/mu-metal-b2b-10page-current-20260623/metal_page_*.json
+```
+
+Summary:
+
+| Path | Completed | Errors | Fallback rows | Total s | Mean s/page |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| PyTorch/Transformers MPS measured | 10 / 10 | 0 | n/a | 450.9345 | 45.0935 |
+| Current Metal cached-attention SIMD | 10 / 10 | 0 | 0 | 651.6244 | 65.1624 |
+
+Current Metal is `1.4451x` slower than the same-run warm MPS reference.
+
+Page-level comparison:
+
+| Page | MPS s | Metal s | Metal / MPS |
+| ---: | ---: | ---: | ---: |
+| 224 | 38.7110 | 80.3509 | 2.0757x |
+| 234 | 59.3327 | 79.7639 | 1.3444x |
+| 237 | 61.7792 | 80.5461 | 1.3038x |
+| 241 | 72.9072 | 80.2076 | 1.1001x |
+| 244 | 66.5738 | 79.6922 | 1.1970x |
+| 247 | 63.6432 | 78.5575 | 1.2343x |
+| 258 | 32.7487 | 43.1906 | 1.3189x |
+| 281 | 18.0230 | 42.7760 | 2.3734x |
+| 303 | 18.1214 | 42.9611 | 2.3707x |
+| 334 | 19.0943 | 43.5784 | 2.2823x |
+
+Mean Metal stage timing:
+
+| Stage | Mean s/page |
+| --- | ---: |
+| `layout_vision_encode` | 33.7636 |
+| `text_generate_decode` | 14.4107 |
+| `content_total` | 26.8243 |
+| `content_region_vision_encode` | 14.4387 |
+| `content_region_generate` | 12.2146 |
+| `layout_generate` | 4.1425 |
+
+Interpretation:
+
+- The cached-attention default helped enough that decode is no longer the
+  obvious first target in this 10-page MPS comparison.
+- Current Metal pays an almost fixed `~33.8s/page` `layout_vision_encode` cost,
+  which dominates the short/simple pages where MPS finishes in `18-19s`.
+- For table-heavy pages, content work is also substantial, but the common
+  across-page gap is now the vision/layout path.
+
+Decision:
+
+- Keep cached attention SIMD enabled by default.
+- Do not start another attention micro-fusion from this result alone.
+- Next optimization target should be the vision/layout encoder path: profile
+  vision block timing under the current default, then test the smallest MPS/MSL
+  bridge that reduces `layout_vision_encode` before writing new custom kernels.
