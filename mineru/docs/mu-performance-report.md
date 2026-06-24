@@ -3765,3 +3765,57 @@ Decision:
 - The next local M5 optimization should avoid another naive online-softmax MSL
   attention kernel. Either test a materially different simdgroup/tiled SDPA
   design or move to the next largest non-attention stage.
+
+### Post-MPSGraph Vision Non-Attention Profile
+
+Date: 2026-06-24
+
+Ran the shortest local M5 profile after rejecting the packed MSL attention lane:
+
+```text
+MU_VISION_PROFILE_SPLIT=1 MU_VISION_ATTN_MPSGRAPH_PROFILE=1 MU_TIMING=1
+page=258
+skip-content=true
+max_new_tokens=512
+```
+
+Artifact:
+
+```text
+/tmp/mu-vision-nonattn-mpsgraph-split-258-skip-20260624.json
+```
+
+The MPSGraph split flag adds extra command-buffer boundaries, so this is a
+bottleneck-ordering profile, not a promotion gate.
+
+Results:
+
+| Stage | Seconds | Share of layout vision |
+| --- | ---: | ---: |
+| `vision_profile_norm1` | 3.5621 | 21.5% |
+| `vision_profile_norm2` | 3.5172 | 21.2% |
+| `vision_attn_mpsgraph_graph` | 2.0094 | 12.1% |
+| `vision_profile_fc1_gelu` | 1.6800 | 10.1% |
+| `vision_profile_fc2` | 1.4098 | 8.5% |
+| `vision_profile_qkv` | 1.2396 | 7.5% |
+| `vision_attn_mpsgraph_pack_qkv` | 0.3179 | 1.9% |
+| `vision_profile_proj` | 0.4269 | 2.6% |
+| `vision_profile_merger_fc0_gelu` | 0.4062 | 2.5% |
+| `vision_attn_mpsgraph_copy_round` | 0.1075 | 0.6% |
+
+Totals:
+
+- `layout_vision_encode`: `16.5731s`
+- `page_total`: `26.5270s`
+- `fallback_rows`: `0`
+- Output comparison against the same-day default MPSGraph profile output was
+  exact (`block_count_exact_rate=1.0`, `mean_content_token_f1=1.0`).
+
+Decision:
+
+- Stop targeting attention for the next small change. MPSGraph SDPA is no
+  longer the largest single local M5 cost on this gate.
+- Next candidate should target vision LayerNorm first: `norm1 + norm2` is
+  `7.0793s`, about `42.7%` of layout vision.
+- If the LayerNorm path cannot be improved cheaply, the next fallback target is
+  the vision FFN pair: `fc1_gelu + fc2 = 3.0898s`.

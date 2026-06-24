@@ -385,6 +385,34 @@ Decision:
 - The next local M5 candidate needs a materially different attention design
   such as simdgroup/tiled SDPA, or it should target a non-attention stage.
 
+Post-MPSGraph non-attention profile, 2026-06-24:
+
+- Ran page `258` skip-content with both split profilers enabled:
+
+  ```text
+  MU_VISION_PROFILE_SPLIT=1 MU_VISION_ATTN_MPSGRAPH_PROFILE=1 MU_TIMING=1
+  ```
+
+- Result:
+
+| Stage | Seconds | Share of layout vision |
+| --- | ---: | ---: |
+| `vision_profile_norm1` | 3.5621 | 21.5% |
+| `vision_profile_norm2` | 3.5172 | 21.2% |
+| `vision_attn_mpsgraph_graph` | 2.0094 | 12.1% |
+| `vision_profile_fc1_gelu` | 1.6800 | 10.1% |
+| `vision_profile_fc2` | 1.4098 | 8.5% |
+| `vision_profile_qkv` | 1.2396 | 7.5% |
+
+- Output stayed exact against the same-day default MPSGraph profile output.
+
+Updated decision:
+
+- Do not start another attention variant next.
+- Next shortest useful implementation target is vision LayerNorm, because
+  `norm1 + norm2` is the largest remaining local M5 cost.
+- If LayerNorm has no cheap win, move to the FFN pair (`fc1_gelu + fc2`).
+
 ## References
 
 - `mineru/mu_metal.m`: current `mu_gpu_vision_encode` and host-side attention
