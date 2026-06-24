@@ -45,30 +45,39 @@ The underlying model is a `Qwen2-VL-1.2B` architecture. It consists of three pri
 
 ```mermaid
 graph TB
-    subgraph Input Processing
-        Img[Raw RGB Image] --> Patches["Spatial Patches (14x14)<br/>Temporal Patches (2)"]
-        Patches --> PE["Patch Embedding<br/>(3D Convolution Projection to 1280-dim)"]
+    subgraph Input["Input Processing"]
+        Img["Raw RGB Image"] --> Pre["Resize / Pad / Normalize"]
+        Pre --> Patches["Spatial Patches 14x14<br/>Temporal Patches 2"]
+        Patches --> PE["Patch Embedding<br/>3D Conv Projection to 1280"]
     end
 
-    subgraph Vision Tower (32 ViT Blocks)
-        PE --> MRope["3D Rotary Positional Embedding (M-RoPE)"]
-        MRope --> ViT[32 x Vision Blocks]
+    subgraph Vision["Vision Tower: 32 ViT Blocks, 1280 hidden, 16 heads"]
+        PE --> MRope["3D M-RoPE"]
+        MRope --> VBlock["Per Block:<br/>LayerNorm -> fused QKV projection"]
+        VBlock --> VAttn{"Vision Attention"}
+        VAttn -->|default| MPSGraph["MPSGraph SDPA<br/>Q/K/V packed as 1x16xrowsx80"]
+        VAttn -->|diagnostic only| MSLDiag["MSL flash variants<br/>flash / K16 / packed rows=5476"]
+        MPSGraph --> VProj["Attention output projection<br/>Residual add"]
+        MSLDiag --> VProj
+        VProj --> VFFN["LayerNorm -> FFN<br/>Residual add"]
     end
 
-    subgraph Spatial Merger
-        ViT --> Pool["2x2 Spatial pooling"]
-        Pool --> MLProj["Linear Projection to 896-dim"]
+    subgraph Merger["Spatial Merger"]
+        VFFN --> Pool["2x2 Spatial Merge"]
+        Pool --> MLProj["LayerNorm + Linear Projection<br/>1280 -> 896"]
     end
 
-    subgraph Text Decoder (24 Qwen2 Layers)
-        MLProj --> EmbedScatter["Embedding Scatter<br/>(Embeddings Merged into Text Token Sequence)"]
-        Prompt[Text Tokens] --> TextEmbed[Token Embedding]
+    subgraph Decoder["Text Decoder: 24 Qwen2 Layers, 896 hidden"]
+        MLProj --> EmbedScatter["Embedding Scatter<br/>Visual tokens inserted into text sequence"]
+        Prompt["Text Prompt Tokens"] --> TextEmbed["Token Embedding"]
         TextEmbed --> EmbedScatter
-        
-        EmbedScatter --> DecL1["Decoder Layer 1"]
-        DecL1 --> DecL24["...<br/>Decoder Layer 24"]
-        DecL24 --> VocabProj["Vocabulary Projection (151,936-dim)"]
-        VocabProj --> Logits[Logits]
+
+        EmbedScatter --> Resident["Resident Decode Loop<br/>one command buffer per token"]
+        Resident --> QKV["cached QKV / RoPE / KV-cache update"]
+        QKV --> TextAttn["cached attention SIMD"]
+        TextAttn --> TextFFN["MLP / FFN kernels"]
+        TextFFN --> VocabProj["Vocabulary Projection<br/>151,936 logits"]
+        VocabProj --> Logits["Greedy token output"]
     end
 ```
 
