@@ -413,6 +413,36 @@ Updated decision:
   `norm1 + norm2` is the largest remaining local M5 cost.
 - If LayerNorm has no cheap win, move to the FFN pair (`fc1_gelu + fc2`).
 
+LayerNorm SIMD result, 2026-06-24:
+
+- Added `mu_layernorm_bf16_rows_simd` for vision `cols == 1280`.
+- Promoted it to default.
+- Rollback:
+
+  ```text
+  MU_VISION_LAYERNORM_NO_SIMD=1
+  ```
+
+Page `258` skip-content split profile:
+
+| Path | Page total s | Layout vision s | Norm1 s | Norm2 s |
+| --- | ---: | ---: | ---: | ---: |
+| Previous default | 26.5270 | 16.5731 | 3.5621 | 3.5172 |
+| SIMD LayerNorm default | 17.1204 | 7.6873 | 0.0428 | 0.0263 |
+
+Two-page full-content gate:
+
+| Path | Total s | Mean s/page | Mean layout vision s/page | Mean content vision s/page | Output parity |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Previous default | 72.2379 | 36.1189 | 12.3955 | 5.8953 | baseline |
+| SIMD LayerNorm default | 57.7566 | 28.8783 | 7.2973 | 3.4085 | exact |
+
+Decision:
+
+- Keep SIMD LayerNorm as default.
+- Do not spend the next cycle on LayerNorm.
+- Next local M5 target is the vision FFN pair (`fc1_gelu + fc2`).
+
 ## References
 
 - `mineru/mu_metal.m`: current `mu_gpu_vision_encode` and host-side attention

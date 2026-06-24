@@ -3819,3 +3819,69 @@ Decision:
   `7.0793s`, about `42.7%` of layout vision.
 - If the LayerNorm path cannot be improved cheaply, the next fallback target is
   the vision FFN pair: `fc1_gelu + fc2 = 3.0898s`.
+
+### Vision LayerNorm SIMD Promotion
+
+Date: 2026-06-24
+
+Added a row-wise SIMD/threadgroup LayerNorm kernel for the vision width
+`cols == 1280`:
+
+```text
+mu_layernorm_bf16_rows_simd
+```
+
+The previous `mu_layernorm_bf16_rows` path assigned one output column per GPU
+thread and recomputed mean/variance for the full row in every column. The SIMD
+path computes row mean and variance once per row threadgroup, then writes the
+row cooperatively.
+
+Default:
+
+```text
+SIMD LayerNorm is enabled by default.
+```
+
+Rollback:
+
+```text
+MU_VISION_LAYERNORM_NO_SIMD=1
+```
+
+Single-page split profile, page `258`, skip-content:
+
+| Path | Page total s | Layout vision s | Norm1 s | Norm2 s | Output parity |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Previous default | 26.5270 | 16.5731 | 3.5621 | 3.5172 | baseline |
+| SIMD LayerNorm default | 17.1204 | 7.6873 | 0.0428 | 0.0263 | exact |
+
+Two-page full-content gate, pages `224,258`, `max_new_tokens=512`:
+
+| Path | Total s | Mean s/page | Mean layout vision s/page | Mean content vision s/page | Fallback rows | Output parity |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Previous default | 72.2379 | 36.1189 | 12.3955 | 5.8953 | 0 | baseline |
+| SIMD LayerNorm default | 57.7566 | 28.8783 | 7.2973 | 3.4085 | 0 | exact |
+
+Speedups:
+
+- 2-page total: `1.2507x`
+- Mean layout vision: `1.6987x`
+- Mean content-region vision: `1.7296x`
+- Mean total vision encode: `1.7085x`
+
+Artifacts:
+
+```text
+/tmp/mu-vision-layernorm-default-224-258-20260624.json
+/tmp/mu-vision-layernorm-simd-224-258-20260624.json
+/tmp/mu-vision-layernorm-simd-default-258-skip-20260624.json
+```
+
+Decision:
+
+- Promote SIMD LayerNorm to default.
+- Keep `MU_VISION_LAYERNORM_NO_SIMD=1` as the rollback path.
+- Do not run a 10-page gate in this step; the 2-page full-content gate is exact
+  and the change is narrowly scoped to vision `cols == 1280` LayerNorm.
+- Next target is the vision FFN pair (`fc1_gelu + fc2`) because LayerNorm is no
+  longer the bottleneck.

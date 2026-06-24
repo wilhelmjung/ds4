@@ -65,6 +65,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> rmsnorm_bf16_rows;
     id<MTLComputePipelineState> layernorm_bf16_probe;
     id<MTLComputePipelineState> layernorm_bf16_rows;
+    id<MTLComputePipelineState> layernorm_bf16_rows_simd;
     id<MTLComputePipelineState> text_attn_token0;
     id<MTLComputePipelineState> text_attn_seq;
     id<MTLComputePipelineState> text_attn_seq_pos;
@@ -859,6 +860,11 @@ int mu_gpu_create(mu_gpu **out) {
                                                          @"mu_layernorm_bf16_probe");
         gpu->layernorm_bf16_rows = mu_gpu_make_pipeline(device, @"mu_norm.metal",
                                                         @"mu_layernorm_bf16_rows");
+        if (getenv("MU_VISION_LAYERNORM_NO_SIMD") == NULL ||
+            getenv("MU_VISION_LAYERNORM_SIMD") != NULL) {
+            gpu->layernorm_bf16_rows_simd = mu_gpu_make_pipeline(device, @"mu_norm.metal",
+                                                                 @"mu_layernorm_bf16_rows_simd");
+        }
         gpu->text_attn_token0 = mu_gpu_make_pipeline(device, @"mu_attn.metal",
                                                      @"mu_text_attn_token0");
         gpu->text_attn_seq = mu_gpu_make_pipeline(device, @"mu_attn.metal",
@@ -1042,6 +1048,7 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->text_attn_seq = nil;
     gpu->text_attn_token0 = nil;
     gpu->layernorm_bf16_rows = nil;
+    gpu->layernorm_bf16_rows_simd = nil;
     gpu->layernorm_bf16_probe = nil;
     gpu->rmsnorm_bf16_rows = nil;
     gpu->rmsnorm_bf16_probe = nil;
@@ -3023,6 +3030,22 @@ int mu_gpu_layernorm_bf16_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf
     id<MTLBuffer> w_buf = (__bridge id<MTLBuffer>)weight.ptr;
     id<MTLBuffer> bias_buf = (__bridge id<MTLBuffer>)bias.ptr;
     id<MTLBuffer> out_buf = (__bridge id<MTLBuffer>)out.ptr;
+
+    bool disable_simd = getenv("MU_VISION_LAYERNORM_NO_SIMD") != NULL;
+    if (!disable_simd &&
+        cols == 1280 &&
+        ctx->gpu->layernorm_bf16_rows_simd) {
+        [ctx->encoder setComputePipelineState:ctx->gpu->layernorm_bf16_rows_simd];
+        [ctx->encoder setBuffer:x_buf offset:x.offset atIndex:0];
+        [ctx->encoder setBuffer:w_buf offset:weight.offset atIndex:1];
+        [ctx->encoder setBuffer:bias_buf offset:bias.offset atIndex:2];
+        [ctx->encoder setBuffer:out_buf offset:out.offset atIndex:3];
+        [ctx->encoder setBytes:&cols length:sizeof(cols) atIndex:4];
+        [ctx->encoder setBytes:&eps length:sizeof(eps) atIndex:5];
+        [ctx->encoder dispatchThreadgroups:MTLSizeMake((NSUInteger)rows, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        return 0;
+    }
 
     [ctx->encoder setComputePipelineState:ctx->gpu->layernorm_bf16_rows];
     [ctx->encoder setBuffer:x_buf offset:x.offset atIndex:0];

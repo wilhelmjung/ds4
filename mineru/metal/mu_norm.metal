@@ -123,3 +123,60 @@ kernel void mu_layernorm_bf16_rows(device const float *x [[buffer(0)]],
     y = y * mu_bf16_to_f32(weight[col]) + mu_bf16_to_f32(bias[col]);
     out[(size_t)row * (size_t)cols + col] = mu_round_bf16(y);
 }
+
+kernel void mu_layernorm_bf16_rows_simd(device const float *x [[buffer(0)]],
+                                        device const ushort *weight [[buffer(1)]],
+                                        device const ushort *bias [[buffer(2)]],
+                                        device float *out [[buffer(3)]],
+                                        constant int &cols [[buffer(4)]],
+                                        constant float &eps [[buffer(5)]],
+                                        uint row [[threadgroup_position_in_grid]],
+                                        uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sums[256];
+    device const float *xr = x + (size_t)row * (size_t)cols;
+
+    float local = 0.0f;
+    for (int i = (int)tid; i < cols; i += 256) {
+        local += xr[i];
+    }
+    sums[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 128) sums[tid] += sums[tid + 128];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 64) sums[tid] += sums[tid + 64];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) {
+        float s = sums[tid] + sums[tid + 32];
+        s = simd_sum(s);
+        if (tid == 0) sums[0] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float mean = sums[0] / (float)cols;
+    local = 0.0f;
+    for (int i = (int)tid; i < cols; i += 256) {
+        float d = xr[i] - mean;
+        local += d * d;
+    }
+    sums[tid] = local;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < 128) sums[tid] += sums[tid + 128];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 64) sums[tid] += sums[tid + 64];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 32) {
+        float s = sums[tid] + sums[tid + 32];
+        s = simd_sum(s);
+        if (tid == 0) sums[0] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv = rsqrt(sums[0] / (float)cols + eps);
+    for (int col = (int)tid; col < cols; col += 256) {
+        float y = (xr[col] - mean) * inv;
+        y = y * mu_bf16_to_f32(weight[col]) + mu_bf16_to_f32(bias[col]);
+        out[(size_t)row * (size_t)cols + (size_t)col] = mu_round_bf16(y);
+    }
+}

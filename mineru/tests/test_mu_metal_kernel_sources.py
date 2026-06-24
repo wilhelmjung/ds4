@@ -270,3 +270,19 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn('getenv("MU_VISION_ATTN_MSL_PACKED_5476")', host)
         self.assertIn("rows == 5476", host)
         self.assertIn("path=packed_flash_5476", host)
+
+    def test_vision_layernorm_simd_lane_is_wired(self):
+        metal = (ROOT / "mineru/metal/mu_norm.metal").read_text()
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn("kernel void mu_layernorm_bf16_rows_simd", metal)
+        self.assertIn("layernorm_bf16_rows_simd", host)
+        self.assertIn('"mu_layernorm_bf16_rows_simd"', host)
+        self.assertIn('getenv("MU_VISION_LAYERNORM_SIMD")', host)
+        self.assertIn("cols == 1280", host)
+
+    def test_vision_layernorm_simd_is_default_with_escape_hatch(self):
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn('getenv("MU_VISION_LAYERNORM_NO_SIMD")', host)
+        self.assertIn("!disable_simd", host)
