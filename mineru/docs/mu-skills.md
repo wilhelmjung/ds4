@@ -75,6 +75,26 @@ The next local M5 optimization should start with per-kernel timing inside
 `text_generate_decode` / `content_region_generate`. The remaining vision FFN
 pair is secondary unless decoder dispatch overhead is not cheaply reducible.
 
+## Skills Learned From The MPS Comparison
+
+The important reusable lesson is that the current win is not "custom Metal is
+always faster than MPS." The current win is a model-specific native Metal/MPS
+hybrid backend beating a general PyTorch/Transformers MPS path on a stable
+MinerU workload.
+
+Reusable skills:
+
+| Skill | Practice |
+| --- | --- |
+| Benchmark framing | Compare one warm-up MPS pass, one measured MPS pass, and one measured Metal no-fallback pass on the exact same page set. |
+| Backend positioning | Treat PyTorch/MPS as a regression reference now, not as the immediate performance blocker. |
+| Hybrid selection | Keep Apple library paths where measured strong, such as MPSGraph SDPA or MPS dense bridges; replace only measured weak points. |
+| Shape specialization | Exploit fixed MinerU dimensions and workflows instead of preserving fully generic operator behavior. |
+| Kernel replacement | Promote custom MSL only when a stage-level bottleneck is proven and output parity stays exact. |
+| Example pattern | SIMD vision LayerNorm won because it computed row statistics once per row/threadgroup instead of recomputing mean and variance per output column. |
+| Next-step discipline | Use per-kernel timing inside `text_generate_decode` / `content_region_generate` before proposing another attention or LayerNorm variant. |
+| Documentation discipline | Record artifact paths, exact commands, fallback rows, output metrics, and relative timing in the same update. |
+
 ## Documentation Relationship
 
 - `mu-design.md` and `mu-metal-design.md` explain architecture.

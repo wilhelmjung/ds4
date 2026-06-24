@@ -3979,3 +3979,29 @@ Decision:
   `text_generate_decode` / `content_region_generate`, with the remaining vision
   FFN pair as the secondary target if decoder dispatch overhead is not cheaply
   reducible.
+
+Experience summary:
+
+- The result should not be interpreted as generic hand-written Metal beating
+  every Apple MPS primitive. The faster path is a model-specific native
+  Metal/MPS hybrid backend beating the general PyTorch/Transformers MPS stack
+  on this fixed MinerU workload.
+- The biggest structural win is removing general framework overhead:
+  Python/Transformers orchestration, dynamic tensor/operator dispatch, generic
+  shape handling, and broader tensor lifetime management.
+- The current backend wins by specializing around stable model shapes and
+  stable page workflows. It can cache buffers, use narrow rollback flags, and
+  optimize one measured stage at a time instead of paying for fully generic
+  operator semantics.
+- The useful pattern is hybrid, not ideological: keep Apple library paths where
+  they are strong (`MPSGraph` SDPA, MPS-backed dense bridges), and replace only
+  measured weak points with targeted MSL kernels.
+- SIMD LayerNorm is the concrete example. The old vision LayerNorm recomputed
+  row mean/variance per output column; the promoted SIMD/threadgroup path
+  computes row statistics once and writes the row cooperatively. That one
+  model-specific fix moved the 10-page Metal total from the previous
+  `651.6244s` class to `328.0251s`.
+- The optimization lesson is to keep MPS as a regression reference, not as the
+  immediate blocker. The next performance decisions need per-kernel timing
+  inside the current Metal path, especially decode/generation, before adding
+  more MPS bridges or attention variants.
