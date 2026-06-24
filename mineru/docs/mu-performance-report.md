@@ -3883,5 +3883,99 @@ Decision:
 - Keep `MU_VISION_LAYERNORM_NO_SIMD=1` as the rollback path.
 - Do not run a 10-page gate in this step; the 2-page full-content gate is exact
   and the change is narrowly scoped to vision `cols == 1280` LayerNorm.
-- Next target is the vision FFN pair (`fc1_gelu + fc2`) because LayerNorm is no
-  longer the bottleneck.
+- The immediate follow-up is a fresh 10-page MPS comparison before committing
+  to the vision FFN pair as the next target.
+
+### Back-To-Back MPS vs Current Metal After SIMD LayerNorm
+
+Date: 2026-06-24
+
+Ran a fresh local Apple Silicon M5 10-page comparison after SIMD vision
+LayerNorm became the default. The page set is:
+
+```text
+224,234,237,241,244,247,258,281,303,334
+```
+
+MPS command shape:
+
+```text
+benchmark_pdf.py --device mps --batch-size 1 --dpi 120 --max-new-tokens 512
+```
+
+Metal command shape:
+
+```text
+mu_benchmark_pages.py --backend metal --max-new-tokens 512 --timing
+```
+
+Artifacts:
+
+```text
+/tmp/mu-mps-b2b-10page-warm-20260624/summary.json
+/tmp/mu-mps-b2b-10page-measured-20260624/summary.json
+/tmp/mu-mps-b2b-10page-measured-20260624/pages.jsonl
+/tmp/mu-metal-layernorm-simd-b2b-10page-20260624.json
+/tmp/mu-metal-layernorm-simd-b2b-10page-20260624/metal_page_*.json
+/tmp/mu-metal-vs-mps-b2b-10page-20260624.metrics.json
+```
+
+Results:
+
+| Path | Completed | Total s | Mean s/page | Relative time |
+| --- | ---: | ---: | ---: | ---: |
+| PyTorch/MPS measured | `10 / 10` | `521.6959` | `52.1696` | `1.0000x` |
+| Current Metal | `10 / 10` | `328.0251` | `32.8025` | `0.6288x` |
+
+Current Metal has `0` fallback rows and is `1.5904x` faster than the fresh
+PyTorch/MPS measured run on this 10-page set. Compared with the 2026-06-23
+Metal baseline (`651.6244s`), the current default is `1.9865x` faster.
+
+Page-level signal:
+
+| Page | MPS s | Metal s | Metal / MPS |
+| ---: | ---: | ---: | ---: |
+| 224 | `47.8201` | `40.4779` | `0.8465x` |
+| 234 | `65.2880` | `37.8628` | `0.5799x` |
+| 237 | `63.2350` | `37.9833` | `0.6007x` |
+| 241 | `81.3106` | `41.8999` | `0.5153x` |
+| 244 | `77.5236` | `45.0379` | `0.5810x` |
+| 247 | `73.2060` | `43.6953` | `0.5969x` |
+| 258 | `41.1653` | `20.8250` | `0.5059x` |
+| 281 | `24.7533` | `19.8100` | `0.8003x` |
+| 303 | `24.5201` | `19.5936` | `0.7991x` |
+| 334 | `22.8739` | `20.8396` | `0.9111x` |
+
+Mean Metal stage timings:
+
+| Stage | Mean s/page |
+| --- | ---: |
+| `page_total` | `32.8025` |
+| `content_total` | `19.4110` |
+| `text_generate_decode` | `18.2951` |
+| `content_region_generate` | `15.2968` |
+| `vision_encode` | `11.3704` |
+| `layout_vision_encode` | `7.4304` |
+| `content_region_vision_encode` | `3.9401` |
+| `text_generate_prefill` | `2.5223` |
+
+Output comparison against the PyTorch/MPS measured outputs:
+
+| Metric | Value |
+| --- | ---: |
+| `block_count_exact_rate` | `1.0000` |
+| `ordered_type_accuracy` | `1.0000` |
+| `ordered_mean_bbox_iou` | `0.9877` |
+| `mean_content_token_f1` | `1.0000` |
+| `table_exact_cell_recall` | `1.0000` |
+
+Decision:
+
+- Current native Metal is now faster than the fresh PyTorch/MPS baseline on the
+  local M5 10-page gate.
+- Do not spend the next optimization step on another MPS comparison or
+  LayerNorm/attention micro-variant.
+- The next bottleneck decision should use per-kernel timing inside
+  `text_generate_decode` / `content_region_generate`, with the remaining vision
+  FFN pair as the secondary target if decoder dispatch overhead is not cheaply
+  reducible.

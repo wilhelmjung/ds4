@@ -28,6 +28,17 @@ observable through traces, smoke tests, or benchmark artifacts.
 7. Verify CPU before Metal.
 8. Update docs only after measured evidence exists.
 
+## Current Performance Direction
+
+Current native Metal is faster than the fresh local PyTorch/MPS 10-page
+baseline. Treat MPS as a regression reference, not the immediate blocker.
+
+Start the next optimization cycle with per-kernel timing inside
+`text_generate_decode` / `content_region_generate`. Do not spend another cycle
+on LayerNorm or attention micro-variants without new timing evidence. Keep the
+remaining vision FFN pair as the fallback target if decoder dispatch overhead
+is not cheaply reducible.
+
 ## Coding Rules
 
 - Use `apply_patch` for manual edits.
@@ -63,3 +74,5 @@ Before committing:
   generated artifacts.
 - Reports distinguish CPU, Metal no-fallback, and Transformers/MPS.
 - Any performance number names the exact artifact path.
+- Skill docs are updated when the accepted baseline or default optimization
+  direction changes.

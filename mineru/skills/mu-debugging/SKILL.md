@@ -36,6 +36,7 @@ MU_CHECK_TRACE_SCOPE=layout-generation ./mu --backend metal --no-cpu-fallback --
 | Page JSON differs | Compare ordered blocks, bbox, content F1, table cells. |
 | Timeout | Check stage timing; isolate page and token limits. |
 | Metal slower after optimization | Count host/device copies and buffer allocation churn. |
+| PyTorch/MPS comparison regresses | Rerun MPS warm-up and measured passes before blaming Metal. |
 | Transformers differs but CPU/Metal match | Check reference DPI, token limits, or parsing expectations. |
 
 ## Debug Rules
@@ -47,6 +48,8 @@ MU_CHECK_TRACE_SCOPE=layout-generation ./mu --backend metal --no-cpu-fallback --
   not changed.
 - Keep page 224 as the first full-content regression target.
 - Escalate to the 10-page sample only after page 224 is stable.
+- Current Metal is faster than fresh PyTorch/MPS on the local M5 10-page gate;
+  use per-kernel Metal timings before proposing new MPS or attention work.
 
 ## Evidence To Capture
 
@@ -58,3 +61,5 @@ For any bug fix, record:
 - Relevant stage timings.
 - Metrics artifact path.
 - Whether CPU, Metal, and Transformers agree.
+- For MPS back-to-back results, record both the warm-up and measured artifact
+  directories.

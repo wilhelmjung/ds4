@@ -441,7 +441,51 @@ Decision:
 
 - Keep SIMD LayerNorm as default.
 - Do not spend the next cycle on LayerNorm.
-- Next local M5 target is the vision FFN pair (`fc1_gelu + fc2`).
+- Before committing to the vision FFN pair, rerun the 10-page MPS comparison to
+  verify the current E2E bottleneck after LayerNorm promotion.
+
+Fresh MPS comparison after SIMD LayerNorm, 2026-06-24:
+
+- Ran PyTorch/MPS warm-up, then PyTorch/MPS measured on the same 10-page set
+  with `batch-size=1`, `dpi=120`, `max_new_tokens=512`.
+- Rebuilt `mu`, then ran current Metal with `MU_TIMING=1`,
+  `--backend metal`, and `--no-cpu-fallback`.
+- Artifacts:
+
+  ```text
+  /tmp/mu-mps-b2b-10page-warm-20260624/summary.json
+  /tmp/mu-mps-b2b-10page-measured-20260624/summary.json
+  /tmp/mu-mps-b2b-10page-measured-20260624/pages.jsonl
+  /tmp/mu-metal-layernorm-simd-b2b-10page-20260624.json
+  /tmp/mu-metal-layernorm-simd-b2b-10page-20260624/metal_page_*.json
+  /tmp/mu-metal-vs-mps-b2b-10page-20260624.metrics.json
+  ```
+
+| Path | Completed | Total s | Mean s/page | Relative time |
+| --- | ---: | ---: | ---: | ---: |
+| PyTorch/MPS measured | `10 / 10` | `521.6959` | `52.1696` | `1.0000x` |
+| Current Metal | `10 / 10` | `328.0251` | `32.8025` | `0.6288x` |
+
+- Current Metal has `0` fallback rows and is `1.5904x` faster than fresh
+  PyTorch/MPS on this local M5 gate.
+- Output comparison against PyTorch/MPS measured output stayed exact for block
+  count, type order, content token F1, and table cells; mean bbox IoU was
+  `0.9877`.
+- Mean Metal stage timings:
+  - `text_generate_decode=18.2951s/page`
+  - `content_region_generate=15.2968s/page`
+  - `layout_vision_encode=7.4304s/page`
+  - `content_region_vision_encode=3.9401s/page`
+
+Updated decision:
+
+- Current native Metal is no longer slower than the local PyTorch/MPS baseline
+  on the 10-page gate.
+- Use MPS as a regression reference, not as the immediate blocker.
+- Next local M5 target is per-kernel timing and reduction of
+  `text_generate_decode` / `content_region_generate`.
+- The remaining vision FFN pair stays as the secondary target if decoder
+  dispatch overhead is not cheaply reducible.
 
 ## References
 

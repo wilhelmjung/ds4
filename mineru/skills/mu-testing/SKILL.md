@@ -47,9 +47,20 @@ Use the 10-page sample:
 Current reference artifacts:
 
 ```text
-/tmp/optimized_metal_10pages_512.json
-/Users/will/.gemini/antigravity/brain/d330e4f3-22dd-44e1-bda6-60867e6459c1/.system_generated/tasks/task-4068.log
+/tmp/mu-mps-b2b-10page-warm-20260624/summary.json
+/tmp/mu-mps-b2b-10page-measured-20260624/summary.json
+/tmp/mu-mps-b2b-10page-measured-20260624/pages.jsonl
+/tmp/mu-metal-layernorm-simd-b2b-10page-20260624.json
+/tmp/mu-metal-layernorm-simd-b2b-10page-20260624/metal_page_*.json
+/tmp/mu-metal-vs-mps-b2b-10page-20260624.metrics.json
 ```
+
+Current local M5 benchmark expectation:
+
+- PyTorch/MPS measured: `521.6959s` total, `52.1696s/page`.
+- Metal no-fallback: `328.0251s` total, `32.8025s/page`.
+- Metal is `1.5904x` faster than PyTorch/MPS on the 10-page gate.
+- Metal fallback rows are zero.
 
 ## Acceptance Criteria
 
@@ -61,7 +72,16 @@ For pure Metal E2E validation:
 - Fallback rows are zero.
 - CPU-vs-Metal has block count exact, ordered type accuracy 1.0, bbox IoU 1.0,
   content token F1 1.0, and table cell recall 1.0.
-- Performance report includes CPU, Metal, and Transformers/MPS timing.
+- Performance report includes exact artifact paths for Metal and any
+  PyTorch/MPS comparison.
+
+For PyTorch/MPS back-to-back validation:
+
+- Run one MPS warm-up pass before the measured pass.
+- Use `--device mps --batch-size 1 --dpi 120 --max-new-tokens 512`.
+- Compare Metal output against the measured MPS `pages.jsonl`.
+- Record block count, ordered type accuracy, bbox IoU, content token F1, table
+  cell recall, total seconds, mean seconds/page, and relative time.
 
 ## Baseline Policy
 
@@ -70,5 +90,7 @@ For pure Metal E2E validation:
 - Rerun CPU only when CPU code, parsing semantics, token limits, model weights,
   or comparison logic changed.
 - Rerun Metal after each meaningful Metal optimization.
+- Rerun MPS only for explicit back-to-back comparisons or when the MPS reference
+  environment changed.
 - Update `mineru/docs/mu-performance-report.md` only with measured artifact
   paths, not inferred timings.

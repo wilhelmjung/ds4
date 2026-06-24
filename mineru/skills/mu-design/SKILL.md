@@ -32,6 +32,10 @@ treated as performance data.
 - Benchmark claims only count for `--backend metal --no-cpu-fallback`.
 - Treat fallback-enabled Metal as a development convenience, never as Metal
   performance evidence.
+- Treat PyTorch/MPS as a back-to-back regression reference. The current local
+  M5 Metal path is faster than PyTorch/MPS on the 10-page gate, so new design
+  work should be justified by per-kernel Metal timing rather than by the old
+  "catch up to MPS" framing.
 
 ## Architecture Checklist
 
@@ -72,3 +76,4 @@ A design is acceptable only when it names:
 - Performance gate.
 - Failure mode and diagnostic command.
 - Whether CPU baselines should be reused or rerun.
+- Whether MPS must be rerun or the latest measured MPS artifact can be reused.

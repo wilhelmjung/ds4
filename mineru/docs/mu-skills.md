@@ -1,6 +1,6 @@
 # MU Skills
 
-Date: 2026-06-19
+Date: 2026-06-24
 Branch: `codex/mineru-metal-backend`
 
 This directory captures the reusable operating practice from the current
@@ -27,21 +27,25 @@ engineering contract, not to describe generic C, Metal, or VLM development.
 
 ## Current Baseline Encoded By The Skills
 
-The skills assume the current full-content512 checkpoint:
+The skills assume the current full-content512 checkpoint on the local Apple
+Silicon M5 10-page sample:
 
 | Item | Value |
 | --- | ---: |
 | Sample pages | 10 |
-| CPU-vs-Metal exact block-count pages | 10 / 10 |
-| CPU-vs-Metal ordered type accuracy | 1.0000 |
-| CPU-vs-Metal ordered bbox IoU | 1.0000 |
-| CPU-vs-Metal content token F1 | 1.0000 |
-| CPU-vs-Metal table cells | 104 / 104 |
-| CPU total time | 1381.32s |
-| Metal no-fallback total time | 1095.77s |
-| PyTorch/MPS (Throttled) total time | 755.93s |
-| Metal / CPU speed gap | 1.26x faster |
-| Metal / PyTorch MPS speed gap | 1.45x slower |
+| Metal no-fallback total time | 328.0251s |
+| Metal no-fallback mean time | 32.8025s/page |
+| PyTorch/MPS measured total time | 521.6959s |
+| PyTorch/MPS measured mean time | 52.1696s/page |
+| Metal / PyTorch MPS speed gap | 1.5904x faster |
+| Metal fallback rows | 0 |
+| Metal-vs-MPS exact block-count pages | 10 / 10 |
+| Metal-vs-MPS ordered type accuracy | 1.0000 |
+| Metal-vs-MPS ordered bbox IoU | 0.9877 |
+| Metal-vs-MPS content token F1 | 1.0000 |
+| Metal-vs-MPS table cells | 104 / 104 |
+| Reused CPU reference total time | 1381.32s |
+| Metal / reused CPU speed gap | 4.2110x faster |
 
 The authoritative performance record is
 `mineru/docs/mu-performance-report.md`.
@@ -60,6 +64,16 @@ unless one of these changed:
 
 For Metal-only optimization, run page 224 first, then the 10-page Metal
 full-content512 sample when the page-level result is stable.
+
+For PyTorch/MPS comparisons, run one warm-up pass and then one measured pass on
+the same 10 pages. MPS is now a regression reference, not the immediate
+performance blocker.
+
+## Current Optimization Direction
+
+The next local M5 optimization should start with per-kernel timing inside
+`text_generate_decode` / `content_region_generate`. The remaining vision FFN
+pair is secondary unless decoder dispatch overhead is not cheaply reducible.
 
 ## Documentation Relationship
 
