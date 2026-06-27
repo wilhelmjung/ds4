@@ -91,6 +91,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> vision_quick_gelu_bf16;
     id<MTLComputePipelineState> vision_gelu_bf16;
     id<MTLComputePipelineState> vision_merge4;
+    id<MTLComputePipelineState> vision_fused_ffn;
     id<MTLComputePipelineState> argmax_f32;
     id<MTLComputePipelineState> dense_probe_simd;
     id<MTLComputePipelineState> dense_probe_add_simd;
@@ -919,6 +920,8 @@ int mu_gpu_create(mu_gpu **out) {
                                                      @"mu_vision_gelu_bf16");
         gpu->vision_merge4 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
                                                    @"mu_vision_merge4");
+        gpu->vision_fused_ffn = mu_gpu_make_pipeline(device, @"mu_vision_fused_ffn.metal",
+                                                     @"mu_vision_fused_ffn");
         gpu->argmax_f32 = mu_gpu_make_pipeline(device, @"mu_sample.metal",
                                                @"mu_argmax_f32");
         gpu->dense_probe_simd = mu_gpu_make_pipeline(device, @"mu_dense.metal",
@@ -992,6 +995,7 @@ void mu_gpu_destroy(mu_gpu *gpu) {
         gpu->dense_mps_weight_cache[i].f32 = nil;
     }
     gpu->vision_merge4 = nil;
+    gpu->vision_fused_ffn = nil;
     gpu->argmax_f32 = nil;
     gpu->dense_probe_simd = nil;
     gpu->dense_probe_add_simd = nil;
@@ -2173,20 +2177,31 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
                 if (rc != 0) return rc;
             }
 
-            rc = mu_gpu_dense_bf16_bias_rows_quick_gelu_ctx(ctx, temp_norm2, fc1_w_buf, fc1_b_buf, rows, 1280, 5120, temp_fc1_act);
-            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
-            if (profile_split) {
-                snprintf(profile_label, sizeof(profile_label), "vision_profile_fc2_l%02d", layer);
-                rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_fc1_gelu", profile_label);
-                if (rc != 0) return rc;
-            }
+            bool request_fused_ffn = getenv("MU_VISION_FUSED_FFN") != NULL;
+            if (request_fused_ffn) {
+                rc = mu_gpu_vision_fused_ffn_ctx(ctx, temp_norm2, fc1_w_buf, fc1_b_buf, fc2_w_buf, fc2_b_buf, rows, temp_proj);
+                if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+                if (profile_split) {
+                    snprintf(profile_label, sizeof(profile_label), "vision_profile_residual2_l%02d", layer);
+                    rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_fc1_gelu", profile_label);
+                    if (rc != 0) return rc;
+                }
+            } else {
+                rc = mu_gpu_dense_bf16_bias_rows_quick_gelu_ctx(ctx, temp_norm2, fc1_w_buf, fc1_b_buf, rows, 1280, 5120, temp_fc1_act);
+                if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+                if (profile_split) {
+                    snprintf(profile_label, sizeof(profile_label), "vision_profile_fc2_l%02d", layer);
+                    rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_fc1_gelu", profile_label);
+                    if (rc != 0) return rc;
+                }
 
-            rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, temp_fc1_act, fc2_w_buf, fc2_b_buf, rows, 5120, 1280, temp_proj);
-            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
-            if (profile_split) {
-                snprintf(profile_label, sizeof(profile_label), "vision_profile_residual2_l%02d", layer);
-                rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_fc2", profile_label);
-                if (rc != 0) return rc;
+                rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, temp_fc1_act, fc2_w_buf, fc2_b_buf, rows, 5120, 1280, temp_proj);
+                if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+                if (profile_split) {
+                    snprintf(profile_label, sizeof(profile_label), "vision_profile_residual2_l%02d", layer);
+                    rc = mu_gpu_profile_commit_stage(gpu, &ctx, "vision_profile_fc2", profile_label);
+                    if (rc != 0) return rc;
+                }
             }
 
             rc = mu_gpu_vision_add_bf16_ctx(ctx, temp_res1, temp_proj, rows * 1280, current_out);
@@ -3405,6 +3420,8 @@ int mu_gpu_dense_bf16_bias_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_bu
         return mu_gpu_dense_bf16_bias_rows_mps_ctx(ctx, x, w, bias,
                                                    x_rows, cols, out_cols, out);
     }
+
+
     bool use_rows_tiled = getenv("MU_DENSE_ROWS_TILED") != NULL &&
                           can_use_tiled &&
                           ctx->gpu->dense_bf16_bias_rows_tiled;
@@ -3871,6 +3888,33 @@ int mu_gpu_vision_merge4_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf hidden,
     MTLSize grid = MTLSizeMake((NSUInteger)total, 1, 1);
     MTLSize threads = MTLSizeMake(width, 1, 1);
     [ctx->encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+    return 0;
+}
+
+
+int mu_gpu_vision_fused_ffn_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf hs_in,
+                                mu_gpu_buf fc1_w, mu_gpu_buf fc1_b,
+                                mu_gpu_buf fc2_w, mu_gpu_buf fc2_b,
+                                int rows, mu_gpu_buf out) {
+    if (!ctx || !hs_in.ptr || !fc1_w.ptr || !fc1_b.ptr || !fc2_w.ptr || !fc2_b.ptr || !out.ptr || rows <= 0) return -1;
+    id<MTLBuffer> hs_in_buf = (__bridge id<MTLBuffer>)hs_in.ptr;
+    id<MTLBuffer> fc1_w_buf = (__bridge id<MTLBuffer>)fc1_w.ptr;
+    id<MTLBuffer> fc1_b_buf = (__bridge id<MTLBuffer>)fc1_b.ptr;
+    id<MTLBuffer> fc2_w_buf = (__bridge id<MTLBuffer>)fc2_w.ptr;
+    id<MTLBuffer> fc2_b_buf = (__bridge id<MTLBuffer>)fc2_b.ptr;
+    id<MTLBuffer> out_buf = (__bridge id<MTLBuffer>)out.ptr;
+
+    [ctx->encoder setComputePipelineState:ctx->gpu->vision_fused_ffn];
+    [ctx->encoder setBuffer:hs_in_buf offset:hs_in.offset atIndex:0];
+    [ctx->encoder setBuffer:fc1_w_buf offset:fc1_w.offset atIndex:1];
+    [ctx->encoder setBuffer:fc1_b_buf offset:fc1_b.offset atIndex:2];
+    [ctx->encoder setBuffer:fc2_w_buf offset:fc2_w.offset atIndex:3];
+    [ctx->encoder setBuffer:fc2_b_buf offset:fc2_b.offset atIndex:4];
+    [ctx->encoder setBuffer:out_buf offset:out.offset atIndex:5];
+
+    MTLSize grid = MTLSizeMake(1, (NSUInteger)rows, 1);
+    MTLSize threads = MTLSizeMake(128, 1, 1);
+    [ctx->encoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
     return 0;
 }
 

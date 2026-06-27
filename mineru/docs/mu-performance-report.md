@@ -3979,3 +3979,48 @@ Decision:
   `text_generate_decode` / `content_region_generate`, with the remaining vision
   FFN pair as the secondary target if decoder dispatch overhead is not cheaply
   reducible.
+
+### Vision Tower MPS GEMM Integration Evaluation
+
+Date: 2026-06-27
+
+We evaluated replacing our custom MSL `simdgroup_matrix` GEMMs in the Vision Tower (`fc1`, `fc2`, `qkv`, `proj`) with Apple's hardware-accelerated AMX `MPSMatrixMultiplication` library.
+
+E2E 10-page benchmark results (sequentially run under identical conditions):
+
+| Path | Mean s/page | Total s | layout_vision_encode s/page | Output Parity |
+| --- | ---: | ---: | ---: | --- |
+| Custom MSL GEMM (Default) | 38.4178 | 384.1779 | 10.3035 | baseline |
+| MPS GEMM (Default) | 41.0301 | 410.3014 | 8.4131 | exact |
+| Gated MPS GEMM (rows >= 5000) | 41.9885 | 419.8850 | 15.6788 | exact |
+
+Interpretation:
+- While MPS GEMM reduces the raw GPU execution time of layout_vision_encode from 10.30s to 8.41s, it regresses the overall E2E time due to command encoder switching overhead (ending compute command encoder, committing MPS Matrix Multiplication, and starting a new encoder).
+- In the Vision Tower, layout vision encoding requires 3 large GEMM dispatches per layer (96 encoder switches per page), which introduces high CPU scheduling latency and GPU pipeline bubbles that outweigh the AMX coprocessor gains.
+- Custom MSL `simdgroup` GEMM shaders executing in a single compute command encoder remain the faster choice.
+
+Decision:
+- Do not enable MPS Matrix Multiplication by default. Keep it behind the opt-in flag `MU_DENSE_ROWS_MPS=1`.
+
+---
+
+### Vision FFN Fusion Evaluation
+
+Date: 2026-06-27
+
+We implemented a cooperative row-wise fused FFN shader (`mu_vision_fused_ffn` in `mu_vision_fused_ffn.metal`) to combine `fc1` projection, QuickGELU activation, and `fc2` down-projection in threadgroup shared memory, eliminating VRAM traffic for intermediate activated states.
+
+E2E 10-page benchmark results:
+
+| Path | Mean s/page | Total s | layout_vision_encode s/page | Output Parity |
+| --- | ---: | ---: | ---: | --- |
+| Custom MSL GEMM (Default) | 38.4178 | 384.1779 | 10.3035 | baseline |
+| Fused Vision FFN | 46.2162 | 462.1622 | 13.4490 | exact |
+
+Interpretation:
+- The fused FFN is significantly slower than the unfused SIMD-group matrix multiply path.
+- In order to fit each row in threadgroup shared memory, the fused FFN kernel relies on single-threaded sequential dot product loops. This drastically lowers GPU ALU utilization compared to the optimized `simdgroup_matrix` instructions, causing a compute bottleneck that is much larger than the saved VRAM traffic.
+
+Decision:
+- Keep the unfused SIMD-group GEMMs as default. Keep Fused Vision FFN as an opt-in diagnostic switch behind `MU_VISION_FUSED_FFN=1`.
+
