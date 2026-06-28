@@ -128,9 +128,9 @@
   <text class="text" x="1078" y="517">cached attention</text>
   <text class="small" x="1105" y="536">SIMD</text>
 
-  <rect class="gpu" x="1055" y="595" width="160" height="70" />
-  <text class="text" x="1097" y="621">MLP / FFN</text>
-  <text class="small" x="1088" y="641">projection kernels</text>
+  <rect class="default" x="1055" y="595" width="160" height="70" />
+  <text class="label" x="1073" y="619">DEFAULT</text>
+  <text class="text" x="1084" y="642">fused SwiGLU</text>
 
   <rect class="gpu" x="1055" y="710" width="160" height="50" />
   <text class="text" x="1080" y="740">Greedy Output</text>

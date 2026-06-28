@@ -1,0 +1,22 @@
+---
+name: mineru-optimization-guide
+description: Guidelines, architectures, and optimization patterns for MinerU Metal/C inference engine, detailing kernel fusions and concurrency rules.
+---
+
+# MinerU Metal Optimization Guide
+
+This guide compiles key architectural patterns and lessons learned during the optimization of the MinerU Metal/C engine.
+
+## 1. Custom MSL Shaders vs. MPSMatrixMultiplication
+- **Rule**: Prefer custom MSL `simdgroup_matrix` GEMM kernels over `MPSMatrixMultiplication` for intermediate matrix multiplications in the vision tower or text decoder blocks.
+- **Why**: MPS Matrix Multiplication requires separate command encoder switches (ending the current encoder, encoding MPS, starting a new encoder). For shapes like width-1280 vision block multiplications, the driver CPU overhead and pipeline bubbles of 96+ encoder switches per page completely negate the AMX hardware acceleration. Keeping operations inside a single contiguous compute command encoder is faster.
+
+## 2. Kernel Fusion Design
+- **GQA Attention**: Fused FlashAttention (`mu_vision_attn_rows_flash` and `mu_text_prefill_attn_flash`) must compute online softmax statistics dynamically to avoid costly intermediate QK transpose and softmax allocations.
+- **FFN SwiGLU**: Fuse gate projection, up projection, SiLU activation, and element-wise multiplication into a single SIMD-group unified kernel (`mu_dense_bf16_rows_simdgroup_swiglu`). This eliminates 2 dispatches per layer and removes intermediate buffers.
+- **Residual Addition**: Fuse output projections directly with the residual summation to save intermediate VRAM writes/reads.
+
+## 3. Concurrency and Thread Safety
+- **Rule**: When executing multiple worker threads via `--threads > 1`, keep all shared buffers and caches thread-safe.
+- **Weight Cache**: Protect the global `weight_cache` lookups and allocations in `mu_metal.m` using a `pthread_mutex_t`.
+- **MPS Objects**: Metal Performance Shaders (MPS) kernel objects (such as `MPSMatrixMultiplication`) are **not thread-safe** for concurrent `encodeToCommandBuffer` calls. When `MU_CONCURRENT_WORKERS > 1`, bypass the kernel cache and allocate a fresh MPS kernel object per-call.

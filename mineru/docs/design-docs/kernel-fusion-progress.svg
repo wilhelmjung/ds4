@@ -87,8 +87,8 @@
     <path class="wire" d="M395 1304 L395 1370"/>
     <rect x="172" y="1370" width="446" height="96" class="box" fill="#b8a8ff" stroke="#6f55e8"/>
     <text x="395" y="1410" text-anchor="middle" class="label">MLP / SwiGLU</text>
-    <text x="395" y="1440" text-anchor="middle" class="small">large remaining target</text>
-    <rect x="150" y="1348" width="490" height="140" class="next"/>
+    <text x="395" y="1440" text-anchor="middle" class="small">fused by default for prefill</text>
+    <rect x="150" y="1348" width="490" height="140" class="enabled"/>
 
     <path class="wire" d="M395 1466 L395 1530"/>
     <circle cx="395" cy="1556" r="34" fill="#fff" stroke="#111" stroke-width="4"/>
@@ -97,7 +97,7 @@
   </g>
 
   <g transform="translate(916 390)">
-    <rect x="0" y="0" width="280" height="626" rx="22" fill="#f8fafc" stroke="#cbd5e1" stroke-width="3"/>
+    <rect x="0" y="0" width="280" height="656" rx="22" fill="#f8fafc" stroke="#cbd5e1" stroke-width="3"/>
     <text x="24" y="48" class="label">Legend</text>
 
     <rect x="28" y="84" width="64" height="44" class="enabled"/>
@@ -113,11 +113,12 @@
     <text x="24" y="386" class="tiny">Vision QKV fusion</text>
     <text x="24" y="416" class="tiny">Text QKV projection fusion</text>
     <text x="24" y="446" class="tiny">O projection + residual add</text>
+    <text x="24" y="476" class="tiny">FFN/SwiGLU prefill fusion</text>
 
-    <text x="24" y="516" class="small">Opt-in result</text>
-    <text x="24" y="552" class="tiny">Dispatches: 145 -> 121/token</text>
-    <text x="24" y="582" class="tiny">Correctness: exact</text>
-    <text x="24" y="612" class="tiny">Default unchanged: E2E slower</text>
+    <text x="24" y="546" class="small">Opt-in result</text>
+    <text x="24" y="582" class="tiny">Dispatches: 145 -> 121/token</text>
+    <text x="24" y="612" class="tiny">Correctness: exact</text>
+    <text x="24" y="642" class="tiny">Default unchanged: E2E slower</text>
   </g>
 
   <g transform="translate(916 1060)">
