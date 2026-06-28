@@ -710,3 +710,114 @@ kernel void mu_vision_attn_copy_mpsgraph(device const float *src [[buffer(0)]],
     if ((int)gid >= n) return;
     out[gid] = mu_round_bf16(src[gid]);
 }
+
+kernel void mu_vision_attn_rows_packed_flash_opt(device const float *q_pack [[buffer(0)]],
+                                                 device const float *k_pack [[buffer(1)]],
+                                                 device const float *v_pack [[buffer(2)]],
+                                                 device float *out [[buffer(3)]],
+                                                 constant int &rows [[buffer(4)]],
+                                                 uint2 tg [[threadgroup_position_in_grid]],
+                                                 uint lane [[thread_index_in_simdgroup]]) {
+    int head = (int)tg.y;
+    int query_row = (int)tg.x * 32 + (int)lane;
+    const int head_dim = 80;
+    const float scale = rsqrt(80.0f);
+    size_t head_base = (size_t)head * (size_t)rows * 80u;
+
+    threadgroup float shared_q[32 * 80];
+    if (query_row < rows) {
+        device const float *q_head = q_pack + head_base + (size_t)query_row * 80u;
+        for (int d = 0; d < 80; d++) {
+            shared_q[lane * 80 + d] = q_head[d];
+        }
+    }
+
+    threadgroup float shared_k[16 * 80];
+    threadgroup float shared_v[16 * 80];
+
+    float max_score = -3.402823466e38f;
+    float denom = 0.0f;
+
+    for (int kb = 0; kb < rows; kb += 16) {
+        for (int d = 0; d < 80; d++) {
+            int i = (int)lane + d * 32;
+            int r = i / 80;
+            int dim = i % 80;
+            if (r < 16) {
+                int key_row = kb + r;
+                if (key_row < rows) {
+                    shared_k[i] = k_pack[head_base + (size_t)key_row * 80u + (size_t)dim];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (query_row < rows) {
+            int limit = min(16, rows - kb);
+            threadgroup const float *q_shared_ptr = shared_q + lane * 80;
+            for (int j = 0; j < limit; j++) {
+                float dot = 0.0f;
+                threadgroup const float *k_head_shared = shared_k + j * 80;
+                for (int d = 0; d < 80; d++) {
+                    dot += q_shared_ptr[d] * k_head_shared[d];
+                }
+                float score = dot * scale;
+                float m_new = max(max_score, score);
+                denom = denom * exp(max_score - m_new) + exp(score - m_new);
+                max_score = m_new;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float acc[80];
+    for (int d = 0; d < 80; d++) {
+        acc[d] = 0.0f;
+    }
+
+    for (int kb = 0; kb < rows; kb += 16) {
+        for (int d = 0; d < 80; d++) {
+            int i = (int)lane + d * 32;
+            int r = i / 80;
+            int dim = i % 80;
+            if (r < 16) {
+                int key_row = kb + r;
+                if (key_row < rows) {
+                    size_t idx = head_base + (size_t)key_row * 80u + (size_t)dim;
+                    shared_k[i] = k_pack[idx];
+                    shared_v[i] = v_pack[idx];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (query_row < rows) {
+            int limit = min(16, rows - kb);
+            threadgroup const float *q_shared_ptr = shared_q + lane * 80;
+            for (int j = 0; j < limit; j++) {
+                float dot = 0.0f;
+                threadgroup const float *k_head_shared = shared_k + j * 80;
+                for (int d = 0; d < 80; d++) {
+                    dot += q_shared_ptr[d] * k_head_shared[d];
+                }
+                float p = mu_round_bf16(exp(dot * scale - max_score) / denom);
+                threadgroup const float *v_head_shared = shared_v + j * 80;
+                for (int d = 0; d < 80; d++) {
+                    acc[d] += p * v_head_shared[d];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (query_row < rows) {
+        device float *out_head = out + (size_t)query_row * 1280u + head * head_dim;
+        for (int d = 0; d < 80; d++) {
+            out_head[d] = mu_round_bf16(acc[d]);
+        }
+    }
+}

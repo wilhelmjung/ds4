@@ -88,6 +88,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> vision_attn_rows_flash;
     id<MTLComputePipelineState> vision_attn_rows_flash_k16;
     id<MTLComputePipelineState> vision_attn_rows_packed_flash;
+    id<MTLComputePipelineState> vision_attn_rows_packed_flash_opt;
     id<MTLComputePipelineState> vision_attn_pack_qkv_mpsgraph;
     id<MTLComputePipelineState> vision_attn_copy_mpsgraph;
     id<MTLComputePipelineState> vision_add_bf16;
@@ -847,7 +848,11 @@ static int mu_gpu_vision_attn_rows_packed_flash_stage(mu_gpu *gpu,
     [ctx->encoder dispatchThreads:MTLSizeMake((NSUInteger)rows * 1280u, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
-    [ctx->encoder setComputePipelineState:gpu->vision_attn_rows_packed_flash];
+    id<MTLComputePipelineState> pstate = gpu->vision_attn_rows_packed_flash_opt;
+    if (getenv("MU_VISION_ATTN_NO_OPT") != NULL || !pstate) {
+        pstate = gpu->vision_attn_rows_packed_flash;
+    }
+    [ctx->encoder setComputePipelineState:pstate];
     [ctx->encoder setBuffer:q_pack offset:0 atIndex:0];
     [ctx->encoder setBuffer:k_pack offset:0 atIndex:1];
     [ctx->encoder setBuffer:v_pack offset:0 atIndex:2];
@@ -952,6 +957,8 @@ int mu_gpu_create(mu_gpu **out) {
         if (getenv("MU_VISION_ATTN_MSL_PACKED_5476") != NULL) {
             gpu->vision_attn_rows_packed_flash = mu_gpu_make_pipeline(device, @"mu_vision.metal",
                                                                       @"mu_vision_attn_rows_packed_flash");
+            gpu->vision_attn_rows_packed_flash_opt = mu_gpu_make_pipeline(device, @"mu_vision.metal",
+                                                                          @"mu_vision_attn_rows_packed_flash_opt");
         }
         if (getenv("MU_VISION_ATTN_NO_MPSGRAPH") == NULL) {
             gpu->vision_attn_pack_qkv_mpsgraph = mu_gpu_make_pipeline(device, @"mu_vision.metal",
@@ -1077,6 +1084,7 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->vision_attn_rows_flash = nil;
     gpu->vision_attn_rows_flash_k16 = nil;
     gpu->vision_attn_rows_packed_flash = nil;
+    gpu->vision_attn_rows_packed_flash_opt = nil;
     gpu->vision_attn_pack_qkv_mpsgraph = nil;
     gpu->vision_attn_copy_mpsgraph = nil;
     gpu->vision_attn_mpsgraph = nil;
