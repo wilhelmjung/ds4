@@ -149,6 +149,9 @@ int mu_gpu_dense_bf16_bias_rows_quick_gelu_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x
                                                mu_gpu_buf bias, int x_rows, int cols, int out_cols, mu_gpu_buf out);
 int mu_gpu_dense_bf16_bias_rows_gelu_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
                                          mu_gpu_buf bias, int x_rows, int cols, int out_cols, mu_gpu_buf out);
+int mu_gpu_dense_bf16_rows_simdgroup_swiglu_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x,
+                                                mu_gpu_buf w_gate, mu_gpu_buf w_up,
+                                                int x_rows, int cols, int out_cols, mu_gpu_buf out);
 int mu_gpu_text_decode_fused_ffn_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf hs_in,
                                      mu_gpu_buf post_norm_w, mu_gpu_buf gate_w,
                                      mu_gpu_buf up_w, mu_gpu_buf down_w,
