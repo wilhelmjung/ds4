@@ -113,7 +113,9 @@ struct mu_gpu {
     id<MTLComputePipelineState> text_decode_qkv_rope_cache_simd;
     id<MTLComputePipelineState> text_attn_cached_simd;
     id<MTLComputePipelineState> text_prefill_attn_flash;
+    id<MTLComputePipelineState> text_prefill_attn_flash_opt;
     id<MTLComputePipelineState> text_prefill_attn_pos_flash;
+    id<MTLComputePipelineState> text_prefill_attn_pos_flash_opt;
     MPSMatrixMultiplication *dense_mps_1280_1280;
     MPSMatrixMultiplication *dense_mps_1280_2560;
     MPSMatrixMultiplication *dense_mps_1280_3840;
@@ -1012,8 +1014,12 @@ int mu_gpu_create(mu_gpu **out) {
                                                                    @"mu_text_prefill_rope_cache_update");
         gpu->text_prefill_attn_flash = mu_gpu_make_pipeline(device, @"mu_attn.metal",
                                                             @"mu_text_prefill_attn_flash");
+        gpu->text_prefill_attn_flash_opt = mu_gpu_make_pipeline(device, @"mu_attn.metal",
+                                                                @"mu_text_prefill_attn_flash_opt");
         gpu->text_prefill_attn_pos_flash = mu_gpu_make_pipeline(device, @"mu_attn.metal",
                                                                 @"mu_text_prefill_attn_pos_flash");
+        gpu->text_prefill_attn_pos_flash_opt = mu_gpu_make_pipeline(device, @"mu_attn.metal",
+                                                                    @"mu_text_prefill_attn_pos_flash_opt");
         const char *name = [[device name] UTF8String];
         if (name) {
             strlcpy(gpu->device_name, name, sizeof(gpu->device_name));
@@ -1106,7 +1112,9 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->text_rope_cache_update = nil;
     gpu->text_prefill_rope_cache_update = nil;
     gpu->text_prefill_attn_flash = nil;
+    gpu->text_prefill_attn_flash_opt = nil;
     gpu->text_prefill_attn_pos_flash = nil;
+    gpu->text_prefill_attn_pos_flash_opt = nil;
     gpu->text_attn_seq = nil;
     gpu->text_attn_token0 = nil;
     gpu->layernorm_bf16_rows = nil;
@@ -2493,7 +2501,11 @@ static int mu_gpu_text_layers_mlp_seq_engine(mu_gpu *gpu, void *engine,
 
             if (use_prefill_flash) {
                 if (position_ids) {
-                    [ctx->encoder setComputePipelineState:gpu->text_prefill_attn_pos_flash];
+                    id<MTLComputePipelineState> pstate = gpu->text_prefill_attn_pos_flash_opt;
+                    if (getenv("MU_TEXT_PREFILL_ATTN_NO_OPT") != NULL || !pstate) {
+                        pstate = gpu->text_prefill_attn_pos_flash;
+                    }
+                    [ctx->encoder setComputePipelineState:pstate];
                     [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_q.ptr offset:temp_q.offset atIndex:0];
                     [ctx->encoder setBuffer:gpu_cache->k_cache offset:0 atIndex:1];
                     [ctx->encoder setBuffer:gpu_cache->v_cache offset:0 atIndex:2];
@@ -2503,7 +2515,11 @@ static int mu_gpu_text_layers_mlp_seq_engine(mu_gpu *gpu, void *engine,
                     [ctx->encoder setBytes:&cache_cap length:sizeof(cache_cap) atIndex:6];
                     [ctx->encoder setBytes:&layer length:sizeof(layer) atIndex:7];
                 } else {
-                    [ctx->encoder setComputePipelineState:gpu->text_prefill_attn_flash];
+                    id<MTLComputePipelineState> pstate = gpu->text_prefill_attn_flash_opt;
+                    if (getenv("MU_TEXT_PREFILL_ATTN_NO_OPT") != NULL || !pstate) {
+                        pstate = gpu->text_prefill_attn_flash;
+                    }
+                    [ctx->encoder setComputePipelineState:pstate];
                     [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_q.ptr offset:temp_q.offset atIndex:0];
                     [ctx->encoder setBuffer:gpu_cache->k_cache offset:0 atIndex:1];
                     [ctx->encoder setBuffer:gpu_cache->v_cache offset:0 atIndex:2];
