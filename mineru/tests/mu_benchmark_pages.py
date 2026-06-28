@@ -236,6 +236,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--backend", choices=["cpu", "metal"], required=True)
     parser.add_argument("--out", required=True)
+    parser.add_argument("--threads", type=int, default=1)
     parser.add_argument("--pages", type=parse_pages,
                         default=DEFAULT_PAGES)
     parser.add_argument("--max-new-tokens", type=int)
@@ -272,6 +273,8 @@ def main() -> None:
 
         # Build CLI command
         cmd = [str(MU), "--backend", args.backend]
+        if args.threads > 1:
+            cmd.extend(["--threads", str(args.threads)])
         if args.backend == "metal":
             cmd.append("--no-cpu-fallback")
         if args.max_new_tokens is not None:

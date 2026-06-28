@@ -157,6 +157,7 @@ int mu_gpu_vision_fused_ffn_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf hs_in,
                                 mu_gpu_buf fc1_w, mu_gpu_buf fc1_b,
                                 mu_gpu_buf fc2_w, mu_gpu_buf fc2_b,
                                 int rows, mu_gpu_buf out);
+void mu_gpu_set_thread_worker_id(int worker_id);
 int mu_gpu_dense_f32_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,
                               int x_rows, int cols, int out_cols, mu_gpu_buf out);
 int mu_gpu_dense_f32_bias_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_buf w,

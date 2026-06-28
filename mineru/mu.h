@@ -140,5 +140,6 @@ int mu_text_generate_greedy_with_image_embeds(mu_engine *e,
                                               int n_image_embeds,
                                               int max_new_tokens, int *out);
 void mu_free(void *ptr);
+void mu_set_thread_log_stream(FILE *fp);
 
 #endif

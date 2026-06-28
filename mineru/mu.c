@@ -107,17 +107,24 @@ struct mu_result {
     char *markdown;
 };
 
+static __thread FILE *tl_log_stream = NULL;
+
+void mu_set_thread_log_stream(FILE *fp) {
+    tl_log_stream = fp;
+}
+
 static int mu_record_cpu_fallback(mu_engine *e, const char *stage) {
     if (!e) return -1;
     if (e->opt.backend != MU_BACKEND_METAL) return 0;
+    FILE *fp = tl_log_stream ? tl_log_stream : stderr;
     if (!e->opt.allow_cpu_fallback) {
-        fprintf(stderr, "mu metal stage unavailable without CPU fallback: %s\n",
+        fprintf(fp, "mu metal stage unavailable without CPU fallback: %s\n",
                 stage ? stage : "unknown");
         return -20;
     }
     e->cpu_fallback_count++;
     if (getenv("MU_METAL_DEBUG")) {
-        fprintf(stderr, "mu metal fallback to CPU: %s\n",
+        fprintf(fp, "mu metal fallback to CPU: %s\n",
                 stage ? stage : "unknown");
     }
     return 0;
@@ -126,7 +133,8 @@ static int mu_record_cpu_fallback(mu_engine *e, const char *stage) {
 static void mu_record_metal_stage(const mu_engine *e, const char *stage) {
     if (!e || e->opt.backend != MU_BACKEND_METAL) return;
     if (getenv("MU_METAL_DEBUG")) {
-        fprintf(stderr, "mu metal stage: %s\n", stage ? stage : "unknown");
+        FILE *fp = tl_log_stream ? tl_log_stream : stderr;
+        fprintf(fp, "mu metal stage: %s\n", stage ? stage : "unknown");
     }
 }
 
@@ -143,13 +151,15 @@ static double mu_time_now_seconds(void) {
 
 static void mu_timing_log_stage(int enabled, const char *stage, double start) {
     if (!enabled || !stage) return;
-    fprintf(stderr, "mu_timing stage=%s seconds=%.6f\n",
+    FILE *fp = tl_log_stream ? tl_log_stream : stderr;
+    fprintf(fp, "mu_timing stage=%s seconds=%.6f\n",
             stage, mu_time_now_seconds() - start);
 }
 
 static void mu_timing_log_seconds(int enabled, const char *stage, double seconds) {
     if (!enabled || !stage) return;
-    fprintf(stderr, "mu_timing stage=%s seconds=%.6f\n", stage, seconds);
+    FILE *fp = tl_log_stream ? tl_log_stream : stderr;
+    fprintf(fp, "mu_timing stage=%s seconds=%.6f\n", stage, seconds);
 }
 
 typedef struct mu_text_decode_timing {

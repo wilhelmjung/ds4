@@ -1,4 +1,5 @@
 #include "mu_gpu.h"
+#include <pthread.h>
 
 struct mu_engine;
 typedef struct mu_engine mu_engine;
@@ -26,6 +27,8 @@ static double local_time_now_seconds(void) {
     gettimeofday(&tv, NULL);
     return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
 }
+
+static pthread_mutex_t weight_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 @protocol MTLCommandBufferProfiling <NSObject>
 @property (readonly) double kernelStartTime;
@@ -258,11 +261,15 @@ static int mu_gpu_dense_f32_rows_mps(mu_gpu *gpu,
 static id<MTLBuffer> mu_gpu_get_or_create_buffer(mu_gpu *gpu, const void *cpu_ptr, NSUInteger length) {
     if (!gpu || !cpu_ptr || length == 0) return nil;
 
+    pthread_mutex_lock(&weight_cache_mutex);
+
     // Check if it's already cached
     for (int i = 0; i < gpu->weight_cache_count; i++) {
         if (gpu->weight_cache[i].cpu_ptr == cpu_ptr) {
             gpu->weight_cache_hits++;
-            return gpu->weight_cache[i].buffer;
+            id<MTLBuffer> buf = gpu->weight_cache[i].buffer;
+            pthread_mutex_unlock(&weight_cache_mutex);
+            return buf;
         }
     }
 
@@ -273,7 +280,9 @@ static id<MTLBuffer> mu_gpu_get_or_create_buffer(mu_gpu *gpu, const void *cpu_pt
             fprintf(stderr, "Warning: Metal weight cache capacity reached (%d)\n", MU_GPU_WEIGHT_CACHE_CAP);
         }
         gpu->weight_cache_copy_allocs++;
-        return [gpu->device newBufferWithBytes:cpu_ptr length:length options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf = [gpu->device newBufferWithBytes:cpu_ptr length:length options:MTLResourceStorageModeShared];
+        pthread_mutex_unlock(&weight_cache_mutex);
+        return buf;
     }
 
     id<MTLBuffer> buffer = nil;
@@ -315,6 +324,7 @@ static id<MTLBuffer> mu_gpu_get_or_create_buffer(mu_gpu *gpu, const void *cpu_pt
         }
     }
 
+    pthread_mutex_unlock(&weight_cache_mutex);
     return buffer;
 }
 
@@ -381,8 +391,31 @@ int mu_gpu_cmd_begin_with_scratch_offsets(mu_gpu *gpu, unsigned long offset_a,
     return 0;
 }
 
+static __thread int tl_worker_id = 0;
+
+void mu_gpu_set_thread_worker_id(int worker_id) {
+    tl_worker_id = worker_id;
+}
+
+static mu_scratch_allocator mu_scratch_allocator_make_thread_local(mu_gpu *gpu) {
+    int max_workers = getenv("MU_CONCURRENT_WORKERS") ? atoi(getenv("MU_CONCURRENT_WORKERS")) : 4;
+    if (max_workers < 1) max_workers = 1;
+    unsigned long chunk = gpu->scratch_size / max_workers;
+    mu_scratch_allocator alloc = {
+        gpu,
+        (NSUInteger)(tl_worker_id * chunk),
+        (NSUInteger)(tl_worker_id * chunk)
+    };
+    return alloc;
+}
+
 int mu_gpu_cmd_begin(mu_gpu *gpu, mu_gpu_cmd_ctx **out_ctx) {
-    return mu_gpu_cmd_begin_with_scratch_offsets(gpu, 0, 0, out_ctx);
+    int max_workers = getenv("MU_CONCURRENT_WORKERS") ? atoi(getenv("MU_CONCURRENT_WORKERS")) : 4;
+    if (max_workers < 1) max_workers = 1;
+    unsigned long chunk = gpu->scratch_size / max_workers;
+    unsigned long offset_a = (unsigned long)tl_worker_id * chunk;
+    unsigned long offset_b = (unsigned long)tl_worker_id * chunk;
+    return mu_gpu_cmd_begin_with_scratch_offsets(gpu, offset_a, offset_b, out_ctx);
 }
 
 void mu_gpu_cmd_set_label(mu_gpu_cmd_ctx *ctx, const char *label) {
@@ -692,9 +725,15 @@ static int mu_gpu_vision_attn_rows_mpsgraph_stage(mu_gpu *gpu,
     *ctx = NULL;
     if (rc != 0) return rc;
 
+    static pthread_mutex_t mpsgraph_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&mpsgraph_mutex);
+
     double t_graph = local_time_now_seconds();
     rc = mu_gpu_vision_attn_mpsgraph_ensure(gpu, rows);
-    if (rc != 0) return rc;
+    if (rc != 0) {
+        pthread_mutex_unlock(&mpsgraph_mutex);
+        return rc;
+    }
 
     MPSShape *packed_shape = @[ @1, @16, @(rows), @80 ];
     MPSShape *out_shape = @[ @(rows), @1280 ];
@@ -710,8 +749,12 @@ static int mu_gpu_vision_attn_rows_mpsgraph_stage(mu_gpu *gpu,
     MPSGraphTensorData *out_data = [[MPSGraphTensorData alloc] initWithMTLBuffer:graph_out
                                                                            shape:out_shape
                                                                         dataType:MPSDataTypeFloat32];
-    if (!q_data || !k_data || !v_data || !out_data) return -4;
+    if (!q_data || !k_data || !v_data || !out_data) {
+        pthread_mutex_unlock(&mpsgraph_mutex);
+        return -4;
+    }
 
+    int run_failed = 0;
     @try {
         MPSGraphTensorDataDictionary *feeds = @{
             gpu->vision_attn_mpsgraph_q: q_data,
@@ -724,12 +767,15 @@ static int mu_gpu_vision_attn_rows_mpsgraph_stage(mu_gpu *gpu,
                                           targetOperations:nil
                                          resultsDictionary:results];
     } @catch (NSException *exception) {
+        run_failed = 1;
         if (getenv("MU_METAL_DEBUG")) {
             fprintf(stderr, "mu mpsgraph attention failed: %s\n",
                     [[exception reason] UTF8String]);
         }
-        return -5;
     }
+    pthread_mutex_unlock(&mpsgraph_mutex);
+    if (run_failed) return -5;
+
     if (mpsgraph_profile) {
         fprintf(stderr, "mu_timing stage=vision_attn_mpsgraph_graph seconds=%.6f\n",
                 local_time_now_seconds() - t_graph);
@@ -964,7 +1010,7 @@ int mu_gpu_create(mu_gpu **out) {
         } else {
             strlcpy(gpu->device_name, "unknown", sizeof(gpu->device_name));
         }
-        gpu->scratch_size = 512 * 1024 * 1024; // 512 MB
+        gpu->scratch_size = 1536ULL * 1024ULL * 1024ULL; // 1.5 GB
         gpu->scratch_a = [device newBufferWithLength:gpu->scratch_size options:MTLResourceStorageModeShared];
         gpu->scratch_b = [device newBufferWithLength:gpu->scratch_size options:MTLResourceStorageModeShared];
         *out = gpu;
@@ -1108,7 +1154,7 @@ int mu_gpu_dense_bf16_bias_probe(mu_gpu *gpu, const float *x,
     if (!x || !w_bf16 || !bias_bf16 || !out || rows <= 0 || cols <= 0) return -2;
 
     @autoreleasepool {
-        mu_scratch_allocator alloc_ctx = { gpu, 0, 0 };
+        mu_scratch_allocator alloc_ctx = mu_scratch_allocator_make_thread_local(gpu);
         NSUInteger x_bytes = (NSUInteger)cols * sizeof(float);
         NSUInteger w_bytes = (NSUInteger)rows * (NSUInteger)cols * sizeof(unsigned short);
         NSUInteger bias_bytes = (NSUInteger)rows * sizeof(unsigned short);
@@ -1206,7 +1252,7 @@ int mu_gpu_dense_f32_rows(mu_gpu *gpu, const float *x,
     if (!x || !w_bf16 || !out || x_rows <= 0 || cols <= 0 || out_cols <= 0) return -2;
 
     @autoreleasepool {
-        mu_scratch_allocator alloc_ctx = { gpu, 0, 0 };
+        mu_scratch_allocator alloc_ctx = mu_scratch_allocator_make_thread_local(gpu);
         NSUInteger x_bytes = (NSUInteger)x_rows * (NSUInteger)cols * sizeof(float);
         NSUInteger w_bytes = (NSUInteger)out_cols * (NSUInteger)cols * sizeof(unsigned short);
         NSUInteger out_bytes = (NSUInteger)x_rows * (NSUInteger)out_cols * sizeof(float);
@@ -1277,7 +1323,7 @@ int mu_gpu_dense_f32_bias_rows(mu_gpu *gpu, const float *x,
     }
 
     @autoreleasepool {
-        mu_scratch_allocator alloc_ctx = { gpu, 0, 0 };
+        mu_scratch_allocator alloc_ctx = mu_scratch_allocator_make_thread_local(gpu);
         NSUInteger x_bytes = (NSUInteger)x_rows * (NSUInteger)cols * sizeof(float);
         NSUInteger w_bytes = (NSUInteger)out_cols * (NSUInteger)cols * sizeof(unsigned short);
         NSUInteger bias_bytes = (NSUInteger)out_cols * sizeof(unsigned short);
@@ -1361,7 +1407,7 @@ int mu_gpu_rmsnorm_probe(mu_gpu *gpu, const float *x, const float *weight,
     if (!x || !weight || !out || n <= 0) return -2;
 
     @autoreleasepool {
-        mu_scratch_allocator alloc_ctx = { gpu, 0, 0 };
+        mu_scratch_allocator alloc_ctx = mu_scratch_allocator_make_thread_local(gpu);
         NSUInteger bytes = (NSUInteger)n * sizeof(float);
         NSUInteger x_buf_offset = 0;
         id<MTLBuffer> x_buf = mu_scratch_alloc_a(&alloc_ctx, bytes, &x_buf_offset);
@@ -1443,7 +1489,7 @@ int mu_gpu_rmsnorm_bf16_rows(mu_gpu *gpu, const float *x,
     if (!x || !weight_bf16 || !out || rows <= 0 || cols <= 0) return -2;
 
     @autoreleasepool {
-        mu_scratch_allocator alloc_ctx = { gpu, 0, 0 };
+        mu_scratch_allocator alloc_ctx = mu_scratch_allocator_make_thread_local(gpu);
         NSUInteger x_bytes = (NSUInteger)rows * (NSUInteger)cols * sizeof(float);
         NSUInteger w_bytes = (NSUInteger)cols * sizeof(unsigned short);
         NSUInteger x_buf_offset = 0;
@@ -1499,7 +1545,7 @@ int mu_gpu_layernorm_bf16_probe(mu_gpu *gpu, const float *x,
     if (!x || !weight_bf16 || !bias_bf16 || !out || n <= 0) return -2;
 
     @autoreleasepool {
-        mu_scratch_allocator alloc_ctx = { gpu, 0, 0 };
+        mu_scratch_allocator alloc_ctx = mu_scratch_allocator_make_thread_local(gpu);
         NSUInteger x_bytes = (NSUInteger)n * sizeof(float);
         NSUInteger bf16_bytes = (NSUInteger)n * sizeof(unsigned short);
         NSUInteger x_buf_offset = 0;
@@ -1624,7 +1670,7 @@ int mu_gpu_text_attn_token0(mu_gpu *gpu, const float *v, float *out) {
     if (!v || !out) return -2;
 
     @autoreleasepool {
-        mu_scratch_allocator alloc_ctx = { gpu, 0, 0 };
+        mu_scratch_allocator alloc_ctx = mu_scratch_allocator_make_thread_local(gpu);
         NSUInteger v_bytes = 128u * sizeof(float);
         NSUInteger out_bytes = 896u * sizeof(float);
         NSUInteger v_buf_offset = 0;
@@ -1672,7 +1718,7 @@ int mu_gpu_text_attn_seq(mu_gpu *gpu, const float *q, const float *k,
     if (!q || !k || !v || !out || seq <= 0) return -2;
 
     @autoreleasepool {
-        mu_scratch_allocator alloc_ctx = { gpu, 0, 0 };
+        mu_scratch_allocator alloc_ctx = mu_scratch_allocator_make_thread_local(gpu);
         NSUInteger q_bytes = (NSUInteger)seq * 896u * sizeof(float);
         NSUInteger kv_bytes = (NSUInteger)seq * 128u * sizeof(float);
         NSUInteger out_bytes = q_bytes;
@@ -1741,7 +1787,7 @@ int mu_gpu_text_attn_seq_pos(mu_gpu *gpu, const float *q, const float *k,
     if (!q || !k || !v || !position_ids || !out || seq <= 0) return -2;
 
     @autoreleasepool {
-        mu_scratch_allocator alloc_ctx = { gpu, 0, 0 };
+        mu_scratch_allocator alloc_ctx = mu_scratch_allocator_make_thread_local(gpu);
         NSUInteger q_bytes = (NSUInteger)seq * 896u * sizeof(float);
         NSUInteger kv_bytes = (NSUInteger)seq * 128u * sizeof(float);
         NSUInteger pos_bytes = (NSUInteger)seq * 3u * sizeof(int);
@@ -3093,6 +3139,22 @@ static MPSMatrixMultiplication *mu_gpu_dense_mps_kernel(mu_gpu *gpu,
                                                        int rows, int cols, int out_cols) {
     if (!gpu || rows <= 0 || !(mu_gpu_dense_mps_shape(cols, out_cols) || mu_gpu_dense_mps_text_shape(cols, out_cols))) return nil;
 
+    int max_workers = getenv("MU_CONCURRENT_WORKERS") ? atoi(getenv("MU_CONCURRENT_WORKERS")) : 1;
+    if (max_workers > 1) {
+        // Thread-unsafe to share MPSMatrixMultiplication across threads; create fresh each time
+        return [[MPSMatrixMultiplication alloc] initWithDevice:gpu->device
+                                                 transposeLeft:NO
+                                                transposeRight:YES
+                                                    resultRows:(NSUInteger)rows
+                                                 resultColumns:(NSUInteger)out_cols
+                                               interiorColumns:(NSUInteger)cols
+                                                         alpha:1.0
+                                                          beta:0.0];
+    }
+
+    pthread_mutex_lock(&weight_cache_mutex);
+    MPSMatrixMultiplication *res = nil;
+
     if (cols == 1280 && out_cols == 1280) {
         if (!gpu->dense_mps_1280_1280 || gpu->dense_mps_1280_1280_rows != rows) {
             gpu->dense_mps_1280_1280 =
@@ -3106,9 +3168,9 @@ static MPSMatrixMultiplication *mu_gpu_dense_mps_kernel(mu_gpu *gpu,
                                                            beta:0.0];
             gpu->dense_mps_1280_1280_rows = rows;
         }
-        return gpu->dense_mps_1280_1280;
+        res = gpu->dense_mps_1280_1280;
     }
-    if (cols == 1280 && out_cols == 2560) {
+    else if (cols == 1280 && out_cols == 2560) {
         if (!gpu->dense_mps_1280_2560 || gpu->dense_mps_1280_2560_rows != rows) {
             gpu->dense_mps_1280_2560 =
                 [[MPSMatrixMultiplication alloc] initWithDevice:gpu->device
@@ -3121,9 +3183,9 @@ static MPSMatrixMultiplication *mu_gpu_dense_mps_kernel(mu_gpu *gpu,
                                                            beta:0.0];
             gpu->dense_mps_1280_2560_rows = rows;
         }
-        return gpu->dense_mps_1280_2560;
+        res = gpu->dense_mps_1280_2560;
     }
-    if (cols == 1280 && out_cols == 3840) {
+    else if (cols == 1280 && out_cols == 3840) {
         if (!gpu->dense_mps_1280_3840 || gpu->dense_mps_1280_3840_rows != rows) {
             gpu->dense_mps_1280_3840 =
                 [[MPSMatrixMultiplication alloc] initWithDevice:gpu->device
@@ -3136,9 +3198,9 @@ static MPSMatrixMultiplication *mu_gpu_dense_mps_kernel(mu_gpu *gpu,
                                                            beta:0.0];
             gpu->dense_mps_1280_3840_rows = rows;
         }
-        return gpu->dense_mps_1280_3840;
+        res = gpu->dense_mps_1280_3840;
     }
-    if (cols == 1280 && out_cols == 5120) {
+    else if (cols == 1280 && out_cols == 5120) {
         if (!gpu->dense_mps_1280_5120 || gpu->dense_mps_1280_5120_rows != rows) {
             gpu->dense_mps_1280_5120 =
                 [[MPSMatrixMultiplication alloc] initWithDevice:gpu->device
@@ -3151,9 +3213,9 @@ static MPSMatrixMultiplication *mu_gpu_dense_mps_kernel(mu_gpu *gpu,
                                                            beta:0.0];
             gpu->dense_mps_1280_5120_rows = rows;
         }
-        return gpu->dense_mps_1280_5120;
+        res = gpu->dense_mps_1280_5120;
     }
-    if (cols == 5120 && out_cols == 1280) {
+    else if (cols == 5120 && out_cols == 1280) {
         if (!gpu->dense_mps_5120_1280 || gpu->dense_mps_5120_1280_rows != rows) {
             gpu->dense_mps_5120_1280 =
                 [[MPSMatrixMultiplication alloc] initWithDevice:gpu->device
@@ -3166,9 +3228,9 @@ static MPSMatrixMultiplication *mu_gpu_dense_mps_kernel(mu_gpu *gpu,
                                                            beta:0.0];
             gpu->dense_mps_5120_1280_rows = rows;
         }
-        return gpu->dense_mps_5120_1280;
+        res = gpu->dense_mps_5120_1280;
     }
-    if (cols == 896 && out_cols == 896) {
+    else if (cols == 896 && out_cols == 896) {
         if (!gpu->dense_mps_896_896 || gpu->dense_mps_896_896_rows != rows) {
             gpu->dense_mps_896_896 =
                 [[MPSMatrixMultiplication alloc] initWithDevice:gpu->device
@@ -3181,9 +3243,9 @@ static MPSMatrixMultiplication *mu_gpu_dense_mps_kernel(mu_gpu *gpu,
                                                            beta:0.0];
             gpu->dense_mps_896_896_rows = rows;
         }
-        return gpu->dense_mps_896_896;
+        res = gpu->dense_mps_896_896;
     }
-    if (cols == 896 && out_cols == 128) {
+    else if (cols == 896 && out_cols == 128) {
         if (!gpu->dense_mps_896_128 || gpu->dense_mps_896_128_rows != rows) {
             gpu->dense_mps_896_128 =
                 [[MPSMatrixMultiplication alloc] initWithDevice:gpu->device
@@ -3196,9 +3258,9 @@ static MPSMatrixMultiplication *mu_gpu_dense_mps_kernel(mu_gpu *gpu,
                                                            beta:0.0];
             gpu->dense_mps_896_128_rows = rows;
         }
-        return gpu->dense_mps_896_128;
+        res = gpu->dense_mps_896_128;
     }
-    if (cols == 896 && out_cols == 4864) {
+    else if (cols == 896 && out_cols == 4864) {
         if (!gpu->dense_mps_896_4864 || gpu->dense_mps_896_4864_rows != rows) {
             gpu->dense_mps_896_4864 =
                 [[MPSMatrixMultiplication alloc] initWithDevice:gpu->device
@@ -3211,9 +3273,9 @@ static MPSMatrixMultiplication *mu_gpu_dense_mps_kernel(mu_gpu *gpu,
                                                            beta:0.0];
             gpu->dense_mps_896_4864_rows = rows;
         }
-        return gpu->dense_mps_896_4864;
+        res = gpu->dense_mps_896_4864;
     }
-    if (cols == 4864 && out_cols == 896) {
+    else if (cols == 4864 && out_cols == 896) {
         if (!gpu->dense_mps_4864_896 || gpu->dense_mps_4864_896_rows != rows) {
             gpu->dense_mps_4864_896 =
                 [[MPSMatrixMultiplication alloc] initWithDevice:gpu->device
@@ -3226,18 +3288,26 @@ static MPSMatrixMultiplication *mu_gpu_dense_mps_kernel(mu_gpu *gpu,
                                                            beta:0.0];
             gpu->dense_mps_4864_896_rows = rows;
         }
-        return gpu->dense_mps_4864_896;
+        res = gpu->dense_mps_4864_896;
     }
-    return nil;
+
+    pthread_mutex_unlock(&weight_cache_mutex);
+    return res;
 }
+
 
 static id<MTLBuffer> mu_gpu_dense_mps_f32_weight(mu_gpu *gpu, id<MTLBuffer> src,
                                                 NSUInteger offset, NSUInteger length) {
     if (!gpu || !src || length == 0) return nil;
+
+    pthread_mutex_lock(&weight_cache_mutex);
+
     for (int i = 0; i < gpu->dense_mps_weight_cache_count; i++) {
         mu_gpu_dense_mps_weight *entry = &gpu->dense_mps_weight_cache[i];
         if (entry->src == src && entry->offset == offset && entry->length == length) {
-            return entry->f32;
+            id<MTLBuffer> buf = entry->f32;
+            pthread_mutex_unlock(&weight_cache_mutex);
+            return buf;
         }
     }
 
@@ -3245,7 +3315,10 @@ static id<MTLBuffer> mu_gpu_dense_mps_f32_weight(mu_gpu *gpu, id<MTLBuffer> src,
     NSUInteger f32_bytes = count * sizeof(float);
     id<MTLBuffer> f32 = [gpu->device newBufferWithLength:f32_bytes
                                                   options:MTLResourceStorageModeShared];
-    if (!f32) return nil;
+    if (!f32) {
+        pthread_mutex_unlock(&weight_cache_mutex);
+        return nil;
+    }
     const unsigned short *s = (const unsigned short *)((const char *)[src contents] + offset);
     float *d = (float *)[f32 contents];
     for (NSUInteger i = 0; i < count; i++) d[i] = mu_gpu_bf16_to_f32(s[i]);
@@ -3258,6 +3331,8 @@ static id<MTLBuffer> mu_gpu_dense_mps_f32_weight(mu_gpu *gpu, id<MTLBuffer> src,
         entry->length = length;
         entry->f32 = f32;
     }
+
+    pthread_mutex_unlock(&weight_cache_mutex);
     return f32;
 }
 
@@ -4120,7 +4195,7 @@ int mu_gpu_text_logits_argmax(mu_gpu *gpu, const float *hidden_state_cpu,
         hidden_dim <= 0 || vocab_dim <= 0) return -2;
 
     @autoreleasepool {
-        mu_scratch_allocator alloc_ctx = { gpu, 0, 0 };
+        mu_scratch_allocator alloc_ctx = mu_scratch_allocator_make_thread_local(gpu);
         NSUInteger hs_bytes = (NSUInteger)hidden_dim * sizeof(float);
         NSUInteger norm_w_bytes = (NSUInteger)hidden_dim * sizeof(unsigned short);
         NSUInteger last_bytes = (NSUInteger)hidden_dim * sizeof(float);

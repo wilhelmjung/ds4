@@ -1919,6 +1919,120 @@ static void get_output_filename(const char *image_path, const char *output_dir, 
     snprintf(out, out_max, "%s/%s.%s", output_dir, name, is_json ? "json" : "md");
 }
 
+#include <pthread.h>
+
+#ifdef __APPLE__
+void mu_gpu_set_thread_worker_id(int worker_id);
+#endif
+
+typedef struct {
+    mu_engine *engine;
+    int next_image_idx;
+    pthread_mutex_t mutex;
+    int n_images;
+    const char **images;
+    const char *output_dir;
+    int write_json;
+    int failed;
+    int max_workers;
+} mu_work_queue;
+
+typedef struct {
+    mu_work_queue *queue;
+    int worker_id;
+} mu_worker_args;
+
+static void *mu_worker_thread_fn(void *arg) {
+    mu_worker_args *args = (mu_worker_args *)arg;
+    mu_work_queue *q = args->queue;
+    
+#ifdef __APPLE__
+    mu_gpu_set_thread_worker_id(args->worker_id);
+#endif
+
+    while (1) {
+        int idx = -1;
+        pthread_mutex_lock(&q->mutex);
+        if (q->next_image_idx < q->n_images) {
+            idx = q->next_image_idx++;
+        }
+        pthread_mutex_unlock(&q->mutex);
+
+        if (idx == -1) break;
+
+        const char *path = q->images[idx];
+
+        char *log_buf = NULL;
+        size_t log_size = 0;
+        FILE *log_fp = open_memstream(&log_buf, &log_size);
+        if (log_fp) {
+            mu_set_thread_log_stream(log_fp);
+            fprintf(log_fp, "mu_page_start page=%s\n", path);
+        } else {
+            fprintf(stderr, "mu_page_start page=%s\n", path);
+        }
+
+        mu_result *result = NULL;
+        int rc = mu_parse_image_file(q->engine, path, &result);
+
+        if (log_fp) {
+            fprintf(log_fp, "mu_page_end page=%s\n", path);
+            fclose(log_fp);
+            mu_set_thread_log_stream(NULL);
+            if (log_buf && log_size > 0) {
+                pthread_mutex_lock(&q->mutex);
+                fwrite(log_buf, 1, log_size, stderr);
+                fflush(stderr);
+                pthread_mutex_unlock(&q->mutex);
+            }
+            free(log_buf);
+        } else {
+            fprintf(stderr, "mu_page_end page=%s\n", path);
+        }
+
+        if (rc) {
+            fprintf(stderr, "mu_parse_image_file failed for %s: %d\n", path, rc);
+            pthread_mutex_lock(&q->mutex);
+            q->failed = 1;
+            pthread_mutex_unlock(&q->mutex);
+            mu_result_free(result);
+            continue;
+        }
+
+        if (q->output_dir) {
+            char out_filename[512];
+            get_output_filename(path, q->output_dir, q->write_json != 0, out_filename, sizeof(out_filename));
+            FILE *fp = fopen(out_filename, "wb");
+            if (!fp) {
+                fprintf(stderr, "failed to open output file %s\n", out_filename);
+                pthread_mutex_lock(&q->mutex);
+                q->failed = 1;
+                pthread_mutex_unlock(&q->mutex);
+                mu_result_free(result);
+                continue;
+            }
+            rc = q->write_json ? mu_result_write_json(result, fp)
+                               : mu_result_write_markdown(result, fp);
+            fclose(fp);
+            if (rc) {
+                fprintf(stderr, "failed to write output to %s\n", out_filename);
+                pthread_mutex_lock(&q->mutex);
+                q->failed = 1;
+                pthread_mutex_unlock(&q->mutex);
+            }
+        } else {
+            pthread_mutex_lock(&q->mutex);
+            rc = q->write_json ? mu_result_write_json(result, stdout)
+                               : mu_result_write_markdown(result, stdout);
+            if (rc == 0) fputc('\n', stdout);
+            else q->failed = 1;
+            pthread_mutex_unlock(&q->mutex);
+        }
+        mu_result_free(result);
+    }
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     mu_engine_options opt = mu_engine_options_default();
     const char *trace_path = NULL;
@@ -1929,6 +2043,7 @@ int main(int argc, char **argv) {
     const char *images[512];
     int n_images = 0;
     const char *output_dir = NULL;
+    int n_threads = 4;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--model-dir") && i + 1 < argc) {
@@ -1970,6 +2085,9 @@ int main(int argc, char **argv) {
             }
         } else if (!strcmp(argv[i], "--output-dir") && i + 1 < argc) {
             output_dir = argv[++i];
+        } else if (!strcmp(argv[i], "--threads") && i + 1 < argc) {
+            n_threads = atoi(argv[++i]);
+            if (n_threads < 1) n_threads = 1;
         } else if (!strcmp(argv[i], "--json")) {
             write_json = 1;
         } else if (!strcmp(argv[i], "--markdown")) {
@@ -2063,46 +2181,43 @@ int main(int argc, char **argv) {
     }
     if (image_path) {
         if (n_images > 1 || output_dir) {
-            for (int idx = 0; idx < n_images; idx++) {
-                const char *path = images[idx];
-                fprintf(stderr, "mu_page_start page=%s\n", path);
-                mu_result *result = NULL;
-                rc = mu_parse_image_file(engine, path, &result);
-                fprintf(stderr, "mu_page_end page=%s\n", path);
-                if (rc) {
-                    fprintf(stderr, "mu_parse_image_file failed for %s: %d\n", path, rc);
-                    mu_result_free(result);
-                    mu_engine_close(engine);
-                    return 1;
-                }
-                if (output_dir) {
-                    char out_filename[512];
-                    get_output_filename(path, output_dir, write_json != 0, out_filename, sizeof(out_filename));
-                    FILE *fp = fopen(out_filename, "wb");
-                    if (!fp) {
-                        fprintf(stderr, "failed to open output file %s\n", out_filename);
-                        mu_result_free(result);
-                        mu_engine_close(engine);
-                        return 1;
-                    }
-                    rc = write_json ? mu_result_write_json(result, fp)
-                                    : mu_result_write_markdown(result, fp);
-                    fclose(fp);
-                    if (rc) {
-                        fprintf(stderr, "failed to write output to %s\n", out_filename);
-                        mu_result_free(result);
-                        mu_engine_close(engine);
-                        return 1;
-                    }
-                } else {
-                    rc = write_json ? mu_result_write_json(result, stdout)
-                                    : mu_result_write_markdown(result, stdout);
-                    if (rc == 0) fputc('\n', stdout);
-                }
-                mu_result_free(result);
+            char num_workers_str[32];
+            snprintf(num_workers_str, sizeof(num_workers_str), "%d", n_threads);
+            setenv("MU_CONCURRENT_WORKERS", num_workers_str, 1);
+
+            mu_work_queue queue;
+            queue.engine = engine;
+            queue.next_image_idx = 0;
+            pthread_mutex_init(&queue.mutex, NULL);
+            queue.n_images = n_images;
+            queue.images = images;
+            queue.output_dir = output_dir;
+            queue.write_json = write_json;
+            queue.failed = 0;
+            queue.max_workers = n_threads;
+
+            int active_threads = n_threads;
+            if (active_threads > n_images) active_threads = n_images;
+
+            pthread_t *threads = (pthread_t *)malloc((size_t)active_threads * sizeof(pthread_t));
+            mu_worker_args *args = (mu_worker_args *)malloc((size_t)active_threads * sizeof(mu_worker_args));
+
+            for (int i = 0; i < active_threads; i++) {
+                args[i].queue = &queue;
+                args[i].worker_id = i;
+                pthread_create(&threads[i], NULL, mu_worker_thread_fn, &args[i]);
             }
+
+            for (int i = 0; i < active_threads; i++) {
+                pthread_join(threads[i], NULL);
+            }
+
+            int failed = queue.failed;
+            pthread_mutex_destroy(&queue.mutex);
+            free(threads);
+            free(args);
             mu_engine_close(engine);
-            return 0;
+            return failed ? 1 : 0;
         } else {
             mu_result *result = NULL;
             rc = mu_parse_image_file(engine, image_path, &result);
