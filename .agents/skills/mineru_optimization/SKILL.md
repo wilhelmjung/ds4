@@ -20,3 +20,8 @@ This guide compiles key architectural patterns and lessons learned during the op
 - **Rule**: When executing multiple worker threads via `--threads > 1`, keep all shared buffers and caches thread-safe.
 - **Weight Cache**: Protect the global `weight_cache` lookups and allocations in `mu_metal.m` using a `pthread_mutex_t`.
 - **MPS Objects**: Metal Performance Shaders (MPS) kernel objects (such as `MPSMatrixMultiplication`) are **not thread-safe** for concurrent `encodeToCommandBuffer` calls. When `MU_CONCURRENT_WORKERS > 1`, bypass the kernel cache and allocate a fresh MPS kernel object per-call.
+
+## 4. Occupancy and Register Pressure Tuning
+- **Rule**: Minimize per-thread local arrays (registers) in complex kernels like FlashAttention, shifting persistent thread variables to threadgroup shared memory if necessary.
+- **Why**: Thread register counts exceeding 128 on Apple Silicon drop GPU compute core occupancy significantly. Buffering Query (Q) vectors in shared memory and tuning Key-Value tile sizes (e.g. step=16 instead of step=32) reduces threadgroup storage footprint and halves per-thread registers, improving overall warp occupancy and delivering a **1.05x-1.07x speedup** on memory/bandwidth-bound kernels.
+
