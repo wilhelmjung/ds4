@@ -3584,6 +3584,14 @@ const unsigned short *mu_engine_get_text_layer_tensor(void *engine, int layer, c
     return (const unsigned short *)mu_text_layer_tensor_bf16((const mu_engine *)engine, layer, suffix, ndim, d0, d1);
 }
 
+const unsigned short *mu_engine_get_final_norm_tensor(void *engine) {
+    return (const unsigned short *)mu_tensor_bf16((const mu_engine *)engine, "model.norm.weight", 1, 896, 0);
+}
+
+const unsigned short *mu_engine_get_embed_tokens_tensor(void *engine) {
+    return (const unsigned short *)mu_tensor_bf16((const mu_engine *)engine, "model.embed_tokens.weight", 2, 151936, 896);
+}
+
 
 static void mu_record_text_layer_seq_stage(const mu_engine *e, int layer,
                                            const char *suffix) {
@@ -5133,6 +5141,30 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
             return top_rc;
         }
         if (layer_resident) {
+            if (getenv("MU_TEXT_DECODE_ICB") != NULL) {
+                mu_token_logit best_out[1];
+                int icb_rc = mu_gpu_text_decode_icb_execute(e, gpu_cache, cache_pos, pos3, hidden_state, top_k, best_out);
+                if (icb_rc == 0) {
+                    out[0].id = best_out[0].id;
+                    out[0].logit = best_out[0].logit;
+                    for (int i = 1; i < top_k; i++) {
+                        out[i].id = -1;
+                        out[i].logit = -FLT_MAX;
+                    }
+                    mu_record_metal_stage(e, "text_cached_layer_resident");
+                    mu_record_metal_stage(e, "text_cached_attn");
+                    mu_record_metal_stage(e, "text_decode_resident_logits");
+                    mu_record_metal_stage(e, "text_final_norm");
+                    mu_record_metal_stage(e, "text_logits");
+                    if (timing_stats) {
+                        local_timing.cached_step += mu_time_now_seconds() - step_start;
+                        local_timing.steps = 1;
+                        mu_text_decode_timing_add(timing_stats, &local_timing);
+                    }
+                    free(gate); free(up); free(mid); free(w_tmp);
+                    return 1;
+                }
+            }
             mu_gpu_cmd_ctx *ctx = NULL;
             rc = mu_gpu_cmd_begin(e->gpu, &ctx);
             if (rc != 0) goto fail;

@@ -156,6 +156,11 @@ struct mu_gpu {
     id<MTLBuffer> scratch_a;
     id<MTLBuffer> scratch_b;
     NSUInteger scratch_size;
+
+    // Static Constants Buffers for ICB
+    id<MTLBuffer> const_hidden_buf;
+    id<MTLBuffer> const_vocab_buf;
+    id<MTLBuffer> const_eps_buf;
 };
 
 struct mu_gpu_kv_cache {
@@ -164,6 +169,12 @@ struct mu_gpu_kv_cache {
     id<MTLBuffer> v_cache;
     int layers;
     int cap;
+    // ICB text decode assets
+    id<MTLIndirectCommandBuffer> decode_icb;
+    id<MTLBuffer> dynamic_params_buf;
+    __unsafe_unretained id<MTLResource> *resources;
+    NSUInteger resource_count;
+    BOOL icb_recorded;
 };
 
 static inline NSUInteger mu_gpu_kv_cache_offset(mu_gpu_kv_cache *cache, int layer);
@@ -237,8 +248,15 @@ static id<MTLComputePipelineState> mu_gpu_make_pipeline(id<MTLDevice> device,
         return nil;
     }
 
+    MTLComputePipelineDescriptor *desc = [[MTLComputePipelineDescriptor alloc] init];
+    desc.computeFunction = function;
+    desc.supportIndirectCommandBuffers = YES;
+
     id<MTLComputePipelineState> pipeline =
-        [device newComputePipelineStateWithFunction:function error:&error];
+        [device newComputePipelineStateWithDescriptor:desc
+                                              options:MTLPipelineOptionNone
+                                           reflection:nil
+                                                error:&error];
     if (!pipeline && getenv("MU_METAL_DEBUG")) {
         fprintf(stderr, "mu metal pipeline failed: %s %s %s\n",
                 [source_name UTF8String], [function_name UTF8String],
@@ -1031,6 +1049,14 @@ int mu_gpu_create(mu_gpu **out) {
         gpu->scratch_size = 1536ULL * 1024ULL * 1024ULL; // 1.5 GB
         gpu->scratch_a = [device newBufferWithLength:gpu->scratch_size options:MTLResourceStorageModeShared];
         gpu->scratch_b = [device newBufferWithLength:gpu->scratch_size options:MTLResourceStorageModeShared];
+        
+        int val_hidden = 896;
+        int val_vocab = 151936;
+        float val_eps = 1e-6f;
+        gpu->const_hidden_buf = [device newBufferWithBytes:&val_hidden length:sizeof(int) options:MTLResourceStorageModeShared];
+        gpu->const_vocab_buf = [device newBufferWithBytes:&val_vocab length:sizeof(int) options:MTLResourceStorageModeShared];
+        gpu->const_eps_buf = [device newBufferWithBytes:&val_eps length:sizeof(float) options:MTLResourceStorageModeShared];
+
         *out = gpu;
     }
     return 0;
@@ -1132,6 +1158,9 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->dense_f32_bias_probe = nil;
     gpu->dense_bf16_bias_probe = nil;
     gpu->dense_probe = nil;
+    gpu->const_hidden_buf = nil;
+    gpu->const_vocab_buf = nil;
+    gpu->const_eps_buf = nil;
     gpu->queue = nil;
     gpu->device = nil;
     free(gpu);
@@ -4065,6 +4094,11 @@ int mu_gpu_kv_cache_create(mu_gpu *gpu, int layers, int cap, mu_gpu_kv_cache **o
     cache->gpu = gpu;
     cache->layers = layers;
     cache->cap = cap;
+    cache->decode_icb = nil;
+    cache->dynamic_params_buf = nil;
+    cache->resources = NULL;
+    cache->resource_count = 0;
+    cache->icb_recorded = NO;
 
     bool use_bf16 = (getenv("MU_KV_CACHE_BF16") != NULL);
     NSUInteger elem_size = use_bf16 ? sizeof(uint16_t) : sizeof(float);
@@ -4087,6 +4121,11 @@ void mu_gpu_kv_cache_destroy(mu_gpu_kv_cache *cache) {
     if (!cache) return;
     cache->k_cache = nil;
     cache->v_cache = nil;
+    cache->decode_icb = nil;
+    cache->dynamic_params_buf = nil;
+    if (cache->resources) {
+        free(cache->resources);
+    }
     free(cache);
 }
 
@@ -4403,5 +4442,403 @@ int mu_gpu_text_logits_argmax(mu_gpu *gpu, const float *hidden_state_cpu,
         memcpy(out_id, (char *)[out_id_buf contents] + out_id_offset, sizeof(int));
         memcpy(out_val, (char *)[out_val_buf contents] + out_val_offset, sizeof(float));
     }
+    return 0;
+}
+
+struct mu_gpu_decode_dynamic_params {
+    int pos3[3];
+    int cache_pos;
+    int cache_len;
+    char use_bf16_cache;
+};
+
+struct mu_token_logit {
+    int id;
+    float logit;
+};
+
+static id<MTLIndirectComputeCommand> mu_gpu_icb_get_cmd(id<MTLIndirectCommandBuffer> icb, NSUInteger idx) {
+    id<MTLIndirectComputeCommand> cmd = [icb indirectComputeCommandAtIndex:idx];
+    [cmd setBarrier];
+    return cmd;
+}
+
+static int mu_gpu_text_decode_icb_record(void *engine, mu_gpu_kv_cache *cache) {
+    if (!engine || !cache || !cache->gpu) return -1;
+    mu_gpu *gpu = cache->gpu;
+    id<MTLDevice> device = gpu->device;
+
+    MTLIndirectCommandBufferDescriptor *desc = [[MTLIndirectCommandBufferDescriptor alloc] init];
+    desc.commandTypes = MTLIndirectCommandTypeConcurrentDispatch;
+    desc.inheritBuffers = NO;
+    desc.inheritPipelineState = NO;
+    desc.maxKernelBufferBindCount = 31;
+
+    cache->decode_icb = [device newIndirectCommandBufferWithDescriptor:desc
+                                                      maxCommandCount:250
+                                                              options:0];
+    if (!cache->decode_icb) return -2;
+
+    cache->dynamic_params_buf = [device newBufferWithLength:64 options:MTLResourceStorageModeShared];
+    if (!cache->dynamic_params_buf) return -3;
+
+    NSMutableSet *unique_resources = [NSMutableSet set];
+    [unique_resources addObject:cache->k_cache];
+    [unique_resources addObject:cache->v_cache];
+    [unique_resources addObject:cache->dynamic_params_buf];
+    [unique_resources addObject:gpu->scratch_a];
+    [unique_resources addObject:gpu->scratch_b];
+    [unique_resources addObject:gpu->const_hidden_buf];
+    [unique_resources addObject:gpu->const_vocab_buf];
+    [unique_resources addObject:gpu->const_eps_buf];
+
+    __block NSUInteger cmd_idx = 0;
+
+    int hidden = 896;
+    int q_out = 896;
+    int kv_out = 128;
+    int inter = 4864;
+    int vocab = 151936;
+
+    NSUInteger hidden_bytes = (NSUInteger)hidden * sizeof(float);
+    NSUInteger q_out_bytes = (NSUInteger)q_out * sizeof(float);
+    NSUInteger kv_out_bytes = (NSUInteger)kv_out * sizeof(float);
+
+    NSUInteger offset_a = 0;
+    NSUInteger offset_b = 0;
+
+    NSUInteger cur_hs_offset = offset_a;
+    offset_a += hidden_bytes;
+
+    BOOL use_qkv_rope_fusion = (getenv("MU_TEXT_DECODE_QKV_ROPE_FUSION") != NULL);
+
+    for (int layer = 0; layer < 24; layer++) {
+        const unsigned short *input_norm = mu_engine_get_text_layer_tensor(engine, layer, "input_layernorm.weight", 1, hidden, 0);
+        const unsigned short *post_norm = mu_engine_get_text_layer_tensor(engine, layer, "post_attention_layernorm.weight", 1, hidden, 0);
+        const unsigned short *qw = mu_engine_get_text_layer_tensor(engine, layer, "self_attn.q_proj.weight", 2, q_out, hidden);
+        const unsigned short *qb = mu_engine_get_text_layer_tensor(engine, layer, "self_attn.q_proj.bias", 1, q_out, 0);
+        const unsigned short *kw = mu_engine_get_text_layer_tensor(engine, layer, "self_attn.k_proj.weight", 2, kv_out, hidden);
+        const unsigned short *kb = mu_engine_get_text_layer_tensor(engine, layer, "self_attn.k_proj.bias", 1, kv_out, 0);
+        const unsigned short *vw = mu_engine_get_text_layer_tensor(engine, layer, "self_attn.v_proj.weight", 2, kv_out, hidden);
+        const unsigned short *vb = mu_engine_get_text_layer_tensor(engine, layer, "self_attn.v_proj.bias", 1, kv_out, 0);
+        const unsigned short *ow = mu_engine_get_text_layer_tensor(engine, layer, "self_attn.o_proj.weight", 2, hidden, hidden);
+        const unsigned short *gate_w = mu_engine_get_text_layer_tensor(engine, layer, "mlp.gate_proj.weight", 2, inter, hidden);
+        const unsigned short *up_w = mu_engine_get_text_layer_tensor(engine, layer, "mlp.up_proj.weight", 2, inter, hidden);
+        const unsigned short *down_w = mu_engine_get_text_layer_tensor(engine, layer, "mlp.down_proj.weight", 2, hidden, inter);
+
+        if (!input_norm || !post_norm || !qw || !qb || !kw || !kb || !vw || !vb || !ow || !gate_w || !up_w || !down_w) {
+            return -4;
+        }
+
+        id<MTLBuffer> input_norm_buf = (__bridge id<MTLBuffer>)mu_gpu_get_weight_buf(gpu, input_norm, hidden * sizeof(unsigned short)).ptr;
+        id<MTLBuffer> post_norm_buf = (__bridge id<MTLBuffer>)mu_gpu_get_weight_buf(gpu, post_norm, hidden * sizeof(unsigned short)).ptr;
+        id<MTLBuffer> qw_buf = (__bridge id<MTLBuffer>)mu_gpu_get_weight_buf(gpu, qw, q_out * hidden * sizeof(unsigned short)).ptr;
+        id<MTLBuffer> qb_buf = (__bridge id<MTLBuffer>)mu_gpu_get_weight_buf(gpu, qb, q_out * sizeof(unsigned short)).ptr;
+        id<MTLBuffer> kw_buf = (__bridge id<MTLBuffer>)mu_gpu_get_weight_buf(gpu, kw, kv_out * hidden * sizeof(unsigned short)).ptr;
+        id<MTLBuffer> kb_buf = (__bridge id<MTLBuffer>)mu_gpu_get_weight_buf(gpu, kb, kv_out * sizeof(unsigned short)).ptr;
+        id<MTLBuffer> vw_buf = (__bridge id<MTLBuffer>)mu_gpu_get_weight_buf(gpu, vw, kv_out * hidden * sizeof(unsigned short)).ptr;
+        id<MTLBuffer> vb_buf = (__bridge id<MTLBuffer>)mu_gpu_get_weight_buf(gpu, vb, kv_out * sizeof(unsigned short)).ptr;
+        id<MTLBuffer> ow_buf = (__bridge id<MTLBuffer>)mu_gpu_get_weight_buf(gpu, ow, hidden * hidden * sizeof(unsigned short)).ptr;
+        id<MTLBuffer> gate_w_buf = (__bridge id<MTLBuffer>)mu_gpu_get_weight_buf(gpu, gate_w, inter * hidden * sizeof(unsigned short)).ptr;
+        id<MTLBuffer> up_w_buf = (__bridge id<MTLBuffer>)mu_gpu_get_weight_buf(gpu, up_w, inter * hidden * sizeof(unsigned short)).ptr;
+        id<MTLBuffer> down_w_buf = (__bridge id<MTLBuffer>)mu_gpu_get_weight_buf(gpu, down_w, hidden * inter * sizeof(unsigned short)).ptr;
+
+        if (input_norm_buf) [unique_resources addObject:input_norm_buf];
+        if (post_norm_buf) [unique_resources addObject:post_norm_buf];
+        if (qw_buf) [unique_resources addObject:qw_buf];
+        if (qb_buf) [unique_resources addObject:qb_buf];
+        if (kw_buf) [unique_resources addObject:kw_buf];
+        if (kb_buf) [unique_resources addObject:kb_buf];
+        if (vw_buf) [unique_resources addObject:vw_buf];
+        if (vb_buf) [unique_resources addObject:vb_buf];
+        if (ow_buf) [unique_resources addObject:ow_buf];
+        if (gate_w_buf) [unique_resources addObject:gate_w_buf];
+        if (up_w_buf) [unique_resources addObject:up_w_buf];
+        if (down_w_buf) [unique_resources addObject:down_w_buf];
+
+        NSUInteger normed_offset = offset_a; offset_a += hidden_bytes;
+        NSUInteger q_buf_offset = offset_a;  offset_a += q_out_bytes;
+        NSUInteger k_buf_offset = offset_a;  offset_a += kv_out_bytes;
+        NSUInteger v_buf_offset = offset_a;  offset_a += kv_out_bytes;
+        NSUInteger attn_offset = offset_a;   offset_a += q_out_bytes;
+        offset_a += hidden_bytes; // proj_offset is unused but offset needs to advance
+        NSUInteger hs_buf2_offset = offset_a; offset_a += hidden_bytes;
+        NSUInteger out_hs_offset = offset_a; offset_a += hidden_bytes;
+
+        NSUInteger kv_offset = mu_gpu_kv_cache_offset(cache, layer);
+
+        // 1. RMSNorm (Input Norm)
+        {
+            id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
+            [cmd setComputePipelineState:gpu->rmsnorm_bf16_probe];
+            [cmd setKernelBuffer:gpu->scratch_a offset:cur_hs_offset atIndex:0];
+            [cmd setKernelBuffer:input_norm_buf offset:0 atIndex:1];
+            [cmd setKernelBuffer:gpu->scratch_a offset:normed_offset atIndex:2];
+            [cmd setKernelBuffer:gpu->const_hidden_buf offset:0 atIndex:3];
+            [cmd setKernelBuffer:gpu->const_eps_buf offset:0 atIndex:4];
+
+            NSUInteger width = gpu->rmsnorm_bf16_probe.threadExecutionWidth;
+            if (width < 1) width = 1;
+            if (width > (NSUInteger)hidden) width = (NSUInteger)hidden;
+            [cmd concurrentDispatchThreads:MTLSizeMake((NSUInteger)hidden, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+        }
+
+        // 2. QKV Proj + RoPE Cache Update
+        if (use_qkv_rope_fusion) {
+            id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
+            [cmd setComputePipelineState:gpu->text_decode_qkv_rope_cache_simd];
+            [cmd setKernelBuffer:gpu->scratch_a offset:normed_offset atIndex:0];
+            [cmd setKernelBuffer:qw_buf offset:0 atIndex:1];
+            [cmd setKernelBuffer:qb_buf offset:0 atIndex:2];
+            [cmd setKernelBuffer:kw_buf offset:0 atIndex:3];
+            [cmd setKernelBuffer:kb_buf offset:0 atIndex:4];
+            [cmd setKernelBuffer:vw_buf offset:0 atIndex:5];
+            [cmd setKernelBuffer:vb_buf offset:0 atIndex:6];
+            [cmd setKernelBuffer:gpu->scratch_a offset:q_buf_offset atIndex:7];
+            [cmd setKernelBuffer:cache->k_cache offset:kv_offset atIndex:8];
+            [cmd setKernelBuffer:cache->v_cache offset:kv_offset atIndex:9];
+            [cmd setKernelBuffer:cache->dynamic_params_buf offset:12 atIndex:10]; // cache_pos
+            [cmd setKernelBuffer:cache->dynamic_params_buf offset:0 atIndex:11]; // pos3
+            [cmd setKernelBuffer:cache->dynamic_params_buf offset:20 atIndex:12]; // use_bf16_cache
+            [cmd setKernelBuffer:gpu->const_hidden_buf offset:0 atIndex:13]; // cols
+
+            [cmd concurrentDispatchThreads:MTLSizeMake(32, 1152, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        } else {
+            // Unfused QKV Proj
+            {
+                id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
+                [cmd setComputePipelineState:gpu->text_decode_qkv_proj_simd];
+                [cmd setKernelBuffer:gpu->scratch_a offset:normed_offset atIndex:0];
+                [cmd setKernelBuffer:qw_buf offset:0 atIndex:1];
+                [cmd setKernelBuffer:qb_buf offset:0 atIndex:2];
+                [cmd setKernelBuffer:kw_buf offset:0 atIndex:3];
+                [cmd setKernelBuffer:kb_buf offset:0 atIndex:4];
+                [cmd setKernelBuffer:vw_buf offset:0 atIndex:5];
+                [cmd setKernelBuffer:vb_buf offset:0 atIndex:6];
+                [cmd setKernelBuffer:gpu->scratch_a offset:q_buf_offset atIndex:7];
+                [cmd setKernelBuffer:gpu->scratch_a offset:k_buf_offset atIndex:8];
+                [cmd setKernelBuffer:gpu->scratch_a offset:v_buf_offset atIndex:9];
+                [cmd setKernelBuffer:gpu->const_hidden_buf offset:0 atIndex:10];
+
+                [cmd concurrentDispatchThreads:MTLSizeMake(32, 1152, 1)
+                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            }
+            // RoPE cache update
+            {
+                id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
+                [cmd setComputePipelineState:gpu->text_rope_cache_update];
+                [cmd setKernelBuffer:gpu->scratch_a offset:q_buf_offset atIndex:0];
+                [cmd setKernelBuffer:gpu->scratch_a offset:k_buf_offset atIndex:1];
+                [cmd setKernelBuffer:gpu->scratch_a offset:v_buf_offset atIndex:2];
+                [cmd setKernelBuffer:cache->k_cache offset:kv_offset atIndex:3];
+                [cmd setKernelBuffer:cache->v_cache offset:kv_offset atIndex:4];
+                [cmd setKernelBuffer:cache->dynamic_params_buf offset:0 atIndex:5]; // pos3
+                [cmd setKernelBuffer:cache->dynamic_params_buf offset:12 atIndex:6]; // cache_pos
+                [cmd setKernelBuffer:cache->dynamic_params_buf offset:20 atIndex:7]; // use_bf16_cache
+
+                MTLSize grid = MTLSizeMake(448, 1, 1);
+                NSUInteger width = gpu->text_rope_cache_update.threadExecutionWidth;
+                if (width < 1) width = 1;
+                if (width > 448u) width = 448u;
+                [cmd concurrentDispatchThreads:grid threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+            }
+        }
+
+        // 3. Attention (Cached GQA)
+        {
+            id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
+            bool disable_simd = getenv("MU_TEXT_ATTN_CACHED_NO_SIMD") != NULL;
+            id<MTLComputePipelineState> pstate = (disable_simd || !gpu->text_attn_cached_simd) ? 
+                                                 gpu->text_attn_cached : gpu->text_attn_cached_simd;
+            
+            [cmd setComputePipelineState:pstate];
+            [cmd setKernelBuffer:gpu->scratch_a offset:q_buf_offset atIndex:0];
+            [cmd setKernelBuffer:cache->k_cache offset:kv_offset atIndex:1];
+            [cmd setKernelBuffer:cache->v_cache offset:kv_offset atIndex:2];
+            [cmd setKernelBuffer:gpu->scratch_a offset:attn_offset atIndex:3];
+            [cmd setKernelBuffer:cache->dynamic_params_buf offset:16 atIndex:4]; // cache_len
+            [cmd setKernelBuffer:cache->dynamic_params_buf offset:20 atIndex:5]; // use_bf16_cache
+
+            if (pstate == gpu->text_attn_cached_simd) {
+                [cmd concurrentDispatchThreads:MTLSizeMake(14 * 32, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            } else {
+                [cmd concurrentDispatchThreads:MTLSizeMake(14, 1, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+            }
+        }
+
+        // 4. O-proj + residual add
+        {
+            id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
+            [cmd setComputePipelineState:gpu->dense_probe_add_simd];
+            [cmd setKernelBuffer:gpu->scratch_a offset:attn_offset atIndex:0];
+            [cmd setKernelBuffer:ow_buf offset:0 atIndex:1];
+            [cmd setKernelBuffer:gpu->scratch_a offset:cur_hs_offset atIndex:2];
+            [cmd setKernelBuffer:gpu->scratch_a offset:hs_buf2_offset atIndex:3];
+            [cmd setKernelBuffer:gpu->const_hidden_buf offset:0 atIndex:4]; // cols
+
+            [cmd concurrentDispatchThreads:MTLSizeMake(32, (NSUInteger)hidden, 1)
+                     threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        }
+
+        // 5. Fused FFN (MLP)
+        {
+            id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
+            [cmd setComputePipelineState:gpu->text_decode_fused_ffn];
+            [cmd setKernelBuffer:gpu->scratch_a offset:hs_buf2_offset atIndex:0];
+            [cmd setKernelBuffer:post_norm_buf offset:0 atIndex:1];
+            [cmd setKernelBuffer:gate_w_buf offset:0 atIndex:2];
+            [cmd setKernelBuffer:up_w_buf offset:0 atIndex:3];
+            [cmd setKernelBuffer:down_w_buf offset:0 atIndex:4];
+            [cmd setKernelBuffer:gpu->scratch_a offset:out_hs_offset atIndex:5];
+            [cmd setKernelBuffer:gpu->const_eps_buf offset:0 atIndex:6]; // eps
+
+            [cmd concurrentDispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        }
+
+        cur_hs_offset = out_hs_offset;
+    }
+
+    // Resident classification & argmax
+    {
+        const unsigned short *final_norm = mu_engine_get_final_norm_tensor(engine);
+        const unsigned short *embed = mu_engine_get_embed_tokens_tensor(engine);
+
+        if (!final_norm || !embed) return -5;
+
+        id<MTLBuffer> final_norm_buf = (__bridge id<MTLBuffer>)mu_gpu_get_weight_buf(gpu, final_norm, hidden * sizeof(unsigned short)).ptr;
+        id<MTLBuffer> embed_buf = (__bridge id<MTLBuffer>)mu_gpu_get_weight_buf(gpu, embed, vocab * hidden * sizeof(unsigned short)).ptr;
+
+        if (final_norm_buf) [unique_resources addObject:final_norm_buf];
+        if (embed_buf) [unique_resources addObject:embed_buf];
+
+        NSUInteger out_id_offset = offset_b; offset_b += sizeof(int);
+        NSUInteger out_val_offset = offset_b; offset_b += sizeof(float);
+
+        NSUInteger last_offset = offset_a; offset_a += hidden_bytes;
+        NSUInteger logits_offset = offset_b; offset_b += vocab * sizeof(float);
+
+        // 1. RMSNorm (Final Norm)
+        {
+            id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
+            [cmd setComputePipelineState:gpu->rmsnorm_bf16_rows];
+            [cmd setKernelBuffer:gpu->scratch_a offset:cur_hs_offset atIndex:0];
+            [cmd setKernelBuffer:final_norm_buf offset:0 atIndex:1];
+            [cmd setKernelBuffer:gpu->scratch_a offset:last_offset atIndex:2];
+            [cmd setKernelBuffer:gpu->const_hidden_buf offset:0 atIndex:3];
+            [cmd setKernelBuffer:gpu->const_eps_buf offset:0 atIndex:4];
+
+            NSUInteger width = gpu->rmsnorm_bf16_rows.threadExecutionWidth;
+            if (width < 1) width = 1;
+            if (width > (NSUInteger)hidden) width = (NSUInteger)hidden;
+            [cmd concurrentDispatchThreads:MTLSizeMake((NSUInteger)hidden, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+        }
+
+        // 2. Dense Projection
+        {
+            id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
+            [cmd setComputePipelineState:gpu->dense_f32_rows];
+            [cmd setKernelBuffer:gpu->scratch_a offset:last_offset atIndex:0];
+            [cmd setKernelBuffer:embed_buf offset:0 atIndex:1];
+            [cmd setKernelBuffer:gpu->scratch_b offset:logits_offset atIndex:2];
+            [cmd setKernelBuffer:gpu->const_hidden_buf offset:0 atIndex:3];
+            [cmd setKernelBuffer:gpu->const_vocab_buf offset:0 atIndex:4];
+
+            NSUInteger w_dense = gpu->dense_f32_rows.threadExecutionWidth;
+            if (w_dense < 1) w_dense = 1;
+            if (w_dense > (NSUInteger)vocab) w_dense = (NSUInteger)vocab;
+            [cmd concurrentDispatchThreads:MTLSizeMake((NSUInteger)vocab, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(w_dense, 1, 1)];
+        }
+
+        // 3. Argmax
+        {
+            id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
+            [cmd setComputePipelineState:gpu->argmax_f32];
+            [cmd setKernelBuffer:gpu->scratch_b offset:logits_offset atIndex:0];
+            [cmd setKernelBuffer:gpu->scratch_b offset:out_id_offset atIndex:1];
+            [cmd setKernelBuffer:gpu->scratch_b offset:out_val_offset atIndex:2];
+            [cmd setKernelBuffer:gpu->const_vocab_buf offset:0 atIndex:3];
+
+            [cmd concurrentDispatchThreads:MTLSizeMake(512, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+        }
+    }
+
+    cache->resource_count = unique_resources.count;
+    cache->resources = (__unsafe_unretained id<MTLResource> *)malloc(cache->resource_count * sizeof(id<MTLResource>));
+    NSUInteger r_idx = 0;
+    for (id<MTLResource> res in unique_resources) {
+        cache->resources[r_idx++] = res;
+    }
+
+    cache->icb_recorded = YES;
+    return 0;
+}
+
+int mu_gpu_text_decode_icb_execute(void *engine,
+                                   mu_gpu_kv_cache *cache,
+                                   int cache_pos, const int pos3[3],
+                                   const float *hidden_state_cpu,
+                                   int top_k, void *out_logits) {
+    if (!engine || !cache || !cache->gpu || !hidden_state_cpu || !out_logits || top_k <= 0) return -1;
+    mu_gpu *gpu = cache->gpu;
+
+    // 1. Record lazily if not done
+    if (!cache->icb_recorded) {
+        int record_rc = mu_gpu_text_decode_icb_record(engine, cache);
+        if (record_rc != 0) return record_rc;
+    }
+
+    @autoreleasepool {
+        // 2. Update dynamic parameters buffer
+        struct mu_gpu_decode_dynamic_params params;
+        memcpy(params.pos3, pos3, sizeof(params.pos3));
+        params.cache_pos = cache_pos;
+        params.cache_len = cache_pos + 1;
+        params.use_bf16_cache = (getenv("MU_KV_CACHE_BF16") != NULL) ? 1 : 0;
+        memcpy([cache->dynamic_params_buf contents], &params, sizeof(params));
+
+        // 3. Start command buffer and encoder
+        id<MTLCommandBuffer> command_buffer = [gpu->queue commandBuffer];
+        if (!command_buffer) return -2;
+        id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+        if (!encoder) return -3;
+
+        // Copy input hidden states to scratchpad offset 0
+        memcpy([gpu->scratch_a contents], hidden_state_cpu, 896 * sizeof(float));
+
+        // 4. Mark resources resident on GPU
+        [encoder useResources:cache->resources count:cache->resource_count usage:MTLResourceUsageRead | MTLResourceUsageWrite];
+
+        // 5. Execute pre-recorded ICB commands
+        BOOL use_qkv_rope_fusion = (getenv("MU_TEXT_DECODE_QKV_ROPE_FUSION") != NULL);
+        NSUInteger total_commands = use_qkv_rope_fusion ? (5 * 24 + 3) : (6 * 24 + 3);
+        [encoder executeCommandsInBuffer:cache->decode_icb withRange:NSMakeRange(0, total_commands)];
+
+        [encoder endEncoding];
+        [command_buffer commit];
+        [command_buffer waitUntilCompleted];
+
+        if (command_buffer.status != MTLCommandBufferStatusCompleted) return -4;
+
+        // Copy out results from scratch_b to out_logits
+        int best_id = 0;
+        float best_val = 0.0f;
+        memcpy(&best_id, (char *)[gpu->scratch_b contents], sizeof(int));
+        memcpy(&best_val, (char *)[gpu->scratch_b contents] + sizeof(int), sizeof(float));
+
+        struct mu_token_logit *out = (struct mu_token_logit *)out_logits;
+        out[0].id = best_id;
+        out[0].logit = best_val;
+        for (int i = 1; i < top_k; i++) {
+            out[i].id = -1;
+            out[i].logit = -MAXFLOAT;
+        }
+    }
+
     return 0;
 }

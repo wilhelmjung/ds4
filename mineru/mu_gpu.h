@@ -211,6 +211,8 @@ int mu_gpu_text_logits_argmax(mu_gpu *gpu, const float *hidden_state_cpu,
 const unsigned short *mu_engine_get_vision_block_tensor(void *engine, int layer, const char *suffix, int ndim, unsigned long d0, unsigned long d1);
 const unsigned short *mu_engine_get_vision_merger_tensor(void *engine, const char *name, int ndim, unsigned long d0, unsigned long d1);
 const unsigned short *mu_engine_get_text_layer_tensor(void *engine, int layer, const char *suffix, int ndim, unsigned long d0, unsigned long d1);
+const unsigned short *mu_engine_get_final_norm_tensor(void *engine);
+const unsigned short *mu_engine_get_embed_tokens_tensor(void *engine);
 int mu_gpu_text_layers_mlp_seq(mu_gpu *gpu, void *engine,
                                const int *input_ids, int n_ids,
                                int n_layers, float *out);
@@ -224,5 +226,10 @@ int mu_gpu_text_prefill_cache_from_embeddings(mu_gpu *gpu, void *engine,
                                               int cache_cap,
                                               mu_gpu_kv_cache *gpu_cache,
                                               float *last_hidden_out);
+int mu_gpu_text_decode_icb_execute(void *engine,
+                                   mu_gpu_kv_cache *cache,
+                                   int cache_pos, const int pos3[3],
+                                   const float *hidden_state_cpu,
+                                   int top_k, void *out_logits);
 
 #endif
