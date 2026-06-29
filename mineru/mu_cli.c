@@ -1938,6 +1938,19 @@ typedef struct {
 } mu_work_queue;
 
 typedef struct {
+    mu_engine *engine;
+    const char *path;
+    mu_preprocessed_page *prep;
+    int rc;
+} mu_prefetch_task;
+
+static void *mu_prefetch_thread_fn(void *arg) {
+    mu_prefetch_task *task = (mu_prefetch_task *)arg;
+    task->rc = mu_preprocess_page_cpu(task->engine, task->path, &task->prep);
+    return NULL;
+}
+
+typedef struct {
     mu_work_queue *queue;
     int worker_id;
 } mu_worker_args;
@@ -1950,18 +1963,56 @@ static void *mu_worker_thread_fn(void *arg) {
     mu_gpu_set_thread_worker_id(args->worker_id);
 #endif
 
-    while (1) {
-        int idx = -1;
+    int next_idx = -1;
+    pthread_mutex_lock(&q->mutex);
+    if (q->next_image_idx < q->n_images) {
+        next_idx = q->next_image_idx++;
+    }
+    pthread_mutex_unlock(&q->mutex);
+
+    // Eagerly prefetch the first page synchronously
+    mu_preprocessed_page *curr_prep = NULL;
+    if (next_idx != -1) {
+        int rc = mu_preprocess_page_cpu(q->engine, q->images[next_idx], &curr_prep);
+        if (rc != 0) {
+            fprintf(stderr, "First page prefetch failed for %s: %d\n", q->images[next_idx], rc);
+            pthread_mutex_lock(&q->mutex);
+            q->failed = 1;
+            pthread_mutex_unlock(&q->mutex);
+            return NULL;
+        }
+    }
+
+    while (next_idx != -1) {
+        int curr_idx = next_idx;
+        const char *path = q->images[curr_idx];
+
+        // Retrieve/fetch the next image index
+        int fetch_idx = -1;
         pthread_mutex_lock(&q->mutex);
         if (q->next_image_idx < q->n_images) {
-            idx = q->next_image_idx++;
+            fetch_idx = q->next_image_idx++;
         }
         pthread_mutex_unlock(&q->mutex);
 
-        if (idx == -1) break;
+        // Spawn a background thread to prefetch the next page
+        pthread_t prefetch_thread;
+        mu_prefetch_task prefetch_args;
+        int prefetch_started = 0;
+        if (fetch_idx != -1) {
+            prefetch_args.engine = q->engine;
+            prefetch_args.path = q->images[fetch_idx];
+            prefetch_args.prep = NULL;
+            prefetch_args.rc = 0;
+            if (pthread_create(&prefetch_thread, NULL, mu_prefetch_thread_fn, &prefetch_args) == 0) {
+                prefetch_started = 1;
+            } else {
+                fprintf(stderr, "Failed to spawn prefetch thread for %s, falling back to sync\n", prefetch_args.path);
+                prefetch_args.rc = mu_preprocess_page_cpu(prefetch_args.engine, prefetch_args.path, &prefetch_args.prep);
+            }
+        }
 
-        const char *path = q->images[idx];
-
+        // Process current page on GPU
         char *log_buf = NULL;
         size_t log_size = 0;
         FILE *log_fp = open_memstream(&log_buf, &log_size);
@@ -1973,7 +2024,7 @@ static void *mu_worker_thread_fn(void *arg) {
         }
 
         mu_result *result = NULL;
-        int rc = mu_parse_image_file(q->engine, path, &result);
+        int rc = mu_parse_preprocessed_page(q->engine, curr_prep, &result);
 
         if (log_fp) {
             fprintf(log_fp, "mu_page_end page=%s\n", path);
@@ -1990,13 +2041,33 @@ static void *mu_worker_thread_fn(void *arg) {
             fprintf(stderr, "mu_page_end page=%s\n", path);
         }
 
+        // Wait for prefetch thread to complete
+        mu_preprocessed_page *next_prep = NULL;
+        if (fetch_idx != -1) {
+            if (prefetch_started) {
+                pthread_join(prefetch_thread, NULL);
+            }
+            if (prefetch_args.rc != 0) {
+                fprintf(stderr, "Prefetch failed for %s: %d\n", q->images[fetch_idx], prefetch_args.rc);
+                pthread_mutex_lock(&q->mutex);
+                q->failed = 1;
+                pthread_mutex_unlock(&q->mutex);
+            } else {
+                next_prep = prefetch_args.prep;
+            }
+        }
+
+        // Free current preprocessed page
+        mu_preprocessed_page_free(curr_prep);
+
         if (rc) {
-            fprintf(stderr, "mu_parse_image_file failed for %s: %d\n", path, rc);
+            fprintf(stderr, "mu_parse_preprocessed_page failed for %s: %d\n", path, rc);
             pthread_mutex_lock(&q->mutex);
             q->failed = 1;
             pthread_mutex_unlock(&q->mutex);
             mu_result_free(result);
-            continue;
+            mu_preprocessed_page_free(next_prep);
+            break;
         }
 
         if (q->output_dir) {
@@ -2009,7 +2080,8 @@ static void *mu_worker_thread_fn(void *arg) {
                 q->failed = 1;
                 pthread_mutex_unlock(&q->mutex);
                 mu_result_free(result);
-                continue;
+                mu_preprocessed_page_free(next_prep);
+                break;
             }
             rc = q->write_json ? mu_result_write_json(result, fp)
                                : mu_result_write_markdown(result, fp);
@@ -2029,6 +2101,10 @@ static void *mu_worker_thread_fn(void *arg) {
             pthread_mutex_unlock(&q->mutex);
         }
         mu_result_free(result);
+
+        // Move to the next page
+        curr_prep = next_prep;
+        next_idx = fetch_idx;
     }
     return NULL;
 }

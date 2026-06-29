@@ -142,4 +142,9 @@ int mu_text_generate_greedy_with_image_embeds(mu_engine *e,
 void mu_free(void *ptr);
 void mu_set_thread_log_stream(FILE *fp);
 
+typedef struct mu_preprocessed_page mu_preprocessed_page;
+int mu_preprocess_page_cpu(mu_engine *e, const char *path, mu_preprocessed_page **out_prep);
+void mu_preprocessed_page_free(mu_preprocessed_page *prep);
+int mu_parse_preprocessed_page(mu_engine *e, mu_preprocessed_page *prep, mu_result **out);
+
 #endif
