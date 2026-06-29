@@ -97,7 +97,7 @@
   </g>
 
   <g transform="translate(916 390)">
-    <rect x="0" y="0" width="280" height="656" rx="22" fill="#f8fafc" stroke="#cbd5e1" stroke-width="3"/>
+    <rect x="0" y="0" width="280" height="770" rx="22" fill="#f8fafc" stroke="#cbd5e1" stroke-width="3"/>
     <text x="24" y="48" class="label">Legend</text>
 
     <rect x="28" y="84" width="64" height="44" class="enabled"/>
@@ -121,6 +121,10 @@
     <text x="24" y="596" class="tiny">Dispatches: 145 -> 121/token</text>
     <text x="24" y="626" class="tiny">Correctness: exact</text>
     <text x="24" y="656" class="tiny">Default unchanged: E2E slower</text>
+
+    <text x="24" y="696" class="small">BF16 KV-Cache (Opt-in)</text>
+    <text x="24" y="726" class="tiny">Speedup: ~8.8% E2E faster</text>
+    <text x="24" y="756" class="tiny">Correctness: exact parity</text>
   </g>
 
   <g transform="translate(916 1060)">
