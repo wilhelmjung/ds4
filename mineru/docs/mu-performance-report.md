@@ -4046,3 +4046,22 @@ Specific stage timing improvements:
 Decision:
 - Keep KV-Cache BF16 compression behind the `MU_KV_CACHE_BF16=1` environment variable to ensure bit-exact parity for regression checking (`mu --check-trace`), while allowing users to opt-in for an E2E latency speedup.
 
+### Decoder Dispatch Optimization via Indirect Command Buffers (ICB)
+
+Date: 2026-06-29
+
+We implemented pre-recording of all 147 compute kernel dispatches and buffer bindings during the first decoding step, which are then executed via `executeCommandsInBuffer:withRange:` under the `MU_TEXT_DECODE_ICB=1` environment toggle to eliminate CPU-side driver/encoding overhead.
+
+E2E page benchmark results on Page 224 (sequentially run under identical conditions):
+
+| Path | Completed | Fallback rows | text_generate_decode Total s | Mean s/page | Output Parity |
+| --- | --- | ---: | ---: | ---: | --- |
+| Standard Metal (Default) | 10 / 10 | 0 | 22.037 | 0.2204 | baseline |
+| ICB Enabled (`MU_TEXT_DECODE_ICB=1`) | 10 / 10 | 0 | 21.373 | 0.2137 | exact |
+
+This represents a **~3.0% stage-level performance acceleration** on the text generation decode loops, with **exact output parity** across all benchmark pages.
+
+Decision:
+- Enable Indirect Command Buffer execution when the `MU_TEXT_DECODE_ICB=1` environment variable is provided, offering a clean, driver-level optimization for autoregressive decoding loops.
+
+

@@ -24,14 +24,14 @@
   <rect x="0" y="0" width="1280" height="2040" fill="#fff"/>
 
   <text x="640" y="78" text-anchor="middle" class="title">MinerU Metal Kernel Fusion Progress</text>
-  <text x="640" y="116" text-anchor="middle" class="subtitle">Default path stays stable; opt-in fusion proves dispatch reduction but is not E2E faster yet.</text>
+  <text x="640" y="116" text-anchor="middle" class="subtitle">Default path stays stable; opt-in ICB eliminates driver-side CPU encoding and dispatch overhead.</text>
 
   <g transform="translate(80 146)">
     <rect x="0" y="0" width="1120" height="132" rx="18" fill="#f8fafc" stroke="#cbd5e1" stroke-width="3"/>
     <text x="44" y="48" class="label">Current decode dispatch picture</text>
-    <text x="44" y="86" class="small">Default: 145 kernel dispatches / token</text>
-    <text x="430" y="86" class="small">Opt-in QKV+RoPE+cache: 121 / token</text>
-    <text x="834" y="86" class="metric">-24 dispatches</text>
+    <text x="44" y="86" class="small">Default: 145 dispatches / token</text>
+    <text x="360" y="86" class="small">ICB (Indirect Command Buffer): 1 execution command / token</text>
+    <text x="960" y="86" class="metric">-144 calls</text>
   </g>
 
   <g transform="translate(84 332)">
@@ -97,7 +97,7 @@
   </g>
 
   <g transform="translate(916 390)">
-    <rect x="0" y="0" width="280" height="770" rx="22" fill="#f8fafc" stroke="#cbd5e1" stroke-width="3"/>
+    <rect x="0" y="0" width="280" height="890" rx="22" fill="#f8fafc" stroke="#cbd5e1" stroke-width="3"/>
     <text x="24" y="48" class="label">Legend</text>
 
     <rect x="28" y="84" width="64" height="44" class="enabled"/>
@@ -125,18 +125,22 @@
     <text x="24" y="696" class="small">BF16 KV-Cache (Opt-in)</text>
     <text x="24" y="726" class="tiny">Speedup: ~8.8% E2E faster</text>
     <text x="24" y="756" class="tiny">Correctness: exact parity</text>
+
+    <text x="24" y="806" class="small">Decoder ICB (Opt-in)</text>
+    <text x="24" y="836" class="tiny">MU_TEXT_DECODE_ICB=1</text>
+    <text x="24" y="866" class="tiny">Speedup: ~3.0% decode speedup</text>
   </g>
 
-  <g transform="translate(916 1060)">
+  <g transform="translate(916 1320)">
     <rect x="0" y="0" width="280" height="320" rx="22" fill="#fff7ed" stroke="#fed7aa" stroke-width="3"/>
     <text x="24" y="48" class="label">Next work</text>
-    <text x="24" y="94" class="small">Stop micro-fusing</text>
-    <text x="24" y="132" class="tiny">QKV/RoPE is too small to</text>
-    <text x="24" y="158" class="tiny">move E2E by itself.</text>
-    <text x="24" y="218" class="small">Target bigger groups</text>
-    <text x="24" y="256" class="tiny">Attention / MLP dispatches</text>
-    <text x="24" y="282" class="tiny">or MPS-backed GEMM paths.</text>
+    <text x="24" y="94" class="small">Pre-recorded Loops</text>
+    <text x="24" y="132" class="tiny">ICB is fully implemented.</text>
+    <text x="24" y="158" class="tiny">Next: verify dynamic shapes</text>
+    <text x="24" y="218" class="small">Decoder optimization</text>
+    <text x="24" y="256" class="tiny">Pre-record multi-page paths</text>
+    <text x="24" y="282" class="tiny">or profile vision tower SDPA.</text>
   </g>
 
-  <text x="640" y="1988" text-anchor="middle" class="subtitle">Status: correctness exact, dispatch count improved in opt-in path, default path unchanged until E2E wins.</text>
+  <text x="640" y="1988" text-anchor="middle" class="subtitle">Status: correctness exact, decoder ICB eliminates dispatch loops, custom MSL remains default.</text>
 </svg>

@@ -30,3 +30,10 @@ This guide compiles key architectural patterns and lessons learned during the op
 - **Why**: Halves the VRAM memory footprint and memory bandwidth usage for KV cache lookups. For bandwidth-bound text decoding, this reduces E2E inference times (achieved an **~8.8% E2E speedup** on layout page extraction).
 - **Implementation Detail**: Round FP32 values to BF16 (nearest even) during storage using a fast bitwise operation `(bits >> 16)` with rounding offset. Read and convert back dynamically inside the shader using the dynamic loader helper `mu_load_cache`. To avoid regression trace discrepancies, keep it optional via the toggle.
 
+## 6. Indirect Command Buffers (ICB) for Autoregressive Decoding
+- **Rule**: For repetitive, multi-kernel dispatch sequences (like VLM/LLM autoregressive decoding steps), pre-record all compute kernel dispatches, pipeline bindings, and static resources into a single `MTLIndirectCommandBuffer` during the first step, and execute it using `executeCommandsInBuffer:withRange:` under toggle `MU_TEXT_DECODE_ICB=1`.
+- **Dynamic Parameters**: Since `MTLIndirectComputeCommand` does not support binding dynamic host variables directly via `setBytes:`, pack all dynamic values (e.g. `pos3`, `cache_pos`, `cache_len`, `use_bf16_cache`) into a unified struct `mu_gpu_decode_dynamic_params` mapped to a shared buffer, updating the buffer values on CPU before executing the ICB.
+- **Compute Barriers**: By default, compute commands in an ICB are dispatched concurrently. To enforce sequential execution order and prevent data hazards between dependent layers, call `[cmd setBarrier]` sequentially on all indirect commands (except the first one).
+- **Pipeline Setup**: Ensure all target compute pipelines are created using `MTLComputePipelineDescriptor` with `supportIndirectCommandBuffers = YES` enabled, otherwise calling `setComputePipelineState:` on an indirect command will crash (EXC_BAD_ACCESS).
+
+
