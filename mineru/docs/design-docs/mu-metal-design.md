@@ -496,6 +496,10 @@ To achieve parity or superior performance compared to PyTorch/MPS and Apple MLX,
 - **Problem**: Loading Metal kernels from source strings at runtime via JIT compilation (`newLibraryWithSource`) introduces startup delays and stutter.
 - **Strategy**: Compile `.metal` source files to binary `.metallib` files at build time using the Xcode Command Line tools (`xcrun -sdk macosx metal`). Load the pre-compiled `.metallib` directly at startup, eliminating JIT compilation overhead.
 
+### 9. CPU-GPU Asynchronous Pipeline Overlapping
+- **Problem**: In multi-page parsing, PDF page rendering, image loading, resizing, patch embedding, and tokenization are performed entirely on the CPU. Running these sequentially with GPU layout generation and content decode causes CPU/GPU idle periods, resulting in a performance bottleneck.
+- **Strategy**: Partition page parsing into `mu_preprocess_page_cpu` (pure CPU preprocessing) and `mu_parse_preprocessed_page` (GPU execution). Double-buffer the pipeline by spawning a background prefetch thread using standard `pthread_create` to run `mu_preprocess_page_cpu` for Page $idx + 1$ concurrently with the main thread executing `mu_parse_preprocessed_page` for Page $idx$. This completely hides the CPU-bound loading and scaling latency behind VLM GPU execution.
+
 ## Implementation Milestones
 
 ### Milestone 1: Backend Shell
