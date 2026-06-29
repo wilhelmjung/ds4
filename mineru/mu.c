@@ -6800,7 +6800,28 @@ int mu_preprocess_page_cpu(mu_engine *e, const char *path, mu_preprocessed_page 
             return -20;
         }
 
-        rc = mu_vision_patch_embed(e, &prep->tokens, prep->patch_embeds, prep->tokens.rows, 1280);
+        int timing = mu_timing_enabled();
+        double stage_start = mu_time_now_seconds();
+        int patch_embed_gpu_success = 0;
+#if defined(__APPLE__)
+        if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+            const mu_tensor *tw = mu_tensor_by_name(e, "visual.patch_embed.proj.weight");
+            if (tw && tw->ndim == 5 &&
+                tw->shape[0] == 1280 && tw->shape[1] == 3 &&
+                tw->shape[2] == 2 && tw->shape[3] == 14 && tw->shape[4] == 14) {
+                rc = mu_gpu_vision_patch_embed(e->gpu, prep->tokens.values, (const unsigned short *)tw->data,
+                                               prep->tokens.rows, 1176, 1280, prep->patch_embeds);
+                if (rc == 0) {
+                    patch_embed_gpu_success = 1;
+                }
+            }
+        }
+#endif
+        if (!patch_embed_gpu_success) {
+            rc = mu_vision_patch_embed(e, &prep->tokens, prep->patch_embeds, prep->tokens.rows, 1280);
+        }
+        mu_timing_log_stage(timing, "layout_vision_patch_embed", stage_start);
+
         if (rc == 0) {
             rc = mu_vision_rotary_pos_emb(e, prep->tokens.grid_t, prep->tokens.grid_h, prep->tokens.grid_w,
                                           prep->rotary, prep->tokens.rows, 40);

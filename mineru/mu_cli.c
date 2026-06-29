@@ -1942,10 +1942,14 @@ typedef struct {
     const char *path;
     mu_preprocessed_page *prep;
     int rc;
+    int worker_id;
 } mu_prefetch_task;
 
 static void *mu_prefetch_thread_fn(void *arg) {
     mu_prefetch_task *task = (mu_prefetch_task *)arg;
+#ifdef __APPLE__
+    mu_gpu_set_thread_worker_id(task->worker_id);
+#endif
     task->rc = mu_preprocess_page_cpu(task->engine, task->path, &task->prep);
     return NULL;
 }
@@ -1973,7 +1977,13 @@ static void *mu_worker_thread_fn(void *arg) {
     // Eagerly prefetch the first page synchronously
     mu_preprocessed_page *curr_prep = NULL;
     if (next_idx != -1) {
+#ifdef __APPLE__
+        mu_gpu_set_thread_worker_id(args->worker_id + q->max_workers);
+#endif
         int rc = mu_preprocess_page_cpu(q->engine, q->images[next_idx], &curr_prep);
+#ifdef __APPLE__
+        mu_gpu_set_thread_worker_id(args->worker_id);
+#endif
         if (rc != 0) {
             fprintf(stderr, "First page prefetch failed for %s: %d\n", q->images[next_idx], rc);
             pthread_mutex_lock(&q->mutex);
@@ -2004,11 +2014,18 @@ static void *mu_worker_thread_fn(void *arg) {
             prefetch_args.path = q->images[fetch_idx];
             prefetch_args.prep = NULL;
             prefetch_args.rc = 0;
+            prefetch_args.worker_id = args->worker_id + q->max_workers;
             if (pthread_create(&prefetch_thread, NULL, mu_prefetch_thread_fn, &prefetch_args) == 0) {
                 prefetch_started = 1;
             } else {
                 fprintf(stderr, "Failed to spawn prefetch thread for %s, falling back to sync\n", prefetch_args.path);
+#ifdef __APPLE__
+                mu_gpu_set_thread_worker_id(args->worker_id + q->max_workers);
+#endif
                 prefetch_args.rc = mu_preprocess_page_cpu(prefetch_args.engine, prefetch_args.path, &prefetch_args.prep);
+#ifdef __APPLE__
+                mu_gpu_set_thread_worker_id(args->worker_id);
+#endif
             }
         }
 
@@ -2258,7 +2275,7 @@ int main(int argc, char **argv) {
     if (image_path) {
         if (n_images > 1 || output_dir) {
             char num_workers_str[32];
-            snprintf(num_workers_str, sizeof(num_workers_str), "%d", n_threads);
+            snprintf(num_workers_str, sizeof(num_workers_str), "%d", n_threads * 2);
             setenv("MU_CONCURRENT_WORKERS", num_workers_str, 1);
 
             mu_work_queue queue;

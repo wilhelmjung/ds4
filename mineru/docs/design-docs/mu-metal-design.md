@@ -500,6 +500,10 @@ To achieve parity or superior performance compared to PyTorch/MPS and Apple MLX,
 - **Problem**: In multi-page parsing, PDF page rendering, image loading, resizing, patch embedding, and tokenization are performed entirely on the CPU. Running these sequentially with GPU layout generation and content decode causes CPU/GPU idle periods, resulting in a performance bottleneck.
 - **Strategy**: Partition page parsing into `mu_preprocess_page_cpu` (pure CPU preprocessing) and `mu_parse_preprocessed_page` (GPU execution). Double-buffer the pipeline by spawning a background prefetch thread using standard `pthread_create` to run `mu_preprocess_page_cpu` for Page $idx + 1$ concurrently with the main thread executing `mu_parse_preprocessed_page` for Page $idx$. This completely hides the CPU-bound loading and scaling latency behind VLM GPU execution.
 
+### 10. Vision Patch Embedding on GPU
+- **Problem**: The convolutional patch embedding (`mu_vision_patch_embed`) is a matrix multiplication `[rows, 1176] * [1280, 1176]` executed on the CPU, taking up to 0.4s per page. Copying the resulting large `patch_embeds` tensor (28MB) to the GPU also introduces substantial memory transfer overhead.
+- **Strategy**: Upload the raw preprocessed patch inputs (6.4MB) to the GPU and execute the matrix multiplication directly on GPU cores using the custom MSL GEMM kernels. This reduces Host-to-Device VRAM bandwidth traffic by 4.3x and speeds up patch embedding computation to less than 1ms.
+
 ## Implementation Milestones
 
 ### Milestone 1: Backend Shell

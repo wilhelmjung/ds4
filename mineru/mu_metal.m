@@ -1452,6 +1452,40 @@ int mu_gpu_dense_bf16_bias_rows(mu_gpu *gpu, const float *x,
     return rc;
 }
 
+int mu_gpu_vision_patch_embed(mu_gpu *gpu, const float *x,
+                              const unsigned short *w_bf16,
+                              int x_rows, int cols, int out_cols,
+                              float *out) {
+    mu_gpu_cmd_ctx *ctx = NULL;
+    int rc = mu_gpu_cmd_begin(gpu, &ctx);
+    if (rc != 0) return rc;
+    NSUInteger x_bytes = (NSUInteger)x_rows * (NSUInteger)cols * sizeof(float);
+    NSUInteger w_bytes = (NSUInteger)out_cols * (NSUInteger)cols * sizeof(unsigned short);
+    NSUInteger bias_bytes = (NSUInteger)out_cols * sizeof(unsigned short);
+    NSUInteger out_bytes = (NSUInteger)x_rows * (NSUInteger)out_cols * sizeof(float);
+    
+    unsigned short *bias_zero = (unsigned short *)calloc(out_cols, sizeof(unsigned short));
+    if (!bias_zero) { mu_gpu_cmd_discard(ctx); return -2; }
+
+    mu_gpu_buf x_buf = mu_gpu_scratch_alloc_a_ctx(ctx, x_bytes);
+    mu_gpu_buf w_buf = mu_gpu_get_weight_buf(gpu, w_bf16, w_bytes);
+    mu_gpu_buf bias_buf = mu_gpu_get_weight_buf(gpu, bias_zero, bias_bytes);
+    mu_gpu_buf out_buf = mu_gpu_scratch_alloc_b_ctx(ctx, out_bytes);
+    if (!x_buf.ptr || !w_buf.ptr || !bias_buf.ptr || !out_buf.ptr) {
+        free(bias_zero);
+        mu_gpu_cmd_discard(ctx);
+        return -3;
+    }
+    mu_gpu_buf_copy_to(x_buf, x, x_bytes);
+    rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, x_buf, w_buf, bias_buf, x_rows, cols, out_cols, out_buf);
+    if (rc == 0) {
+        rc = mu_gpu_cmd_commit_and_wait(ctx);
+        if (rc == 0) mu_gpu_buf_copy_from(out, out_buf, out_bytes);
+    } else { mu_gpu_cmd_discard(ctx); }
+    free(bias_zero);
+    return rc;
+}
+
 int mu_gpu_rmsnorm_probe(mu_gpu *gpu, const float *x, const float *weight,
                          int n, float eps, float *out) {
     if (!gpu || !gpu->device || !gpu->queue || !gpu->rmsnorm_probe) return -1;

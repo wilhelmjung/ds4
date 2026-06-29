@@ -38,6 +38,10 @@ int mu_gpu_dense_bf16_bias_rows(mu_gpu *gpu, const float *x,
                                 const unsigned short *bias_bf16,
                                 int x_rows, int cols, int out_cols,
                                 float *out);
+int mu_gpu_vision_patch_embed(mu_gpu *gpu, const float *x,
+                              const unsigned short *w_bf16,
+                              int x_rows, int cols, int out_cols,
+                              float *out);
 int mu_gpu_rmsnorm_probe(mu_gpu *gpu, const float *x, const float *weight,
                          int n, float eps, float *out);
 int mu_gpu_rmsnorm_bf16_probe(mu_gpu *gpu, const float *x,
