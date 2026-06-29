@@ -2,6 +2,9 @@
 #define MU_GPU_H
 
 #include <stdbool.h>
+#include <stdint.h>
+
+uint16_t mu_f32_to_bf16(float f);
 
 typedef struct mu_gpu mu_gpu;
 typedef struct mu_gpu_kv_cache mu_gpu_kv_cache;

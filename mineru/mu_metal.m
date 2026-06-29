@@ -166,6 +166,8 @@ struct mu_gpu_kv_cache {
     int cap;
 };
 
+static inline NSUInteger mu_gpu_kv_cache_offset(mu_gpu_kv_cache *cache, int layer);
+
 static bool mu_gpu_dense_mps_shape(int cols, int out_cols);
 
 static MPSMatrixMultiplication *mu_gpu_dense_mps_kernel(mu_gpu *gpu,
@@ -2493,6 +2495,8 @@ static int mu_gpu_text_layers_mlp_seq_engine(mu_gpu *gpu, void *engine,
                 [ctx->encoder setBytes:&n_ids length:sizeof(n_ids) atIndex:5];
                 [ctx->encoder setBytes:&cache_cap length:sizeof(cache_cap) atIndex:6];
                 [ctx->encoder setBytes:&layer length:sizeof(layer) atIndex:7];
+                BOOL use_bf16_cache = (getenv("MU_KV_CACHE_BF16") != NULL);
+                [ctx->encoder setBytes:&use_bf16_cache length:sizeof(use_bf16_cache) atIndex:8];
 
                 MTLSize grid = MTLSizeMake((NSUInteger)n_ids, 2, 1);
                 MTLSize threads = MTLSizeMake(1, 2, 1);
@@ -2500,6 +2504,7 @@ static int mu_gpu_text_layers_mlp_seq_engine(mu_gpu *gpu, void *engine,
             }
 
             if (use_prefill_flash) {
+                BOOL use_bf16_cache = (getenv("MU_KV_CACHE_BF16") != NULL);
                 if (position_ids) {
                     id<MTLComputePipelineState> pstate = gpu->text_prefill_attn_pos_flash_opt;
                     if (getenv("MU_TEXT_PREFILL_ATTN_NO_OPT") != NULL || !pstate) {
@@ -2514,6 +2519,7 @@ static int mu_gpu_text_layers_mlp_seq_engine(mu_gpu *gpu, void *engine,
                     [ctx->encoder setBytes:&n_ids length:sizeof(n_ids) atIndex:5];
                     [ctx->encoder setBytes:&cache_cap length:sizeof(cache_cap) atIndex:6];
                     [ctx->encoder setBytes:&layer length:sizeof(layer) atIndex:7];
+                    [ctx->encoder setBytes:&use_bf16_cache length:sizeof(use_bf16_cache) atIndex:8];
                 } else {
                     id<MTLComputePipelineState> pstate = gpu->text_prefill_attn_flash_opt;
                     if (getenv("MU_TEXT_PREFILL_ATTN_NO_OPT") != NULL || !pstate) {
@@ -2527,6 +2533,7 @@ static int mu_gpu_text_layers_mlp_seq_engine(mu_gpu *gpu, void *engine,
                     [ctx->encoder setBytes:&n_ids length:sizeof(n_ids) atIndex:4];
                     [ctx->encoder setBytes:&cache_cap length:sizeof(cache_cap) atIndex:5];
                     [ctx->encoder setBytes:&layer length:sizeof(layer) atIndex:6];
+                    [ctx->encoder setBytes:&use_bf16_cache length:sizeof(use_bf16_cache) atIndex:7];
                 }
                 MTLSize grid = MTLSizeMake(((NSUInteger)n_ids + 31u) / 32u, 14, 1);
                 MTLSize threads = MTLSizeMake(32, 1, 1);
@@ -2924,7 +2931,7 @@ int mu_gpu_text_decode_qkv_rope_cache_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x,
     id<MTLBuffer> vw_buf = (__bridge id<MTLBuffer>)vw.ptr;
     id<MTLBuffer> vb_buf = (__bridge id<MTLBuffer>)vb.ptr;
     id<MTLBuffer> q_out_buf = (__bridge id<MTLBuffer>)q_out.ptr;
-    NSUInteger kv_offset = (NSUInteger)layer * (NSUInteger)cache->cap * 128u * sizeof(float);
+    NSUInteger kv_offset = mu_gpu_kv_cache_offset(cache, layer);
 
     [ctx->encoder setComputePipelineState:ctx->gpu->text_decode_qkv_rope_cache_simd];
     [ctx->encoder setBuffer:x_buf offset:x.offset atIndex:0];
@@ -2940,6 +2947,8 @@ int mu_gpu_text_decode_qkv_rope_cache_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x,
     [ctx->encoder setBytes:pos3 length:3 * sizeof(pos3[0]) atIndex:10];
     [ctx->encoder setBytes:&cache_pos length:sizeof(cache_pos) atIndex:11];
     [ctx->encoder setBytes:&cols length:sizeof(cols) atIndex:12];
+    BOOL use_bf16_cache = (getenv("MU_KV_CACHE_BF16") != NULL);
+    [ctx->encoder setBytes:&use_bf16_cache length:sizeof(use_bf16_cache) atIndex:13];
 
     MTLSize grid = MTLSizeMake(32, 640, 1);
     MTLSize threads = MTLSizeMake(32, 1, 1);
@@ -4042,6 +4051,12 @@ int mu_gpu_vision_fused_ffn_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf hs_in,
 }
 
 
+static inline NSUInteger mu_gpu_kv_cache_offset(mu_gpu_kv_cache *cache, int layer) {
+    bool use_bf16 = (getenv("MU_KV_CACHE_BF16") != NULL);
+    NSUInteger elem_size = use_bf16 ? sizeof(uint16_t) : sizeof(float);
+    return (NSUInteger)layer * (NSUInteger)cache->cap * 128u * elem_size;
+}
+
 int mu_gpu_kv_cache_create(mu_gpu *gpu, int layers, int cap, mu_gpu_kv_cache **out) {
     if (!gpu || layers <= 0 || cap <= 0 || !out) return -1;
     mu_gpu_kv_cache *cache = (mu_gpu_kv_cache *)calloc(1, sizeof(*cache));
@@ -4051,7 +4066,9 @@ int mu_gpu_kv_cache_create(mu_gpu *gpu, int layers, int cap, mu_gpu_kv_cache **o
     cache->layers = layers;
     cache->cap = cap;
 
-    NSUInteger bytes = (NSUInteger)layers * (NSUInteger)cap * 128u * sizeof(float);
+    bool use_bf16 = (getenv("MU_KV_CACHE_BF16") != NULL);
+    NSUInteger elem_size = use_bf16 ? sizeof(uint16_t) : sizeof(float);
+    NSUInteger bytes = (NSUInteger)layers * (NSUInteger)cap * 128u * elem_size;
     cache->k_cache = [gpu->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
     cache->v_cache = [gpu->device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
 
@@ -4076,26 +4093,62 @@ void mu_gpu_kv_cache_destroy(mu_gpu_kv_cache *cache) {
 int mu_gpu_kv_cache_update_layer(mu_gpu_kv_cache *cache, int layer, int pos, const float *k_val, const float *v_val) {
     if (!cache || layer < 0 || layer >= cache->layers || pos < 0 || pos >= cache->cap) return -1;
 
+    bool use_bf16 = (getenv("MU_KV_CACHE_BF16") != NULL);
     size_t offset = ((size_t)layer * (size_t)cache->cap + (size_t)pos) * 128u;
-    if (k_val) {
+
+    if (use_bf16) {
+        uint16_t *k_ptr = (uint16_t *)[cache->k_cache contents] + offset;
+        uint16_t *v_ptr = (uint16_t *)[cache->v_cache contents] + offset;
+        if (k_val) {
+            for (int i = 0; i < 128; i++) {
+                k_ptr[i] = mu_f32_to_bf16(k_val[i]);
+            }
+        }
+        if (v_val) {
+            for (int i = 0; i < 128; i++) {
+                v_ptr[i] = mu_f32_to_bf16(v_val[i]);
+            }
+        }
+    } else {
         float *k_ptr = (float *)[cache->k_cache contents] + offset;
-        memcpy(k_ptr, k_val, 128u * sizeof(float));
-    }
-    if (v_val) {
         float *v_ptr = (float *)[cache->v_cache contents] + offset;
-        memcpy(v_ptr, v_val, 128u * sizeof(float));
+        if (k_val) {
+            memcpy(k_ptr, k_val, 128u * sizeof(float));
+        }
+        if (v_val) {
+            memcpy(v_ptr, v_val, 128u * sizeof(float));
+        }
     }
     return 0;
 }
 
 int mu_gpu_kv_cache_upload_all(mu_gpu_kv_cache *cache, const float *k_cpu, const float *v_cpu) {
     if (!cache) return -1;
-    NSUInteger bytes = (NSUInteger)cache->layers * (NSUInteger)cache->cap * 128u * sizeof(float);
-    if (k_cpu) {
-        memcpy([cache->k_cache contents], k_cpu, bytes);
-    }
-    if (v_cpu) {
-        memcpy([cache->v_cache contents], v_cpu, bytes);
+    bool use_bf16 = (getenv("MU_KV_CACHE_BF16") != NULL);
+    NSUInteger elem_size = use_bf16 ? sizeof(uint16_t) : sizeof(float);
+    NSUInteger bytes = (NSUInteger)cache->layers * (NSUInteger)cache->cap * 128u * elem_size;
+    size_t total_elements = (size_t)cache->layers * (size_t)cache->cap * 128u;
+
+    if (use_bf16) {
+        if (k_cpu) {
+            uint16_t *k_ptr = (uint16_t *)[cache->k_cache contents];
+            for (size_t i = 0; i < total_elements; i++) {
+                k_ptr[i] = mu_f32_to_bf16(k_cpu[i]);
+            }
+        }
+        if (v_cpu) {
+            uint16_t *v_ptr = (uint16_t *)[cache->v_cache contents];
+            for (size_t i = 0; i < total_elements; i++) {
+                v_ptr[i] = mu_f32_to_bf16(v_cpu[i]);
+            }
+        }
+    } else {
+        if (k_cpu) {
+            memcpy([cache->k_cache contents], k_cpu, bytes);
+        }
+        if (v_cpu) {
+            memcpy([cache->v_cache contents], v_cpu, bytes);
+        }
     }
     return 0;
 }
@@ -4113,7 +4166,7 @@ int mu_gpu_text_rope_cache_update_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
     id<MTLBuffer> q_buf = (__bridge id<MTLBuffer>)q.ptr;
     id<MTLBuffer> k_buf = (__bridge id<MTLBuffer>)k.ptr;
     id<MTLBuffer> v_buf = (__bridge id<MTLBuffer>)v.ptr;
-    NSUInteger kv_offset = (NSUInteger)layer * (NSUInteger)cache->cap * 128u * sizeof(float);
+    NSUInteger kv_offset = mu_gpu_kv_cache_offset(cache, layer);
 
     [ctx->encoder setComputePipelineState:ctx->gpu->text_rope_cache_update];
     [ctx->encoder setBuffer:q_buf offset:q.offset atIndex:0];
@@ -4123,6 +4176,8 @@ int mu_gpu_text_rope_cache_update_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
     [ctx->encoder setBuffer:cache->v_cache offset:kv_offset atIndex:4];
     [ctx->encoder setBytes:pos3 length:3 * sizeof(pos3[0]) atIndex:5];
     [ctx->encoder setBytes:&cache_pos length:sizeof(cache_pos) atIndex:6];
+    BOOL use_bf16_cache = (getenv("MU_KV_CACHE_BF16") != NULL);
+    [ctx->encoder setBytes:&use_bf16_cache length:sizeof(use_bf16_cache) atIndex:7];
 
     MTLSize grid = MTLSizeMake(448, 1, 1);
     NSUInteger width = ctx->gpu->text_rope_cache_update.threadExecutionWidth;
@@ -4140,8 +4195,9 @@ int mu_gpu_text_attn_cached_resident_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
     id<MTLBuffer> q_buf = (__bridge id<MTLBuffer>)q.ptr;
     id<MTLBuffer> out_buf = (__bridge id<MTLBuffer>)out.ptr;
 
-    NSUInteger kv_offset = (NSUInteger)layer * (NSUInteger)cache->cap * 128u * sizeof(float);
+    NSUInteger kv_offset = mu_gpu_kv_cache_offset(cache, layer);
 
+    BOOL use_bf16_cache = (getenv("MU_KV_CACHE_BF16") != NULL);
     bool disable_simd = getenv("MU_TEXT_ATTN_CACHED_NO_SIMD") != NULL;
     bool use_simd = !disable_simd;
     if (use_simd && ctx->gpu->text_attn_cached_simd) {
@@ -4151,6 +4207,7 @@ int mu_gpu_text_attn_cached_resident_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
         [ctx->encoder setBuffer:cache->v_cache offset:kv_offset atIndex:2];
         [ctx->encoder setBuffer:out_buf offset:out.offset atIndex:3];
         [ctx->encoder setBytes:&cache_len length:sizeof(cache_len) atIndex:4];
+        [ctx->encoder setBytes:&use_bf16_cache length:sizeof(use_bf16_cache) atIndex:5];
 
         MTLSize grid = MTLSizeMake(14 * 32, 1, 1);
         MTLSize threads = MTLSizeMake(32, 1, 1);
@@ -4162,6 +4219,7 @@ int mu_gpu_text_attn_cached_resident_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
         [ctx->encoder setBuffer:cache->v_cache offset:kv_offset atIndex:2];
         [ctx->encoder setBuffer:out_buf offset:out.offset atIndex:3];
         [ctx->encoder setBytes:&cache_len length:sizeof(cache_len) atIndex:4];
+        [ctx->encoder setBytes:&use_bf16_cache length:sizeof(use_bf16_cache) atIndex:5];
 
         MTLSize grid = MTLSizeMake(14, 1, 1);
         MTLSize threads = MTLSizeMake(1, 1, 1);

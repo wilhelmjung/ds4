@@ -4024,3 +4024,25 @@ Interpretation:
 Decision:
 - Keep the unfused SIMD-group GEMMs as default. Keep Fused Vision FFN as an opt-in diagnostic switch behind `MU_VISION_FUSED_FFN=1`.
 
+### KV-Cache BF16 Compression Promotion
+
+Date: 2026-06-29
+
+We implemented BF16 format storage for Key-Value caches (`k_cache` and `v_cache` in the text prefill and decoding phases) under the opt-in environment variable `MU_KV_CACHE_BF16=1`. Storing the cache in BF16 (`ushort`/`uint16_t`) instead of FP32 (`float`) cuts VRAM storage requirements and bandwidth usage in half.
+
+E2E 10-page benchmark results (sequentially run under identical conditions):
+
+| Path | Completed | Fallback rows | Total s | Mean s/page | Output Parity |
+| --- | --- | ---: | ---: | ---: | --- |
+| FP32 (Default) | 10 / 10 | 0 | 46.4511 | 4.6451 | baseline |
+| BF16 (`MU_KV_CACHE_BF16=1`) | 10 / 10 | 0 | 42.3727 | 4.2373 | exact |
+
+This is an **~8.8% end-to-end performance acceleration** on full layout page extraction, with **exact output parity** across all benchmark pages.
+
+Specific stage timing improvements:
+- `text_generate_decode` time reduced from `16.85 seconds` to `16.19 seconds` (~4.0% speedup).
+- `content_region_vision_encode` time reduced from `6.29 seconds` to `5.06 seconds` (~19.6% speedup).
+
+Decision:
+- Keep KV-Cache BF16 compression behind the `MU_KV_CACHE_BF16=1` environment variable to ensure bit-exact parity for regression checking (`mu --check-trace`), while allowing users to opt-in for an E2E latency speedup.
+

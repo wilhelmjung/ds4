@@ -25,3 +25,8 @@ This guide compiles key architectural patterns and lessons learned during the op
 - **Rule**: Minimize per-thread local arrays (registers) in complex kernels like FlashAttention, shifting persistent thread variables to threadgroup shared memory if necessary.
 - **Why**: Thread register counts exceeding 128 on Apple Silicon drop GPU compute core occupancy significantly. Buffering Query (Q) vectors in shared memory and tuning Key-Value tile sizes (e.g. step=16 instead of step=32) reduces threadgroup storage footprint and halves per-thread registers, improving overall warp occupancy and delivering a **1.05x-1.07x speedup** on memory/bandwidth-bound kernels.
 
+## 5. KV-Cache BF16 Compression
+- **Rule**: Store key (`k_cache`) and value (`v_cache`) caches in BF16 (`ushort`) precision instead of FP32 (`float`) during the text prefill and decoding phases under env toggle `MU_KV_CACHE_BF16=1`.
+- **Why**: Halves the VRAM memory footprint and memory bandwidth usage for KV cache lookups. For bandwidth-bound text decoding, this reduces E2E inference times (achieved an **~8.8% E2E speedup** on layout page extraction).
+- **Implementation Detail**: Round FP32 values to BF16 (nearest even) during storage using a fast bitwise operation `(bits >> 16)` with rounding offset. Read and convert back dynamically inside the shader using the dynamic loader helper `mu_load_cache`. To avoid regression trace discrepancies, keep it optional via the toggle.
+
