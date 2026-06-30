@@ -503,3 +503,35 @@ Below is the updated 10-page performance validation table, comparing the **PyTor
 | Page 334 | 15.62s | 15.33s | 1.02x | 48.40s | 0.32x |
 | **Total** | **712.34s** | **226.53s** | **3.14x** | **497.25s** | **1.43x** |
 | **Mean** | **71.23s** | **22.65s** | **3.14x** | **49.72s** | **1.43x** |
+
+---
+
+## 24. Phase 24: CLI Optimization Flags & Automated Makefile Regression Tests
+
+We integrated the advanced optimization parameters as first-class CLI parameters and established automated correctness checks within the project test suite.
+
+### Implementation Details
+1. **CLI Flags**: Added parsing support for `--kv-cache-bf16` and `--use-icb` in [mu_cli.c](file:///Users/will/github/ds4/mineru/mu_cli.c#L2185-L2191) which programmatically set their respective environment variables at startup.
+2. **Benchmark forwarding**: Updated [mu_benchmark_pages.py](file:///Users/will/github/ds4/mineru/tests/mu_benchmark_pages.py#L287-L291) to forward these arguments to the subprocess execution if passed.
+3. **Correctness Regression Test**: Created [mu_regress_check.py](file:///Users/will/github/ds4/mineru/tests/mu_regress_check.py) which renders page 224 from the NASA PDF, executes both single-threaded (`--threads 1`) and concurrent (`--threads 4`) layout extractions with the optimization switches active, and asserts layout block counts and types match the reference exactly.
+4. **Makefile Target Integration**: Added `mu-regress` target to the [Makefile](file:///Users/will/github/ds4/Makefile#L231-L236) and linked it to the `mu-test` suite.
+5. **VRAM Memory Leak Prevention**: Wrapped `mu_gpu_destroy` inside an `@autoreleasepool` block in [mu_metal.m](file:///Users/will/github/ds4/mineru/mu_metal.m#L1106-L1213) to force immediate VRAM buffer collection.
+6. **Shared GPU Context for Tests**: Refactored [mu_test.c](file:///Users/will/github/ds4/mineru/tests/mu_test.c) to share a single global GPU context (`global_gpu`) instead of creating/destroying 17 contexts sequentially, preventing VRAM cache collisions and process OOM crashes (`Killed: 9`).
+
+### Verification Results
+Running `make mu-test` successfully compiles the test executable, runs C unit tests, and executes the python correctness check, returning a warning-free clean build and 100% success status:
+```text
+mu_test ok
+make mu-regress
+python mu_regress_check.py
+Rendering reference page 224...
+--- Test 1: Single Thread ---
+Running: /Users/will/github/ds4/mu --backend metal ... --kv-cache-bf16 --use-icb --threads 1
+Success: Correctness verified for page_224.json (blocks=3, types=['table', 'footer', 'page_number']).
+--- Test 2: Concurrent Threads (threads=4) ---
+Running: /Users/will/github/ds4/mu --backend metal ... --kv-cache-bf16 --use-icb --threads 4
+Success: Correctness verified for page_224.json (blocks=3, types=['table', 'footer', 'page_number']).
+Success: Correctness verified for page_224_copy.json (blocks=3, types=['table', 'footer', 'page_number']).
+ALL REGRESSION CHECKS PASSED SUCCESSFULLY!
+```
+

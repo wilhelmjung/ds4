@@ -4133,4 +4133,18 @@ Implementation details:
    | **Total** | **712.34s** | **226.53s** | **3.14x** | **497.25s** | **1.43x** |
    | **Mean** | **71.23s** | **22.65s** | **3.14x** | **49.72s** | **1.43x** |
 
+---
 
+### CLI Optimization Flags & Automated Makefile Regression Tests (Phase 24)
+
+Date: 2026-06-30
+
+We integrated the advanced optimization parameters as first-class CLI parameters and established automated correctness checks within the project test suite.
+
+Implementation details:
+1. **CLI Flags**: Added parsing support for `--kv-cache-bf16` and `--use-icb` in `mu_cli.c` which programmatically set their respective environment variables at startup.
+2. **Benchmark forwarding**: Updated `mu_benchmark_pages.py` to forward these arguments to the subprocess execution if passed.
+3. **Correctness Regression Test**: Created `mu_regress_check.py` which renders page 224 from the NASA PDF, executes both single-threaded (`--threads 1`) and concurrent (`--threads 4`) layout extractions with the optimization switches active, and asserts layout block counts and types match the reference exactly.
+4. **Makefile Target Integration**: Added `mu-regress` target to the `Makefile` and linked it to the `mu-test` suite.
+5. **VRAM Memory Leak Prevention**: Wrapped `mu_gpu_destroy` inside an `@autoreleasepool` block in `mu_metal.m` to force immediate VRAM buffer collection.
+6. **Shared GPU Context for Tests**: Refactored `mu_test.c` to share a single global GPU context (`global_gpu`) instead of creating/destroying 17 contexts sequentially, preventing VRAM cache collisions and process OOM crashes (`Killed: 9`).
