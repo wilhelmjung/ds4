@@ -1106,109 +1106,111 @@ int mu_gpu_create(mu_gpu **out) {
 void mu_gpu_destroy(mu_gpu *gpu) {
     if (!gpu) return;
 
-    if (getenv("MU_METAL_DEBUG")) {
-        fprintf(stderr, "=== Metal Weight Buffer Cache Stats ===\n");
-        fprintf(stderr, "  Hits: %lld\n", gpu->weight_cache_hits);
-        fprintf(stderr, "  Misses: %lld\n", gpu->weight_cache_misses);
-        fprintf(stderr, "  Allocations (Zero-Copy): %lld\n", gpu->weight_cache_no_copy_allocs);
-        fprintf(stderr, "  Allocations (Copy): %lld\n", gpu->weight_cache_copy_allocs);
-        fprintf(stderr, "  Total Cached Buffers: %d\n", gpu->weight_cache_count);
-        fprintf(stderr, "========================================\n");
-    }
+    @autoreleasepool {
+        if (getenv("MU_METAL_DEBUG")) {
+            fprintf(stderr, "=== Metal Weight Buffer Cache Stats ===\n");
+            fprintf(stderr, "  Hits: %lld\n", gpu->weight_cache_hits);
+            fprintf(stderr, "  Misses: %lld\n", gpu->weight_cache_misses);
+            fprintf(stderr, "  Allocations (Zero-Copy): %lld\n", gpu->weight_cache_no_copy_allocs);
+            fprintf(stderr, "  Allocations (Copy): %lld\n", gpu->weight_cache_copy_allocs);
+            fprintf(stderr, "  Total Cached Buffers: %d\n", gpu->weight_cache_count);
+            fprintf(stderr, "========================================\n");
+        }
 
-    gpu->scratch_a = nil;
-    gpu->scratch_b = nil;
-    for (int i = 0; i < gpu->weight_cache_count; i++) {
-        gpu->weight_cache[i].buffer = nil;
+        gpu->scratch_a = nil;
+        gpu->scratch_b = nil;
+        for (int i = 0; i < gpu->weight_cache_count; i++) {
+            gpu->weight_cache[i].buffer = nil;
+        }
+        for (int i = 0; i < gpu->dense_mps_weight_cache_count; i++) {
+            gpu->dense_mps_weight_cache[i].src = nil;
+            gpu->dense_mps_weight_cache[i].f32 = nil;
+        }
+        gpu->vision_merge4 = nil;
+        gpu->vision_fused_ffn = nil;
+        gpu->argmax_f32 = nil;
+        gpu->dense_probe_simd = nil;
+        gpu->dense_probe_add_simd = nil;
+        gpu->dense_bf16_bias_probe_simd = nil;
+        gpu->dense_f32_bias_probe_simd = nil;
+        gpu->dense_bf16_bias_rows_simd = nil;
+        gpu->dense_bf16_bias_rows_tiled = nil;
+        gpu->dense_bf16_bias_rows_simdgroup = nil;
+        gpu->dense_bf16_bias_rows_simdgroup_quick_gelu = nil;
+        gpu->dense_bf16_bias_rows_simdgroup_gelu = nil;
+        gpu->dense_bf16_bias_rows_simdgroup_qkv = nil;
+        gpu->dense_bf16_rows_simdgroup_swiglu = nil;
+        gpu->text_decode_fused_ffn = nil;
+        gpu->text_decode_qkv_proj_simd = nil;
+        gpu->text_decode_qkv_rope_cache_simd = nil;
+        gpu->text_attn_cached_simd = nil;
+        gpu->text_attn_cached_simd_batched = nil;
+        gpu->text_attn_cached_batched = nil;
+        gpu->dense_mps_1280_1280 = nil;
+        gpu->dense_mps_1280_2560 = nil;
+        gpu->dense_mps_1280_3840 = nil;
+        gpu->dense_mps_1280_5120 = nil;
+        gpu->dense_mps_5120_1280 = nil;
+        gpu->dense_mps_896_896 = nil;
+        gpu->dense_mps_896_128 = nil;
+        gpu->dense_mps_896_4864 = nil;
+        gpu->dense_mps_4864_896 = nil;
+        gpu->vision_gelu_bf16 = nil;
+        gpu->vision_quick_gelu_bf16 = nil;
+        gpu->vision_add_bf16 = nil;
+        gpu->vision_rotary_pos_emb = nil;
+        gpu->vision_attn_rows_online = nil;
+        gpu->vision_attn_rows_flash = nil;
+        gpu->vision_attn_rows_flash_k16 = nil;
+        gpu->vision_attn_rows_packed_flash = nil;
+        gpu->vision_attn_rows_packed_flash_opt = nil;
+        gpu->vision_attn_pack_qkv_mpsgraph = nil;
+        gpu->vision_attn_copy_mpsgraph = nil;
+        for (int i = 0; i < 32; i++) {
+            gpu->thread_graphs[i].vision_attn_mpsgraph = nil;
+            gpu->thread_graphs[i].vision_attn_mpsgraph_q = nil;
+            gpu->thread_graphs[i].vision_attn_mpsgraph_k = nil;
+            gpu->thread_graphs[i].vision_attn_mpsgraph_v = nil;
+            gpu->thread_graphs[i].vision_attn_mpsgraph_out = nil;
+        }
+        gpu->vision_softmax_pv_head = nil;
+        gpu->vision_pv_head = nil;
+        gpu->vision_softmax_bf16_rows = nil;
+        gpu->vision_qk_scores_head_prerot = nil;
+        gpu->vision_rope_qk_rows = nil;
+        gpu->vision_qk_scores_head = nil;
+        gpu->vision_attn_concat_probe = nil;
+        gpu->silu_mul_f32 = nil;
+        gpu->add_f32 = nil;
+        gpu->text_attn_seq_pos = nil;
+        gpu->text_attn_cached = nil;
+        gpu->text_rope_cache_update = nil;
+        gpu->text_prefill_rope_cache_update = nil;
+        gpu->text_prefill_attn_flash = nil;
+        gpu->text_prefill_attn_flash_opt = nil;
+        gpu->text_prefill_attn_pos_flash = nil;
+        gpu->text_prefill_attn_pos_flash_opt = nil;
+        gpu->text_attn_seq = nil;
+        gpu->text_attn_token0 = nil;
+        gpu->layernorm_bf16_rows = nil;
+        gpu->layernorm_bf16_rows_simd = nil;
+        gpu->layernorm_bf16_probe = nil;
+        gpu->rmsnorm_bf16_rows = nil;
+        gpu->rmsnorm_bf16_probe = nil;
+        gpu->rmsnorm_probe = nil;
+        gpu->dense_mps_bias_round = nil;
+        gpu->dense_bf16_bias_rows = nil;
+        gpu->dense_f32_bias_rows = nil;
+        gpu->dense_f32_rows = nil;
+        gpu->dense_f32_bias_probe = nil;
+        gpu->dense_bf16_bias_probe = nil;
+        gpu->dense_probe = nil;
+        gpu->const_hidden_buf = nil;
+        gpu->const_vocab_buf = nil;
+        gpu->const_eps_buf = nil;
+        gpu->queue = nil;
+        gpu->device = nil;
     }
-    for (int i = 0; i < gpu->dense_mps_weight_cache_count; i++) {
-        gpu->dense_mps_weight_cache[i].src = nil;
-        gpu->dense_mps_weight_cache[i].f32 = nil;
-    }
-    gpu->vision_merge4 = nil;
-    gpu->vision_fused_ffn = nil;
-    gpu->argmax_f32 = nil;
-    gpu->dense_probe_simd = nil;
-    gpu->dense_probe_add_simd = nil;
-    gpu->dense_bf16_bias_probe_simd = nil;
-    gpu->dense_f32_bias_probe_simd = nil;
-    gpu->dense_bf16_bias_rows_simd = nil;
-    gpu->dense_bf16_bias_rows_tiled = nil;
-    gpu->dense_bf16_bias_rows_simdgroup = nil;
-    gpu->dense_bf16_bias_rows_simdgroup_quick_gelu = nil;
-    gpu->dense_bf16_bias_rows_simdgroup_gelu = nil;
-    gpu->dense_bf16_bias_rows_simdgroup_qkv = nil;
-    gpu->dense_bf16_rows_simdgroup_swiglu = nil;
-    gpu->text_decode_fused_ffn = nil;
-    gpu->text_decode_qkv_proj_simd = nil;
-    gpu->text_decode_qkv_rope_cache_simd = nil;
-    gpu->text_attn_cached_simd = nil;
-    gpu->text_attn_cached_simd_batched = nil;
-    gpu->text_attn_cached_batched = nil;
-    gpu->dense_mps_1280_1280 = nil;
-    gpu->dense_mps_1280_2560 = nil;
-    gpu->dense_mps_1280_3840 = nil;
-    gpu->dense_mps_1280_5120 = nil;
-    gpu->dense_mps_5120_1280 = nil;
-    gpu->dense_mps_896_896 = nil;
-    gpu->dense_mps_896_128 = nil;
-    gpu->dense_mps_896_4864 = nil;
-    gpu->dense_mps_4864_896 = nil;
-    gpu->vision_gelu_bf16 = nil;
-    gpu->vision_quick_gelu_bf16 = nil;
-    gpu->vision_add_bf16 = nil;
-    gpu->vision_rotary_pos_emb = nil;
-    gpu->vision_attn_rows_online = nil;
-    gpu->vision_attn_rows_flash = nil;
-    gpu->vision_attn_rows_flash_k16 = nil;
-    gpu->vision_attn_rows_packed_flash = nil;
-    gpu->vision_attn_rows_packed_flash_opt = nil;
-    gpu->vision_attn_pack_qkv_mpsgraph = nil;
-    gpu->vision_attn_copy_mpsgraph = nil;
-    for (int i = 0; i < 32; i++) {
-        gpu->thread_graphs[i].vision_attn_mpsgraph = nil;
-        gpu->thread_graphs[i].vision_attn_mpsgraph_q = nil;
-        gpu->thread_graphs[i].vision_attn_mpsgraph_k = nil;
-        gpu->thread_graphs[i].vision_attn_mpsgraph_v = nil;
-        gpu->thread_graphs[i].vision_attn_mpsgraph_out = nil;
-    }
-    gpu->vision_softmax_pv_head = nil;
-    gpu->vision_pv_head = nil;
-    gpu->vision_softmax_bf16_rows = nil;
-    gpu->vision_qk_scores_head_prerot = nil;
-    gpu->vision_rope_qk_rows = nil;
-    gpu->vision_qk_scores_head = nil;
-    gpu->vision_attn_concat_probe = nil;
-    gpu->silu_mul_f32 = nil;
-    gpu->add_f32 = nil;
-    gpu->text_attn_seq_pos = nil;
-    gpu->text_attn_cached = nil;
-    gpu->text_rope_cache_update = nil;
-    gpu->text_prefill_rope_cache_update = nil;
-    gpu->text_prefill_attn_flash = nil;
-    gpu->text_prefill_attn_flash_opt = nil;
-    gpu->text_prefill_attn_pos_flash = nil;
-    gpu->text_prefill_attn_pos_flash_opt = nil;
-    gpu->text_attn_seq = nil;
-    gpu->text_attn_token0 = nil;
-    gpu->layernorm_bf16_rows = nil;
-    gpu->layernorm_bf16_rows_simd = nil;
-    gpu->layernorm_bf16_probe = nil;
-    gpu->rmsnorm_bf16_rows = nil;
-    gpu->rmsnorm_bf16_probe = nil;
-    gpu->rmsnorm_probe = nil;
-    gpu->dense_mps_bias_round = nil;
-    gpu->dense_bf16_bias_rows = nil;
-    gpu->dense_f32_bias_rows = nil;
-    gpu->dense_f32_rows = nil;
-    gpu->dense_f32_bias_probe = nil;
-    gpu->dense_bf16_bias_probe = nil;
-    gpu->dense_probe = nil;
-    gpu->const_hidden_buf = nil;
-    gpu->const_vocab_buf = nil;
-    gpu->const_eps_buf = nil;
-    gpu->queue = nil;
-    gpu->device = nil;
     free(gpu);
 }
 

@@ -47,7 +47,7 @@ MU_LDLIBS := $(LDLIBS)
 MU_OBJS = mineru/mu.o
 endif
 
-.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm mu-test
+.PHONY: all help clean test cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm mu-test mu-regress
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -231,6 +231,10 @@ mu: mineru/mu_cli.o $(MU_OBJS)
 mu-test: mineru/tests/mu_test.o $(MU_OBJS)
 	$(CC) $(CFLAGS) -Imineru -o $@ mineru/tests/mu_test.o $(MU_OBJS) $(MU_LDLIBS) -framework Foundation -framework Metal
 	./mu-test
+	$(MAKE) mu-regress
+
+mu-regress: mu
+	/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_regress_check.py
 
 mu-dense-shape-bench: mineru/tests/mu_dense_shape_bench
 

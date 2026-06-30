@@ -248,6 +248,8 @@ def main() -> None:
     parser.add_argument("--save-output-dir", type=Path)
     parser.add_argument("--timing", action="store_true")
     parser.add_argument("--markdown", action="store_true")
+    parser.add_argument("--kv-cache-bf16", action="store_true")
+    parser.add_argument("--use-icb", action="store_true")
     args = parser.parse_args()
 
     rows = load_resume_rows(args)
@@ -285,6 +287,10 @@ def main() -> None:
             cmd.append("--markdown")
         else:
             cmd.append("--json")
+        if args.kv_cache_bf16:
+            cmd.append("--kv-cache-bf16")
+        if args.use_icb:
+            cmd.append("--use-icb")
 
         for img in images_to_run:
             cmd.extend(["--image", str(img)])

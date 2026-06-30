@@ -2185,8 +2185,12 @@ int main(int argc, char **argv) {
             write_json = 1;
         } else if (!strcmp(argv[i], "--markdown")) {
             write_markdown = 1;
+        } else if (!strcmp(argv[i], "--kv-cache-bf16")) {
+            setenv("MU_KV_CACHE_BF16", "1", 1);
+        } else if (!strcmp(argv[i], "--use-icb")) {
+            setenv("MU_TEXT_DECODE_ICB", "1", 1);
         } else {
-            fprintf(stderr, "usage: %s [--model-dir PATH] [--backend cpu|metal] [--no-cpu-fallback] [--max-new-tokens N] [--skip-content] [--compare-backends] [--inspect] [--check-trace PATH] [--image PATH (--json|--markdown)] [--output-dir PATH]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--model-dir PATH] [--backend cpu|metal] [--no-cpu-fallback] [--max-new-tokens N] [--skip-content] [--compare-backends] [--inspect] [--check-trace PATH] [--image PATH (--json|--markdown)] [--output-dir PATH] [--kv-cache-bf16] [--use-icb]\n", argv[0]);
             return 2;
         }
     }
