@@ -85,6 +85,8 @@ int mu_gpu_vision_gelu_bf16(mu_gpu *gpu, const float *x,
                             int n, float *out);
 int mu_gpu_vision_merge4(mu_gpu *gpu, const float *hidden,
                          int rows, float *out);
+int mu_gpu_vision_rotary_pos_emb(mu_gpu *gpu, int grid_t, int grid_h, int grid_w,
+                                 int merge, float *out, int out_rows, int out_cols);
 int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
                          const float *patch_embeds,
                          int rows, int cols,
@@ -230,10 +232,31 @@ int mu_gpu_text_prefill_cache_from_embeddings(mu_gpu *gpu, void *engine,
                                               int cache_cap,
                                               mu_gpu_kv_cache *gpu_cache,
                                               float *last_hidden_out);
+int mu_gpu_text_prefill_cache_from_embeddings_offset(mu_gpu *gpu, void *engine,
+                                                     const float *hidden_states,
+                                                     int n_ids, const int *position_ids,
+                                                     int cache_cap, int cache_offset,
+                                                     mu_gpu_kv_cache *gpu_cache,
+                                                     float *last_hidden_out);
 int mu_gpu_text_decode_icb_execute(void *engine,
                                    mu_gpu_kv_cache *cache,
                                    int cache_pos, const int pos3[3],
                                    const float *hidden_state_cpu,
                                    int top_k, void *out_logits);
+int mu_gpu_text_decode_step_batched(mu_gpu *gpu, void *engine,
+                                    mu_gpu_kv_cache *cache,
+                                    int batch_size,
+                                    const int *active_mask,
+                                    const int *cache_lens,
+                                    const int *cache_offsets,
+                                    const int *pos3_batched,
+                                    const float *hidden_states_in_cpu,
+                                    float *hidden_states_out_cpu);
+int mu_gpu_text_attn_cached_resident_batched_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
+                                                 mu_gpu_kv_cache *cache, int layer,
+                                                 int batch_size,
+                                                 mu_gpu_buf cache_lens,
+                                                 mu_gpu_buf cache_offsets,
+                                                 mu_gpu_buf out);
 
 #endif

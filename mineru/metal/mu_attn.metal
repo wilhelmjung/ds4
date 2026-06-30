@@ -1032,3 +1032,148 @@ kernel void mu_text_prefill_attn_pos_flash_opt(device const float *q [[buffer(0)
         }
     }
 }
+
+kernel void mu_text_attn_cached_simd_batched(device const float *q [[buffer(0)]],
+                                             device const void *k_cache_void [[buffer(1)]],
+                                             device const void *v_cache_void [[buffer(2)]],
+                                             device float *out [[buffer(3)]],
+                                             device const int *cache_lens [[buffer(4)]],
+                                             device const int *cache_offsets [[buffer(5)]],
+                                             constant bool &use_bf16_cache [[buffer(6)]],
+                                             uint2 gid [[thread_position_in_grid]],
+                                             uint simd_lane [[thread_index_in_simdgroup]]) {
+    int b = (int)gid.y;
+    int head = gid.x / 32;
+    if (head >= 14) return;
+    int cache_len = cache_lens[b];
+    if (cache_len <= 0) return;
+    int kv_offset = cache_offsets[b];
+    int kvh = head / 7;
+    int tid = (int)simd_lane;
+
+    device const float *q_head = q + (size_t)b * 896u + (size_t)head * 64u;
+    float q0 = q_head[tid];
+    float q1 = q_head[tid + 32];
+
+    float max_score = -3.402823466e38f;
+    threadgroup float scores[4096];
+
+    for (int sidx = 0; sidx < cache_len; sidx++) {
+        float k0, k1;
+        size_t base = ((size_t)(kv_offset + sidx) * 2u + (size_t)kvh) * 64u;
+        if (use_bf16_cache) {
+            device const ushort *k_cache = (device const ushort *)k_cache_void;
+            k0 = mu_bf16_to_f32(k_cache[base + tid]);
+            k1 = mu_bf16_to_f32(k_cache[base + tid + 32]);
+        } else {
+            device const float *k_cache = (device const float *)k_cache_void;
+            k0 = k_cache[base + tid];
+            k1 = k_cache[base + tid + 32];
+        }
+        float pdot = q0 * k0 + q1 * k1;
+        float dot = simd_sum(pdot);
+        float score = dot * 0.125f;
+        if (simd_lane == 0) {
+            scores[sidx] = score;
+        }
+        if (score > max_score) max_score = score;
+    }
+    max_score = simd_max(max_score);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float local_denom = 0.0f;
+    for (int sidx = tid; sidx < cache_len; sidx += 32) {
+        local_denom += exp(scores[sidx] - max_score);
+    }
+    float denom = simd_sum(local_denom);
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    for (int sidx = 0; sidx < cache_len; sidx++) {
+        float p = exp(scores[sidx] - max_score) / denom;
+        float v0, v1;
+        size_t base = ((size_t)(kv_offset + sidx) * 2u + (size_t)kvh) * 64u;
+        if (use_bf16_cache) {
+            device const ushort *v_cache = (device const ushort *)v_cache_void;
+            v0 = mu_bf16_to_f32(v_cache[base + tid]);
+            v1 = mu_bf16_to_f32(v_cache[base + tid + 32]);
+        } else {
+            device const float *v_cache = (device const float *)v_cache_void;
+            v0 = v_cache[base + tid];
+            v1 = v_cache[base + tid + 32];
+        }
+        acc0 += p * v0;
+        acc1 += p * v1;
+    }
+
+    device float *oh = out + (size_t)b * 896u + (size_t)head * 64u;
+    oh[tid] = acc0;
+    oh[tid + 32] = acc1;
+}
+
+kernel void mu_text_attn_cached_batched(device const float *q [[buffer(0)]],
+                                       device const void *k_cache_void [[buffer(1)]],
+                                       device const void *v_cache_void [[buffer(2)]],
+                                       device float *out [[buffer(3)]],
+                                       device const int *cache_lens [[buffer(4)]],
+                                       device const int *cache_offsets [[buffer(5)]],
+                                       constant bool &use_bf16_cache [[buffer(6)]],
+                                       uint2 gid [[thread_position_in_grid]]) {
+    int b = (int)gid.y;
+    int head = (int)gid.x;
+    if (head >= 14) return;
+    int cache_len = cache_lens[b];
+    if (cache_len <= 0) return;
+    int kv_offset = cache_offsets[b];
+    int kvh = head / 7;
+
+    device const float *qh = q + (size_t)b * 896u + (size_t)head * 64u;
+    device float *oh = out + (size_t)b * 896u + (size_t)head * 64u;
+
+    float scores[4096];
+    float max_score = -3.402823466e38f;
+
+    for (int sidx = 0; sidx < cache_len; sidx++) {
+        float dot = 0.0f;
+        size_t base = ((size_t)(kv_offset + sidx) * 2u + (size_t)kvh) * 64u;
+        if (use_bf16_cache) {
+            device const ushort *k_cache = (device const ushort *)k_cache_void;
+            for (int d = 0; d < 64; d++) {
+                dot += qh[d] * mu_bf16_to_f32(k_cache[base + d]);
+            }
+        } else {
+            device const float *k_cache = (device const float *)k_cache_void;
+            for (int d = 0; d < 64; d++) {
+                dot += qh[d] * k_cache[base + d];
+            }
+        }
+        float score = dot * 0.125f;
+        scores[sidx] = score;
+        if (score > max_score) max_score = score;
+    }
+
+    float denom = 0.0f;
+    for (int sidx = 0; sidx < cache_len; sidx++) {
+        denom += exp(scores[sidx] - max_score);
+    }
+
+    float acc[64] = {0.0f};
+    for (int sidx = 0; sidx < cache_len; sidx++) {
+        float p = exp(scores[sidx] - max_score) / denom;
+        size_t base = ((size_t)(kv_offset + sidx) * 2u + (size_t)kvh) * 64u;
+        if (use_bf16_cache) {
+            device const ushort *v_cache = (device const ushort *)v_cache_void;
+            for (int d = 0; d < 64; d++) {
+                acc[d] += p * mu_bf16_to_f32(v_cache[base + d]);
+            }
+        } else {
+            device const float *v_cache = (device const float *)v_cache_void;
+            for (int d = 0; d < 64; d++) {
+                acc[d] += p * v_cache[base + d];
+            }
+        }
+    }
+
+    for (int d = 0; d < 64; d++) oh[d] = acc[d];
+}
+

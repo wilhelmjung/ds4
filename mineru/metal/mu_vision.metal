@@ -821,3 +821,37 @@ kernel void mu_vision_attn_rows_packed_flash_opt(device const float *q_pack [[bu
         }
     }
 }
+
+kernel void mu_vision_rotary_pos_emb_kernel(device float *out [[buffer(0)]],
+                                            constant int &grid_t [[buffer(1)]],
+                                            constant int &grid_h [[buffer(2)]],
+                                            constant int &grid_w [[buffer(3)]],
+                                            constant int &merge [[buffer(4)]],
+                                            uint gid [[thread_position_in_grid]]) {
+    int row = (int)gid;
+    int out_rows = grid_t * grid_h * grid_w;
+    if (row >= out_rows) return;
+
+    int group_w = grid_w / merge;
+    int group_h = grid_h / merge;
+
+    int mw = row % merge;
+    int temp1 = row / merge;
+    int mh = temp1 % merge;
+    int temp2 = temp1 / merge;
+    int gwg = temp2 % group_w;
+    int ghg = temp2 / group_w;
+    ghg = ghg % group_h;
+
+    int hpos = ghg * merge + mh;
+    int wpos = gwg * merge + mw;
+
+    device float *dst = out + (size_t)row * 40u;
+    const float theta = 10000.0f;
+    for (int i = 0; i < 20; i++) {
+        float inv_freq = powr(theta, -((float)(2 * i) / 40.0f));
+        dst[i] = (float)hpos * inv_freq;
+        dst[20 + i] = (float)wpos * inv_freq;
+    }
+}
+

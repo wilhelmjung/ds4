@@ -273,7 +273,7 @@ def main() -> None:
 
         # Build CLI command
         cmd = [str(MU), "--backend", args.backend]
-        if args.threads > 1:
+        if args.threads is not None:
             cmd.extend(["--threads", str(args.threads)])
         if args.backend == "metal":
             cmd.append("--no-cpu-fallback")

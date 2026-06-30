@@ -1900,6 +1900,20 @@ int mu_vision_rotary_pos_emb(mu_engine *e, int grid_t, int grid_h, int grid_w,
                              float *out, int out_rows, int out_cols) {
     if (!e || !out) return -1;
     const int merge = e->cfg.spatial_merge_size > 0 ? e->cfg.spatial_merge_size : 2;
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        int timing = mu_timing_enabled();
+        double stage_start = mu_time_now_seconds();
+        int rc = mu_gpu_vision_rotary_pos_emb(e->gpu, grid_t, grid_h, grid_w, merge, out, out_rows, out_cols);
+        mu_timing_log_stage(timing, "vision_rotary_pos_emb", stage_start);
+        if (rc == 0) {
+            mu_record_metal_stage(e, "vision_rotary_pos_emb");
+            return 0;
+        }
+        rc = mu_record_cpu_fallback(e, "vision_rotary_pos_emb");
+        if (rc) return rc;
+    }
+#endif
     const int rotary_cols = 40;
     if (grid_t <= 0 || grid_h <= 0 || grid_w <= 0 ||
         grid_h % merge != 0 || grid_w % merge != 0 ||
@@ -5963,6 +5977,203 @@ int mu_text_generate_greedy_with_image_embeds(mu_engine *e,
         n_image_embeds, max_new_tokens, out);
 }
 
+int mu_text_generate_greedy_with_image_embeds_batched(
+    mu_engine *e, int batch_size,
+    const int *const *input_ids, const int *n_ids,
+    const int *grid_t, const int *grid_h, const int *grid_w,
+    const float *const *image_embeds, const int *n_image_embeds,
+    int max_new_tokens, int **outs, int *outs_len) {
+    
+    if (!e || batch_size <= 0 || !input_ids || !n_ids || !grid_t || !grid_h || !grid_w ||
+        !image_embeds || !n_image_embeds || max_new_tokens <= 0 || !outs || !outs_len) {
+        return -1;
+    }
+
+    const int hidden = 896;
+    const int layers = 24;
+    const int kv_out = 128;
+    const int vocab = 151936;
+
+    int max_seq_len = 0;
+    for (int b = 0; b < batch_size; b++) {
+        int seq_len = n_ids[b] + max_new_tokens;
+        if (seq_len > max_seq_len) max_seq_len = seq_len;
+    }
+
+    int cap = batch_size * max_seq_len;
+    mu_gpu_kv_cache *gpu_cache = NULL;
+    
+#if defined(__APPLE__)
+    if (e->opt.backend == MU_BACKEND_METAL && e->metal_available) {
+        int rc_cache = mu_gpu_kv_cache_create(e->gpu, layers, cap, &gpu_cache);
+        if (rc_cache != 0) {
+            gpu_cache = NULL;
+        }
+    }
+#endif
+
+    int **ids = (int **)malloc((size_t)batch_size * sizeof(int *));
+    int **pos = (int **)malloc((size_t)batch_size * sizeof(int *));
+    float **hidden_states = (float **)malloc((size_t)batch_size * sizeof(float *));
+    float *k_cache_cpu = NULL;
+    float *v_cache_cpu = NULL;
+
+    if (!gpu_cache) {
+        k_cache_cpu = (float *)calloc((size_t)layers * (size_t)cap * kv_out, sizeof(float));
+        v_cache_cpu = (float *)calloc((size_t)layers * (size_t)cap * kv_out, sizeof(float));
+    }
+
+    for (int b = 0; b < batch_size; b++) {
+        int local_cap = n_ids[b] + max_new_tokens;
+        ids[b] = (int *)malloc((size_t)local_cap * sizeof(int));
+        pos[b] = (int *)malloc((size_t)local_cap * 3 * sizeof(int));
+        hidden_states[b] = (float *)malloc((size_t)n_ids[b] * hidden * sizeof(float));
+    }
+
+    const uint16_t *embed = mu_tensor_bf16(e, "model.embed_tokens.weight", 2, vocab, hidden);
+
+    for (int b = 0; b < batch_size; b++) {
+        memcpy(ids[b], input_ids[b], (size_t)n_ids[b] * sizeof(int));
+        int image_i = 0;
+        for (int s = 0; s < n_ids[b]; s++) {
+            int id = ids[b][s];
+            float *dst = hidden_states[b] + (size_t)s * hidden;
+            if (id == 151655) {
+                memcpy(dst, image_embeds[b] + (size_t)image_i * hidden, (size_t)hidden * sizeof(float));
+                image_i++;
+            } else {
+                const uint16_t *row = embed + (size_t)id * hidden;
+                for (int i = 0; i < hidden; i++) dst[i] = mu_bf16_to_f32(row[i]);
+            }
+        }
+        mu_build_position_ids(e, ids[b], n_ids[b], grid_t[b], grid_h[b], grid_w[b], pos[b], n_ids[b] * 3);
+    }
+
+    float *current_hidden_states = (float *)malloc((size_t)batch_size * hidden * sizeof(float));
+    int *active_mask = (int *)malloc((size_t)batch_size * sizeof(int));
+    int *cache_lens = (int *)malloc((size_t)batch_size * sizeof(int));
+    int *cache_offsets = (int *)malloc((size_t)batch_size * sizeof(int));
+    int *pos3_batched = (int *)malloc((size_t)batch_size * 3 * sizeof(int));
+    mu_token_logit *top_logits = (mu_token_logit *)malloc((size_t)batch_size * 8 * sizeof(mu_token_logit));
+
+    for (int b = 0; b < batch_size; b++) {
+        float last_hidden[896];
+        int rc_prefill = -1;
+#if defined(__APPLE__)
+        if (gpu_cache) {
+            rc_prefill = mu_gpu_text_prefill_cache_from_embeddings_offset(
+                e->gpu, e, hidden_states[b], n_ids[b], pos[b],
+                cap, b * max_seq_len, gpu_cache, last_hidden);
+        }
+#endif
+        if (rc_prefill != 0) {
+            float *k_start = k_cache_cpu + (size_t)b * max_seq_len * kv_out;
+            float *v_start = v_cache_cpu + (size_t)b * max_seq_len * kv_out;
+            mu_text_prefill_cache_from_embeddings(e, hidden_states[b], n_ids[b], pos[b],
+                                                   cap, NULL, k_start, v_start, 8, &top_logits[b * 8], NULL);
+        } else {
+            memcpy(current_hidden_states + b * hidden, last_hidden, hidden * sizeof(float));
+            mu_text_top_logits_from_last_hidden(e, last_hidden, 8, &top_logits[b * 8]);
+        }
+        active_mask[b] = 1;
+        cache_lens[b] = n_ids[b];
+        cache_offsets[b] = b * max_seq_len;
+        outs_len[b] = 0;
+    }
+
+    float *next_hidden_states = (float *)malloc((size_t)batch_size * hidden * sizeof(float));
+
+    for (int step = 0; step < max_new_tokens; step++) {
+        int n_active = 0;
+        for (int b = 0; b < batch_size; b++) {
+            if (!active_mask[b]) continue;
+            
+            int next = top_logits[b * 8].id;
+            float best = top_logits[b * 8].logit;
+            for (int i = 1; i < 8; i++) {
+                if (top_logits[b * 8 + i].id >= 0 && top_logits[b * 8 + i].logit == best && top_logits[b * 8 + i].id < next) {
+                    next = top_logits[b * 8 + i].id;
+                }
+            }
+
+            outs[b][outs_len[b]++] = next;
+            ids[b][cache_lens[b]] = next;
+
+            if (next == 151645 || next == 151643 || outs_len[b] >= max_new_tokens) {
+                active_mask[b] = 0;
+                cache_lens[b] = 0;
+                continue;
+            }
+
+            n_active++;
+
+            mu_build_position_ids(e, ids[b], cache_lens[b] + 1, grid_t[b], grid_h[b], grid_w[b], pos[b], (cache_lens[b] + 1) * 3);
+            int cur_idx = cache_lens[b];
+            pos3_batched[b * 3 + 0] = pos[b][0 * (cur_idx + 1) + cur_idx];
+            pos3_batched[b * 3 + 1] = pos[b][1 * (cur_idx + 1) + cur_idx];
+            pos3_batched[b * 3 + 2] = pos[b][2 * (cur_idx + 1) + cur_idx];
+
+            cache_lens[b]++;
+        }
+
+        if (n_active == 0) break;
+
+        int rc_decode = -1;
+#if defined(__APPLE__)
+        if (gpu_cache) {
+            rc_decode = mu_gpu_text_decode_step_batched(
+                e->gpu, e, gpu_cache, batch_size, active_mask,
+                cache_lens, cache_offsets, pos3_batched,
+                current_hidden_states, next_hidden_states);
+        }
+#endif
+        if (rc_decode != 0) {
+            for (int b = 0; b < batch_size; b++) {
+                if (active_mask[b]) {
+                    int pos3[3] = {pos3_batched[b * 3], pos3_batched[b * 3 + 1], pos3_batched[b * 3 + 2]};
+                    float *k_start = k_cache_cpu + (size_t)b * max_seq_len * kv_out;
+                    float *v_start = v_cache_cpu + (size_t)b * max_seq_len * kv_out;
+                    mu_text_cached_step(e, ids[b][cache_lens[b] - 1], pos3, cache_lens[b] - 1, cap,
+                                        k_start, v_start, NULL, 8, &top_logits[b * 8], NULL);
+                }
+            }
+        } else {
+            memcpy(current_hidden_states, next_hidden_states, (size_t)batch_size * hidden * sizeof(float));
+            for (int b = 0; b < batch_size; b++) {
+                if (active_mask[b]) {
+                    float *hs = current_hidden_states + b * hidden;
+                    mu_text_top_logits_from_last_hidden(e, hs, 8, &top_logits[b * 8]);
+                }
+            }
+        }
+    }
+
+    free(current_hidden_states);
+    free(next_hidden_states);
+    free(active_mask);
+    free(cache_lens);
+    free(cache_offsets);
+    free(pos3_batched);
+    free(top_logits);
+
+    for (int b = 0; b < batch_size; b++) {
+        free(ids[b]);
+        free(pos[b]);
+        free(hidden_states[b]);
+    }
+    free(ids);
+    free(pos);
+    free(hidden_states);
+    free(k_cache_cpu);
+    free(v_cache_cpu);
+
+    if (gpu_cache) {
+        mu_gpu_kv_cache_destroy(gpu_cache);
+    }
+
+    return 0;
+}
+
 mu_engine_options mu_engine_options_default(void) {
     mu_engine_options opt;
     memset(&opt, 0, sizeof(opt));
@@ -6952,30 +7163,169 @@ int mu_parse_preprocessed_page(mu_engine *e, mu_preprocessed_page *prep, mu_resu
         }
 
         double content_start = mu_time_now_seconds();
-        for (int i = 0; i < n_blocks; i++) {
-            const char *task = "\nText Recognition:";
-            if (!strcmp(blocks[i].type, "table")) task = "\nTable Recognition:";
-            else if (!strcmp(blocks[i].type, "equation") ||
-                     !strcmp(blocks[i].type, "equation_block") ||
-                     !strcmp(blocks[i].type, "formula_number")) {
-                task = "\nFormula Recognition:";
-            } else if (!strcmp(blocks[i].type, "image") ||
-                       !strcmp(blocks[i].type, "chart")) {
-                task = "\nImage Analysis:";
+        bool use_batching = (e->opt.backend == MU_BACKEND_METAL && e->metal_available && n_blocks > 1);
+
+        if (use_batching) {
+            int ok = 1;
+            int **input_ids_batched = (int **)calloc((size_t)n_blocks, sizeof(int *));
+            int *n_ids_batched = (int *)calloc((size_t)n_blocks, sizeof(int));
+            int *grid_t_batched = (int *)calloc((size_t)n_blocks, sizeof(int));
+            int *grid_h_batched = (int *)calloc((size_t)n_blocks, sizeof(int));
+            int *grid_w_batched = (int *)calloc((size_t)n_blocks, sizeof(int));
+            float **image_embeds_batched = (float **)calloc((size_t)n_blocks, sizeof(float *));
+            int *n_image_embeds_batched = (int *)calloc((size_t)n_blocks, sizeof(int));
+            int **outs_batched = (int **)calloc((size_t)n_blocks, sizeof(int *));
+            int *outs_len_batched = (int *)calloc((size_t)n_blocks, sizeof(int));
+
+            if (!input_ids_batched || !n_ids_batched || !grid_t_batched || !grid_h_batched || !grid_w_batched ||
+                !image_embeds_batched || !n_image_embeds_batched || !outs_batched || !outs_len_batched) {
+                ok = 0;
             }
 
-            stage_start = mu_time_now_seconds();
-            contents[i] = mu_generate_image_region_text(e, prep->path, blocks[i].bbox, task, content_max);
-            if (contents[i] && !strcmp(blocks[i].type, "table")) {
-                char *html = mu_otsl_to_html(contents[i]);
-                if (html) {
-                    free(contents[i]);
-                    contents[i] = html;
+            for (int i = 0; i < n_blocks && ok; i++) {
+                const char *task = "\nText Recognition:";
+                if (!strcmp(blocks[i].type, "table")) task = "\nTable Recognition:";
+                else if (!strcmp(blocks[i].type, "equation") ||
+                         !strcmp(blocks[i].type, "equation_block") ||
+                         !strcmp(blocks[i].type, "formula_number")) {
+                    task = "\nFormula Recognition:";
+                } else if (!strcmp(blocks[i].type, "image") ||
+                           !strcmp(blocks[i].type, "chart")) {
+                    task = "\nImage Analysis:";
+                }
+
+                mu_image_tokens tokens;
+                memset(&tokens, 0, sizeof(tokens));
+                int rc = mu_preprocess_layout_image_region_file(e, prep->path, blocks[i].bbox, &tokens);
+                if (rc) { ok = 0; break; }
+
+                int n_embeds = (tokens.grid_t * tokens.grid_h * tokens.grid_w) / 4;
+                float *patch_embeds = (float *)malloc((size_t)tokens.rows * 1280u * sizeof(float));
+                float *rotary = (float *)malloc((size_t)tokens.rows * 40u * sizeof(float));
+                float *img_embed = (float *)malloc((size_t)n_embeds * 896u * sizeof(float));
+                if (!patch_embeds || !rotary || !img_embed) {
+                    free(patch_embeds); free(rotary); free(img_embed);
+                    mu_image_tokens_free(&tokens);
+                    ok = 0; break;
+                }
+                rc = mu_vision_patch_embed(e, &tokens, patch_embeds, tokens.rows, 1280);
+                if (rc == 0) {
+                    rc = mu_vision_rotary_pos_emb(e, tokens.grid_t, tokens.grid_h, tokens.grid_w, rotary, tokens.rows, 40);
+                }
+                if (rc == 0) {
+                    rc = mu_vision_encode(e, patch_embeds, tokens.rows, 1280, rotary, tokens.rows, 40, img_embed, n_embeds, 896);
+                }
+                free(patch_embeds);
+                free(rotary);
+                mu_image_tokens_free(&tokens);
+                if (rc) {
+                    free(img_embed);
+                    ok = 0; break;
+                }
+
+                char *prompt = mu_render_chat_prompt(task, true);
+                if (!prompt) { free(img_embed); ok = 0; break; }
+                int cap = 8192;
+                int *ids = (int *)malloc((size_t)cap * sizeof(int));
+                int n_ids_val = ids ? mu_tokenize_image_text(e, prompt, tokens.grid_t, tokens.grid_h, tokens.grid_w, ids, cap) : -1;
+                mu_free(prompt);
+                if (n_ids_val <= 0) {
+                    free(ids); free(img_embed);
+                    ok = 0; break;
+                }
+
+                input_ids_batched[i] = ids;
+                n_ids_batched[i] = n_ids_val;
+                grid_t_batched[i] = tokens.grid_t;
+                grid_h_batched[i] = tokens.grid_h;
+                grid_w_batched[i] = tokens.grid_w;
+                image_embeds_batched[i] = img_embed;
+                n_image_embeds_batched[i] = n_embeds;
+                outs_batched[i] = (int *)malloc((size_t)content_max * sizeof(int));
+                outs_len_batched[i] = 0;
+                if (!outs_batched[i]) { ok = 0; break; }
+            }
+
+            if (ok) {
+                mu_text_generate_greedy_with_image_embeds_batched(
+                    e, n_blocks, (const int *const *)input_ids_batched, n_ids_batched,
+                    grid_t_batched, grid_h_batched, grid_w_batched,
+                    (const float *const *)image_embeds_batched, n_image_embeds_batched,
+                    content_max, outs_batched, outs_len_batched);
+
+                for (int i = 0; i < n_blocks; i++) {
+                    stage_start = mu_time_now_seconds();
+                    char *text = mu_decode_token_ids(e, outs_batched[i], outs_len_batched[i]);
+                    if (text) {
+                        char *end = strstr(text, "<|im_end|>");
+                        if (!end) end = strstr(text, "<|endoftext|>");
+                        if (end) *end = 0;
+
+                        if (!strcmp(blocks[i].type, "table")) {
+                            char *html = mu_otsl_to_html(text);
+                            if (html) {
+                                free(text);
+                                text = html;
+                            }
+                        }
+                    }
+                    contents[i] = text;
+                    mu_timing_log_stage(timing, "content_block_total", stage_start);
                 }
             }
-            mu_timing_log_stage(timing, "content_block_total", stage_start);
+
+            if (input_ids_batched) {
+                for (int i = 0; i < n_blocks; i++) free(input_ids_batched[i]);
+                free(input_ids_batched);
+            }
+            free(n_ids_batched);
+            free(grid_t_batched);
+            free(grid_h_batched);
+            free(grid_w_batched);
+            if (image_embeds_batched) {
+                for (int i = 0; i < n_blocks; i++) free(image_embeds_batched[i]);
+                free(image_embeds_batched);
+            }
+            free(n_image_embeds_batched);
+            if (outs_batched) {
+                for (int i = 0; i < n_blocks; i++) free(outs_batched[i]);
+                free(outs_batched);
+            }
+            free(outs_len_batched);
+
+            if (!ok) {
+                if (contents) {
+                    free(contents);
+                    contents = NULL;
+                }
+            }
+            mu_timing_log_stage(timing, "content_total", content_start);
+        } else {
+            for (int i = 0; i < n_blocks; i++) {
+                const char *task = "\nText Recognition:";
+                if (!strcmp(blocks[i].type, "table")) task = "\nTable Recognition:";
+                else if (!strcmp(blocks[i].type, "equation") ||
+                         !strcmp(blocks[i].type, "equation_block") ||
+                         !strcmp(blocks[i].type, "formula_number")) {
+                    task = "\nFormula Recognition:";
+                } else if (!strcmp(blocks[i].type, "image") ||
+                           !strcmp(blocks[i].type, "chart")) {
+                    task = "\nImage Analysis:";
+                }
+
+                stage_start = mu_time_now_seconds();
+                contents[i] = mu_generate_image_region_text(e, prep->path, blocks[i].bbox, task, content_max);
+                if (contents[i] && !strcmp(blocks[i].type, "table")) {
+                    char *html = mu_otsl_to_html(contents[i]);
+                    if (html) {
+                        free(contents[i]);
+                        contents[i] = html;
+                    }
+                }
+                mu_timing_log_stage(timing, "content_block_total", stage_start);
+            }
+            mu_timing_log_stage(timing, "content_total", content_start);
         }
-        mu_timing_log_stage(timing, "content_total", content_start);
     }
 
     stage_start = mu_time_now_seconds();

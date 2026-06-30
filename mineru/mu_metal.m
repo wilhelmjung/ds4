@@ -53,6 +53,15 @@ typedef struct {
     id<MTLBuffer> f32;
 } mu_gpu_dense_mps_weight;
 
+typedef struct {
+    MPSGraph *vision_attn_mpsgraph;
+    MPSGraphTensor *vision_attn_mpsgraph_q;
+    MPSGraphTensor *vision_attn_mpsgraph_k;
+    MPSGraphTensor *vision_attn_mpsgraph_v;
+    MPSGraphTensor *vision_attn_mpsgraph_out;
+    int vision_attn_mpsgraph_rows;
+} mu_gpu_thread_graph;
+
 struct mu_gpu {
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
@@ -89,6 +98,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> vision_attn_rows_flash_k16;
     id<MTLComputePipelineState> vision_attn_rows_packed_flash;
     id<MTLComputePipelineState> vision_attn_rows_packed_flash_opt;
+    id<MTLComputePipelineState> vision_rotary_pos_emb;
     id<MTLComputePipelineState> vision_attn_pack_qkv_mpsgraph;
     id<MTLComputePipelineState> vision_attn_copy_mpsgraph;
     id<MTLComputePipelineState> vision_add_bf16;
@@ -112,6 +122,8 @@ struct mu_gpu {
     id<MTLComputePipelineState> text_decode_qkv_proj_simd;
     id<MTLComputePipelineState> text_decode_qkv_rope_cache_simd;
     id<MTLComputePipelineState> text_attn_cached_simd;
+    id<MTLComputePipelineState> text_attn_cached_simd_batched;
+    id<MTLComputePipelineState> text_attn_cached_batched;
     id<MTLComputePipelineState> text_prefill_attn_flash;
     id<MTLComputePipelineState> text_prefill_attn_flash_opt;
     id<MTLComputePipelineState> text_prefill_attn_pos_flash;
@@ -125,12 +137,7 @@ struct mu_gpu {
     MPSMatrixMultiplication *dense_mps_896_128;
     MPSMatrixMultiplication *dense_mps_896_4864;
     MPSMatrixMultiplication *dense_mps_4864_896;
-    MPSGraph *vision_attn_mpsgraph;
-    MPSGraphTensor *vision_attn_mpsgraph_q;
-    MPSGraphTensor *vision_attn_mpsgraph_k;
-    MPSGraphTensor *vision_attn_mpsgraph_v;
-    MPSGraphTensor *vision_attn_mpsgraph_out;
-    int vision_attn_mpsgraph_rows;
+    mu_gpu_thread_graph thread_graphs[32];
     int dense_mps_1280_1280_rows;
     int dense_mps_1280_2560_rows;
     int dense_mps_1280_3840_rows;
@@ -352,6 +359,8 @@ static id<MTLBuffer> mu_gpu_get_or_create_buffer(mu_gpu *gpu, const void *cpu_pt
     return buffer;
 }
 
+static __thread int tl_worker_id = 0;
+
 typedef struct {
     mu_gpu *gpu;
     NSUInteger offset_a;
@@ -360,14 +369,21 @@ typedef struct {
 
 static id<MTLBuffer> mu_scratch_alloc_a(mu_scratch_allocator *alloc, NSUInteger size, NSUInteger *out_offset) {
     NSUInteger aligned = (size + 255) & ~255;
-    if (alloc->offset_a + aligned <= alloc->gpu->scratch_size) {
+    int max_workers = getenv("MU_CONCURRENT_WORKERS") ? atoi(getenv("MU_CONCURRENT_WORKERS")) : 4;
+    if (max_workers < 1) max_workers = 1;
+    unsigned long chunk = alloc->gpu->scratch_size / max_workers;
+    unsigned long limit = (unsigned long)(tl_worker_id + 1) * chunk;
+    if (tl_worker_id == max_workers - 1) {
+        limit = alloc->gpu->scratch_size;
+    }
+    if (alloc->offset_a + aligned <= limit) {
         *out_offset = alloc->offset_a;
         alloc->offset_a += aligned;
         return alloc->gpu->scratch_a;
     }
     if (getenv("MU_METAL_DEBUG")) {
-        fprintf(stderr, "Error: mu_scratch_alloc_a failed: offset_a=%lu, aligned=%lu, scratch_size=%lu\n",
-                (unsigned long)alloc->offset_a, (unsigned long)aligned, (unsigned long)alloc->gpu->scratch_size);
+        fprintf(stderr, "Error: mu_scratch_alloc_a failed: worker_id=%d, offset_a=%lu, aligned=%lu, limit=%lu\n",
+                tl_worker_id, (unsigned long)alloc->offset_a, (unsigned long)aligned, (unsigned long)limit);
     }
     *out_offset = 0;
     return nil;
@@ -375,10 +391,21 @@ static id<MTLBuffer> mu_scratch_alloc_a(mu_scratch_allocator *alloc, NSUInteger 
 
 static id<MTLBuffer> mu_scratch_alloc_b(mu_scratch_allocator *alloc, NSUInteger size, NSUInteger *out_offset) {
     NSUInteger aligned = (size + 255) & ~255;
-    if (alloc->offset_b + aligned <= alloc->gpu->scratch_size) {
+    int max_workers = getenv("MU_CONCURRENT_WORKERS") ? atoi(getenv("MU_CONCURRENT_WORKERS")) : 4;
+    if (max_workers < 1) max_workers = 1;
+    unsigned long chunk = alloc->gpu->scratch_size / max_workers;
+    unsigned long limit = (unsigned long)(tl_worker_id + 1) * chunk;
+    if (tl_worker_id == max_workers - 1) {
+        limit = alloc->gpu->scratch_size;
+    }
+    if (alloc->offset_b + aligned <= limit) {
         *out_offset = alloc->offset_b;
         alloc->offset_b += aligned;
         return alloc->gpu->scratch_b;
+    }
+    if (getenv("MU_METAL_DEBUG")) {
+        fprintf(stderr, "Error: mu_scratch_alloc_b failed: worker_id=%d, offset_b=%lu, aligned=%lu, limit=%lu\n",
+                tl_worker_id, (unsigned long)alloc->offset_b, (unsigned long)aligned, (unsigned long)limit);
     }
     *out_offset = 0;
     return nil;
@@ -415,7 +442,6 @@ int mu_gpu_cmd_begin_with_scratch_offsets(mu_gpu *gpu, unsigned long offset_a,
     return 0;
 }
 
-static __thread int tl_worker_id = 0;
 
 void mu_gpu_set_thread_worker_id(int worker_id) {
     tl_worker_id = worker_id;
@@ -653,7 +679,12 @@ void mu_gpu_buf_copy_from(void *dst, mu_gpu_buf src, unsigned long size) {
 
 static int mu_gpu_vision_attn_mpsgraph_ensure(mu_gpu *gpu, int rows) {
     if (!gpu || rows <= 0) return -1;
-    if (gpu->vision_attn_mpsgraph && gpu->vision_attn_mpsgraph_rows == rows) return 0;
+    int thread_idx = tl_worker_id;
+    if (thread_idx < 0) thread_idx = 0;
+    if (thread_idx >= 32) thread_idx = 32 - 1;
+    mu_gpu_thread_graph *tg = &gpu->thread_graphs[thread_idx];
+
+    if (tg->vision_attn_mpsgraph && tg->vision_attn_mpsgraph_rows == rows) return 0;
 
     MPSGraph *graph = [MPSGraph new];
     graph.options = MPSGraphOptionsNone;
@@ -672,12 +703,12 @@ static int mu_gpu_vision_attn_mpsgraph_ensure(mu_gpu *gpu, int rows) {
     MPSGraphTensor *out = [graph reshapeTensor:transposed withShape:out_shape name:@"out"];
     if (!q || !k || !v || !out) return -2;
 
-    gpu->vision_attn_mpsgraph = graph;
-    gpu->vision_attn_mpsgraph_q = q;
-    gpu->vision_attn_mpsgraph_k = k;
-    gpu->vision_attn_mpsgraph_v = v;
-    gpu->vision_attn_mpsgraph_out = out;
-    gpu->vision_attn_mpsgraph_rows = rows;
+    tg->vision_attn_mpsgraph = graph;
+    tg->vision_attn_mpsgraph_q = q;
+    tg->vision_attn_mpsgraph_k = k;
+    tg->vision_attn_mpsgraph_v = v;
+    tg->vision_attn_mpsgraph_out = out;
+    tg->vision_attn_mpsgraph_rows = rows;
     return 0;
 }
 
@@ -740,24 +771,25 @@ static int mu_gpu_vision_attn_rows_mpsgraph_stage(mu_gpu *gpu,
     [(*ctx)->encoder dispatchThreads:pack_grid threadsPerThreadgroup:pack_threads];
 
     mu_gpu_cmd_get_scratch_offsets(*ctx, &offset_a, &offset_b);
-    double t_pack = local_time_now_seconds();
-    int rc = mu_gpu_cmd_commit_and_wait(*ctx);
-    if (mpsgraph_profile) {
-        fprintf(stderr, "mu_timing stage=vision_attn_mpsgraph_pack_qkv seconds=%.6f\n",
-                local_time_now_seconds() - t_pack);
+    if (*ctx && (*ctx)->encoder) {
+        [(*ctx)->encoder endEncoding];
+        (*ctx)->encoder = nil;
     }
-    *ctx = NULL;
-    if (rc != 0) return rc;
 
     static pthread_mutex_t mpsgraph_mutex = PTHREAD_MUTEX_INITIALIZER;
     pthread_mutex_lock(&mpsgraph_mutex);
 
     double t_graph = local_time_now_seconds();
-    rc = mu_gpu_vision_attn_mpsgraph_ensure(gpu, rows);
+    int rc = mu_gpu_vision_attn_mpsgraph_ensure(gpu, rows);
     if (rc != 0) {
         pthread_mutex_unlock(&mpsgraph_mutex);
         return rc;
     }
+
+    int thread_idx = tl_worker_id;
+    if (thread_idx < 0) thread_idx = 0;
+    if (thread_idx >= 32) thread_idx = 32 - 1;
+    mu_gpu_thread_graph *tg = &gpu->thread_graphs[thread_idx];
 
     MPSShape *packed_shape = @[ @1, @16, @(rows), @80 ];
     MPSShape *out_shape = @[ @(rows), @1280 ];
@@ -781,15 +813,17 @@ static int mu_gpu_vision_attn_rows_mpsgraph_stage(mu_gpu *gpu,
     int run_failed = 0;
     @try {
         MPSGraphTensorDataDictionary *feeds = @{
-            gpu->vision_attn_mpsgraph_q: q_data,
-            gpu->vision_attn_mpsgraph_k: k_data,
-            gpu->vision_attn_mpsgraph_v: v_data,
+            tg->vision_attn_mpsgraph_q: q_data,
+            tg->vision_attn_mpsgraph_k: k_data,
+            tg->vision_attn_mpsgraph_v: v_data,
         };
-        MPSGraphTensorDataDictionary *results = @{ gpu->vision_attn_mpsgraph_out: out_data };
-        [gpu->vision_attn_mpsgraph runWithMTLCommandQueue:gpu->queue
-                                                     feeds:feeds
-                                          targetOperations:nil
-                                         resultsDictionary:results];
+        MPSGraphTensorDataDictionary *results = @{ tg->vision_attn_mpsgraph_out: out_data };
+        MPSCommandBuffer *mps_cmd_buf = [MPSCommandBuffer commandBufferWithCommandBuffer:(*ctx)->command_buffer];
+        [tg->vision_attn_mpsgraph encodeToCommandBuffer:mps_cmd_buf
+                                                  feeds:feeds
+                                       targetOperations:nil
+                                      resultsDictionary:results
+                                    executionDescriptor:nil];
     } @catch (NSException *exception) {
         run_failed = 1;
         if (getenv("MU_METAL_DEBUG")) {
@@ -805,8 +839,9 @@ static int mu_gpu_vision_attn_rows_mpsgraph_stage(mu_gpu *gpu,
                 local_time_now_seconds() - t_graph);
     }
 
-    rc = mu_gpu_cmd_begin_with_scratch_offsets(gpu, offset_a, offset_b, ctx);
-    if (rc != 0) return rc;
+    (*ctx)->encoder = [(*ctx)->command_buffer computeCommandEncoder];
+    if (!(*ctx)->encoder) return -6;
+
     if (mpsgraph_profile) mu_gpu_cmd_set_label(*ctx, "vision_attn_mpsgraph_copy_round");
     [(*ctx)->encoder setComputePipelineState:gpu->vision_attn_copy_mpsgraph];
     [(*ctx)->encoder setBuffer:graph_out offset:0 atIndex:0];
@@ -988,6 +1023,8 @@ int mu_gpu_create(mu_gpu **out) {
             gpu->vision_attn_copy_mpsgraph = mu_gpu_make_pipeline(device, @"mu_vision.metal",
                                                                   @"mu_vision_attn_copy_mpsgraph");
         }
+        gpu->vision_rotary_pos_emb = mu_gpu_make_pipeline(device, @"mu_vision.metal",
+                                                          @"mu_vision_rotary_pos_emb_kernel");
         gpu->vision_add_bf16 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
                                                     @"mu_vision_add_bf16");
         gpu->vision_quick_gelu_bf16 = mu_gpu_make_pipeline(device, @"mu_vision.metal",
@@ -1030,6 +1067,10 @@ int mu_gpu_create(mu_gpu **out) {
                                                                     @"mu_text_decode_qkv_rope_cache_simd");
         gpu->text_attn_cached_simd = mu_gpu_make_pipeline(device, @"mu_attn.metal",
                                                           @"mu_text_attn_cached_simd");
+        gpu->text_attn_cached_simd_batched = mu_gpu_make_pipeline(device, @"mu_attn.metal",
+                                                                  @"mu_text_attn_cached_simd_batched");
+        gpu->text_attn_cached_batched = mu_gpu_make_pipeline(device, @"mu_attn.metal",
+                                                             @"mu_text_attn_cached_batched");
         gpu->text_prefill_rope_cache_update = mu_gpu_make_pipeline(device, @"mu_attn.metal",
                                                                    @"mu_text_prefill_rope_cache_update");
         gpu->text_prefill_attn_flash = mu_gpu_make_pipeline(device, @"mu_attn.metal",
@@ -1046,7 +1087,7 @@ int mu_gpu_create(mu_gpu **out) {
         } else {
             strlcpy(gpu->device_name, "unknown", sizeof(gpu->device_name));
         }
-        gpu->scratch_size = 1536ULL * 1024ULL * 1024ULL; // 1.5 GB
+        gpu->scratch_size = 3072ULL * 1024ULL * 1024ULL; // 3.0 GB
         gpu->scratch_a = [device newBufferWithLength:gpu->scratch_size options:MTLResourceStorageModeShared];
         gpu->scratch_b = [device newBufferWithLength:gpu->scratch_size options:MTLResourceStorageModeShared];
         
@@ -1102,6 +1143,8 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->text_decode_qkv_proj_simd = nil;
     gpu->text_decode_qkv_rope_cache_simd = nil;
     gpu->text_attn_cached_simd = nil;
+    gpu->text_attn_cached_simd_batched = nil;
+    gpu->text_attn_cached_batched = nil;
     gpu->dense_mps_1280_1280 = nil;
     gpu->dense_mps_1280_2560 = nil;
     gpu->dense_mps_1280_3840 = nil;
@@ -1114,6 +1157,7 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->vision_gelu_bf16 = nil;
     gpu->vision_quick_gelu_bf16 = nil;
     gpu->vision_add_bf16 = nil;
+    gpu->vision_rotary_pos_emb = nil;
     gpu->vision_attn_rows_online = nil;
     gpu->vision_attn_rows_flash = nil;
     gpu->vision_attn_rows_flash_k16 = nil;
@@ -1121,11 +1165,13 @@ void mu_gpu_destroy(mu_gpu *gpu) {
     gpu->vision_attn_rows_packed_flash_opt = nil;
     gpu->vision_attn_pack_qkv_mpsgraph = nil;
     gpu->vision_attn_copy_mpsgraph = nil;
-    gpu->vision_attn_mpsgraph = nil;
-    gpu->vision_attn_mpsgraph_q = nil;
-    gpu->vision_attn_mpsgraph_k = nil;
-    gpu->vision_attn_mpsgraph_v = nil;
-    gpu->vision_attn_mpsgraph_out = nil;
+    for (int i = 0; i < 32; i++) {
+        gpu->thread_graphs[i].vision_attn_mpsgraph = nil;
+        gpu->thread_graphs[i].vision_attn_mpsgraph_q = nil;
+        gpu->thread_graphs[i].vision_attn_mpsgraph_k = nil;
+        gpu->thread_graphs[i].vision_attn_mpsgraph_v = nil;
+        gpu->thread_graphs[i].vision_attn_mpsgraph_out = nil;
+    }
     gpu->vision_softmax_pv_head = nil;
     gpu->vision_pv_head = nil;
     gpu->vision_softmax_bf16_rows = nil;
@@ -1469,7 +1515,7 @@ int mu_gpu_vision_patch_embed(mu_gpu *gpu, const float *x,
 
     mu_gpu_buf x_buf = mu_gpu_scratch_alloc_a_ctx(ctx, x_bytes);
     mu_gpu_buf w_buf = mu_gpu_get_weight_buf(gpu, w_bf16, w_bytes);
-    mu_gpu_buf bias_buf = mu_gpu_get_weight_buf(gpu, bias_zero, bias_bytes);
+    mu_gpu_buf bias_buf = mu_gpu_scratch_alloc_a_ctx(ctx, bias_bytes);
     mu_gpu_buf out_buf = mu_gpu_scratch_alloc_b_ctx(ctx, out_bytes);
     if (!x_buf.ptr || !w_buf.ptr || !bias_buf.ptr || !out_buf.ptr) {
         free(bias_zero);
@@ -1477,6 +1523,7 @@ int mu_gpu_vision_patch_embed(mu_gpu *gpu, const float *x,
         return -3;
     }
     mu_gpu_buf_copy_to(x_buf, x, x_bytes);
+    mu_gpu_buf_copy_to(bias_buf, bias_zero, bias_bytes);
     rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, x_buf, w_buf, bias_buf, x_rows, cols, out_cols, out_buf);
     if (rc == 0) {
         rc = mu_gpu_cmd_commit_and_wait(ctx);
@@ -2077,6 +2124,41 @@ int mu_gpu_vision_merge4(mu_gpu *gpu, const float *hidden,
     return rc;
 }
 
+int mu_gpu_vision_rotary_pos_emb(mu_gpu *gpu, int grid_t, int grid_h, int grid_w,
+                                 int merge, float *out, int out_rows, int out_cols) {
+    if (!gpu || !out || grid_t <= 0 || grid_h <= 0 || grid_w <= 0 || out_rows <= 0 || out_cols != 40) return -1;
+    @autoreleasepool {
+        mu_gpu_cmd_ctx *ctx = NULL;
+        int rc = mu_gpu_cmd_begin(gpu, &ctx);
+        if (rc != 0) return rc;
+        mu_gpu_cmd_set_label(ctx, "vision_rotary_pos_emb");
+
+        NSUInteger out_bytes = (NSUInteger)out_rows * 40u * sizeof(float);
+        mu_gpu_buf out_buf = mu_gpu_scratch_alloc_a_ctx(ctx, out_bytes);
+        if (!out_buf.ptr) {
+            mu_gpu_cmd_discard(ctx);
+            return -2;
+        }
+
+        [ctx->encoder setComputePipelineState:gpu->vision_rotary_pos_emb];
+        [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)out_buf.ptr offset:out_buf.offset atIndex:0];
+        [ctx->encoder setBytes:&grid_t length:sizeof(grid_t) atIndex:1];
+        [ctx->encoder setBytes:&grid_h length:sizeof(grid_h) atIndex:2];
+        [ctx->encoder setBytes:&grid_w length:sizeof(grid_w) atIndex:3];
+        [ctx->encoder setBytes:&merge length:sizeof(merge) atIndex:4];
+
+        MTLSize grid = MTLSizeMake((NSUInteger)out_rows, 1, 1);
+        MTLSize threads = MTLSizeMake(256, 1, 1);
+        [ctx->encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+
+        rc = mu_gpu_cmd_commit_and_wait(ctx);
+        if (rc == 0) {
+            mu_gpu_buf_copy_from(out, out_buf, out_bytes);
+        }
+        return rc;
+    }
+}
+
 int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
                          const float *patch_embeds,
                          int rows, int cols,
@@ -2428,14 +2510,16 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
 }
 
 static int mu_gpu_text_layers_mlp_seq_engine(mu_gpu *gpu, void *engine,
-                                            const float *hidden_states_cpu,
-                                            int n_ids, const int *position_ids,
-                                            int n_layers,
-                                            int cache_cap,
-                                            mu_gpu_kv_cache *gpu_cache,
-                                            float *out,
-                                            bool last_only) {
+                                             const float *hidden_states_cpu,
+                                             int n_ids, const int *position_ids,
+                                             int n_layers,
+                                             int cache_cap,
+                                             int cache_offset,
+                                             mu_gpu_kv_cache *gpu_cache,
+                                             float *out,
+                                             bool last_only) {
     if (!gpu || !engine || !hidden_states_cpu || n_ids <= 0 || n_layers <= 0) return -1;
+    if (gpu_cache && (cache_offset < 0 || cache_offset + n_ids > cache_cap)) return -1;
 
     @autoreleasepool {
         mu_gpu_cmd_ctx *ctx = NULL;
@@ -2450,6 +2534,9 @@ static int mu_gpu_text_layers_mlp_seq_engine(mu_gpu *gpu, void *engine,
         unsigned long embed_bytes = (unsigned long)n_ids * (unsigned long)hidden * sizeof(float);
         unsigned long kv_bytes = (unsigned long)n_ids * 128u * sizeof(float);
         unsigned long mlp_bytes = (unsigned long)n_ids * (unsigned long)inter * sizeof(float);
+        bool use_bf16_cache = (getenv("MU_KV_CACHE_BF16") != NULL);
+        NSUInteger elem_size = use_bf16_cache ? sizeof(uint16_t) : sizeof(float);
+        NSUInteger cache_start_bytes = (NSUInteger)cache_offset * 128u * elem_size;
 
         mu_gpu_buf ping_buf = mu_gpu_scratch_alloc_a_ctx(ctx, embed_bytes);
         mu_gpu_buf pong_buf = mu_gpu_scratch_alloc_b_ctx(ctx, embed_bytes);
@@ -2553,8 +2640,8 @@ static int mu_gpu_text_layers_mlp_seq_engine(mu_gpu *gpu, void *engine,
                 [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_k.ptr offset:temp_k.offset atIndex:0];
                 [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_v.ptr offset:temp_v.offset atIndex:1];
                 [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)pos_buf.ptr offset:pos_buf.offset atIndex:2];
-                [ctx->encoder setBuffer:gpu_cache->k_cache offset:0 atIndex:3];
-                [ctx->encoder setBuffer:gpu_cache->v_cache offset:0 atIndex:4];
+                [ctx->encoder setBuffer:gpu_cache->k_cache offset:cache_start_bytes atIndex:3];
+                [ctx->encoder setBuffer:gpu_cache->v_cache offset:cache_start_bytes atIndex:4];
                 [ctx->encoder setBytes:&n_ids length:sizeof(n_ids) atIndex:5];
                 [ctx->encoder setBytes:&cache_cap length:sizeof(cache_cap) atIndex:6];
                 [ctx->encoder setBytes:&layer length:sizeof(layer) atIndex:7];
@@ -2575,8 +2662,8 @@ static int mu_gpu_text_layers_mlp_seq_engine(mu_gpu *gpu, void *engine,
                     }
                     [ctx->encoder setComputePipelineState:pstate];
                     [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_q.ptr offset:temp_q.offset atIndex:0];
-                    [ctx->encoder setBuffer:gpu_cache->k_cache offset:0 atIndex:1];
-                    [ctx->encoder setBuffer:gpu_cache->v_cache offset:0 atIndex:2];
+                    [ctx->encoder setBuffer:gpu_cache->k_cache offset:cache_start_bytes atIndex:1];
+                    [ctx->encoder setBuffer:gpu_cache->v_cache offset:cache_start_bytes atIndex:2];
                     [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)pos_buf.ptr offset:pos_buf.offset atIndex:3];
                     [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_attn.ptr offset:temp_attn.offset atIndex:4];
                     [ctx->encoder setBytes:&n_ids length:sizeof(n_ids) atIndex:5];
@@ -2590,8 +2677,8 @@ static int mu_gpu_text_layers_mlp_seq_engine(mu_gpu *gpu, void *engine,
                     }
                     [ctx->encoder setComputePipelineState:pstate];
                     [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_q.ptr offset:temp_q.offset atIndex:0];
-                    [ctx->encoder setBuffer:gpu_cache->k_cache offset:0 atIndex:1];
-                    [ctx->encoder setBuffer:gpu_cache->v_cache offset:0 atIndex:2];
+                    [ctx->encoder setBuffer:gpu_cache->k_cache offset:cache_start_bytes atIndex:1];
+                    [ctx->encoder setBuffer:gpu_cache->v_cache offset:cache_start_bytes atIndex:2];
                     [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_attn.ptr offset:temp_attn.offset atIndex:3];
                     [ctx->encoder setBytes:&n_ids length:sizeof(n_ids) atIndex:4];
                     [ctx->encoder setBytes:&cache_cap length:sizeof(cache_cap) atIndex:5];
@@ -2655,7 +2742,7 @@ int mu_gpu_text_layers_mlp_seq_from_hidden(mu_gpu *gpu, void *engine,
                                            int n_layers, float *out) {
     return mu_gpu_text_layers_mlp_seq_engine(gpu, engine, initial_hidden,
                                              n_ids, position_ids, n_layers,
-                                             0, NULL, out, false);
+                                             0, 0, NULL, out, false);
 }
 
 int mu_gpu_text_prefill_cache_from_embeddings(mu_gpu *gpu, void *engine,
@@ -2667,7 +2754,19 @@ int mu_gpu_text_prefill_cache_from_embeddings(mu_gpu *gpu, void *engine,
     return mu_gpu_text_layers_mlp_seq_engine(gpu, engine, hidden_states,
                                              n_ids, position_ids,
                                              mu_engine_text_layers((const mu_engine *)engine),
-                                             cache_cap, gpu_cache, last_hidden_out, true);
+                                             cache_cap, 0, gpu_cache, last_hidden_out, true);
+}
+
+int mu_gpu_text_prefill_cache_from_embeddings_offset(mu_gpu *gpu, void *engine,
+                                                     const float *hidden_states,
+                                                     int n_ids, const int *position_ids,
+                                                     int cache_cap, int cache_offset,
+                                                     mu_gpu_kv_cache *gpu_cache,
+                                                     float *last_hidden_out) {
+    return mu_gpu_text_layers_mlp_seq_engine(gpu, engine, hidden_states,
+                                             n_ids, position_ids,
+                                             mu_engine_text_layers((const mu_engine *)engine),
+                                             cache_cap, cache_offset, gpu_cache, last_hidden_out, true);
 }
 
 int mu_gpu_text_layers_mlp_seq(mu_gpu *gpu, void *engine,
@@ -2695,7 +2794,7 @@ int mu_gpu_text_layers_mlp_seq(mu_gpu *gpu, void *engine,
 
     int rc = mu_gpu_text_layers_mlp_seq_engine(gpu, engine, initial_hidden,
                                                n_ids, NULL, n_layers,
-                                               0, NULL, out, false);
+                                               0, 0, NULL, out, false);
     free(initial_hidden);
     return rc;
 }
@@ -4301,6 +4400,55 @@ int mu_gpu_text_attn_cached_resident_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
     return 0;
 }
 
+int mu_gpu_text_attn_cached_resident_batched_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf q,
+                                                 mu_gpu_kv_cache *cache, int layer,
+                                                 int batch_size,
+                                                 mu_gpu_buf cache_lens,
+                                                 mu_gpu_buf cache_offsets,
+                                                 mu_gpu_buf out) {
+    if (!ctx || !q.ptr || !cache || !out.ptr || batch_size <= 0 ||
+        layer < 0 || layer >= cache->layers || !cache_lens.ptr || !cache_offsets.ptr) return -1;
+    id<MTLBuffer> q_buf = (__bridge id<MTLBuffer>)q.ptr;
+    id<MTLBuffer> lens_buf = (__bridge id<MTLBuffer>)cache_lens.ptr;
+    id<MTLBuffer> offsets_buf = (__bridge id<MTLBuffer>)cache_offsets.ptr;
+    id<MTLBuffer> out_buf = (__bridge id<MTLBuffer>)out.ptr;
+
+    NSUInteger kv_offset = mu_gpu_kv_cache_offset(cache, layer);
+
+    BOOL use_bf16_cache = (getenv("MU_KV_CACHE_BF16") != NULL);
+    bool disable_simd = getenv("MU_TEXT_ATTN_CACHED_NO_SIMD") != NULL;
+    bool use_simd = !disable_simd;
+    if (use_simd && ctx->gpu->text_attn_cached_simd_batched) {
+        [ctx->encoder setComputePipelineState:ctx->gpu->text_attn_cached_simd_batched];
+        [ctx->encoder setBuffer:q_buf offset:q.offset atIndex:0];
+        [ctx->encoder setBuffer:cache->k_cache offset:kv_offset atIndex:1];
+        [ctx->encoder setBuffer:cache->v_cache offset:kv_offset atIndex:2];
+        [ctx->encoder setBuffer:out_buf offset:out.offset atIndex:3];
+        [ctx->encoder setBuffer:lens_buf offset:cache_lens.offset atIndex:4];
+        [ctx->encoder setBuffer:offsets_buf offset:cache_offsets.offset atIndex:5];
+        [ctx->encoder setBytes:&use_bf16_cache length:sizeof(use_bf16_cache) atIndex:6];
+
+        MTLSize grid = MTLSizeMake(14 * 32, (NSUInteger)batch_size, 1);
+        MTLSize threads = MTLSizeMake(32, 1, 1);
+        [ctx->encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+    } else {
+        [ctx->encoder setComputePipelineState:ctx->gpu->text_attn_cached_batched];
+        [ctx->encoder setBuffer:q_buf offset:q.offset atIndex:0];
+        [ctx->encoder setBuffer:cache->k_cache offset:kv_offset atIndex:1];
+        [ctx->encoder setBuffer:cache->v_cache offset:kv_offset atIndex:2];
+        [ctx->encoder setBuffer:out_buf offset:out.offset atIndex:3];
+        [ctx->encoder setBuffer:lens_buf offset:cache_lens.offset atIndex:4];
+        [ctx->encoder setBuffer:offsets_buf offset:cache_offsets.offset atIndex:5];
+        [ctx->encoder setBytes:&use_bf16_cache length:sizeof(use_bf16_cache) atIndex:6];
+
+        MTLSize grid = MTLSizeMake(14, (NSUInteger)batch_size, 1);
+        MTLSize threads = MTLSizeMake(1, 1, 1);
+        [ctx->encoder dispatchThreads:grid threadsPerThreadgroup:threads];
+    }
+    return 0;
+}
+
+
 int mu_gpu_text_logits_argmax_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf hidden_state,
                                   mu_gpu_buf final_norm_bf16,
                                   mu_gpu_buf embed_bf16,
@@ -4538,8 +4686,13 @@ static int mu_gpu_text_decode_icb_record(void *engine, mu_gpu_kv_cache *cache) {
     NSUInteger q_out_bytes = (NSUInteger)q_out * sizeof(float);
     NSUInteger kv_out_bytes = (NSUInteger)kv_out * sizeof(float);
 
-    NSUInteger offset_a = 0;
-    NSUInteger offset_b = 0;
+    int max_workers = getenv("MU_CONCURRENT_WORKERS") ? atoi(getenv("MU_CONCURRENT_WORKERS")) : 4;
+    if (max_workers < 1) max_workers = 1;
+    unsigned long chunk = gpu->scratch_size / max_workers;
+    NSUInteger base_offset = (NSUInteger)(tl_worker_id * chunk);
+
+    NSUInteger offset_a = base_offset;
+    NSUInteger offset_b = base_offset;
 
     NSUInteger cur_hs_offset = offset_a;
     offset_a += hidden_bytes;
@@ -4842,8 +4995,13 @@ int mu_gpu_text_decode_icb_execute(void *engine,
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (!encoder) return -3;
 
-        // Copy input hidden states to scratchpad offset 0
-        memcpy([gpu->scratch_a contents], hidden_state_cpu, 896 * sizeof(float));
+        int max_workers = getenv("MU_CONCURRENT_WORKERS") ? atoi(getenv("MU_CONCURRENT_WORKERS")) : 4;
+        if (max_workers < 1) max_workers = 1;
+        unsigned long chunk = gpu->scratch_size / max_workers;
+        NSUInteger base_offset = (NSUInteger)(tl_worker_id * chunk);
+
+        // Copy input hidden states to scratchpad offset base_offset
+        memcpy((char *)[gpu->scratch_a contents] + base_offset, hidden_state_cpu, 896 * sizeof(float));
 
         // 4. Mark resources resident on GPU
         [encoder useResources:cache->resources count:cache->resource_count usage:MTLResourceUsageRead | MTLResourceUsageWrite];
@@ -4862,8 +5020,8 @@ int mu_gpu_text_decode_icb_execute(void *engine,
         // Copy out results from scratch_b to out_logits
         int best_id = 0;
         float best_val = 0.0f;
-        memcpy(&best_id, (char *)[gpu->scratch_b contents], sizeof(int));
-        memcpy(&best_val, (char *)[gpu->scratch_b contents] + sizeof(int), sizeof(float));
+        memcpy(&best_id, (char *)[gpu->scratch_b contents] + base_offset, sizeof(int));
+        memcpy(&best_val, (char *)[gpu->scratch_b contents] + base_offset + sizeof(int), sizeof(float));
 
         struct mu_token_logit *out = (struct mu_token_logit *)out_logits;
         out[0].id = best_id;
@@ -4875,4 +5033,158 @@ int mu_gpu_text_decode_icb_execute(void *engine,
     }
 
     return 0;
+}
+
+int mu_gpu_text_decode_step_batched(mu_gpu *gpu, void *engine,
+                                    mu_gpu_kv_cache *cache,
+                                    int batch_size,
+                                    const int *active_mask,
+                                    const int *cache_lens,
+                                    const int *cache_offsets,
+                                    const int *pos3_batched,
+                                    const float *hidden_states_in_cpu,
+                                    float *hidden_states_out_cpu) {
+    if (!gpu || !engine || !cache || batch_size <= 0 || !active_mask ||
+        !cache_lens || !cache_offsets || !pos3_batched ||
+        !hidden_states_in_cpu || !hidden_states_out_cpu) return -1;
+
+    const int hidden = 896;
+    const int inter = 4864;
+    const float eps = 1e-6f;
+
+    @autoreleasepool {
+        mu_gpu_cmd_ctx *ctx = NULL;
+        int rc = mu_gpu_cmd_begin(gpu, &ctx);
+        if (rc != 0) return rc;
+        mu_gpu_cmd_set_label(ctx, "text_decode_step_batched");
+
+        unsigned long embed_bytes = (unsigned long)batch_size * (unsigned long)hidden * sizeof(float);
+        unsigned long kv_bytes = (unsigned long)batch_size * 128u * sizeof(float);
+        unsigned long mlp_bytes = (unsigned long)batch_size * (unsigned long)inter * sizeof(float);
+
+        mu_gpu_buf ping_buf = mu_gpu_scratch_alloc_a_ctx(ctx, embed_bytes);
+        mu_gpu_buf pong_buf = mu_gpu_scratch_alloc_b_ctx(ctx, embed_bytes);
+        mu_gpu_buf temp_normed = mu_gpu_scratch_alloc_a_ctx(ctx, embed_bytes);
+        mu_gpu_buf temp_q = mu_gpu_scratch_alloc_a_ctx(ctx, embed_bytes);
+        mu_gpu_buf temp_k = mu_gpu_scratch_alloc_a_ctx(ctx, kv_bytes);
+        mu_gpu_buf temp_v = mu_gpu_scratch_alloc_a_ctx(ctx, kv_bytes);
+        mu_gpu_buf temp_attn = mu_gpu_scratch_alloc_b_ctx(ctx, embed_bytes);
+        mu_gpu_buf temp_proj = mu_gpu_scratch_alloc_b_ctx(ctx, embed_bytes);
+        mu_gpu_buf temp_res1 = mu_gpu_scratch_alloc_b_ctx(ctx, embed_bytes);
+        mu_gpu_buf temp_fc1 = mu_gpu_scratch_alloc_a_ctx(ctx, mlp_bytes);
+
+        unsigned long meta_bytes = (unsigned long)batch_size * sizeof(int);
+        mu_gpu_buf lens_buf = mu_gpu_scratch_alloc_a_ctx(ctx, meta_bytes);
+        mu_gpu_buf offsets_buf = mu_gpu_scratch_alloc_b_ctx(ctx, meta_bytes);
+
+        if (!ping_buf.ptr || !pong_buf.ptr || !temp_normed.ptr || !temp_q.ptr ||
+            !temp_k.ptr || !temp_v.ptr || !temp_attn.ptr || !temp_proj.ptr ||
+            !temp_res1.ptr || !temp_fc1.ptr || !lens_buf.ptr || !offsets_buf.ptr) {
+            mu_gpu_cmd_discard(ctx);
+            return -2;
+        }
+
+        mu_gpu_buf_copy_to(ping_buf, hidden_states_in_cpu, embed_bytes);
+        mu_gpu_buf_copy_to(lens_buf, cache_lens, meta_bytes);
+        mu_gpu_buf_copy_to(offsets_buf, cache_offsets, meta_bytes);
+
+        mu_gpu_buf current_in = ping_buf;
+        mu_gpu_buf current_out = pong_buf;
+
+        char name[256];
+        for (int layer = 0; layer < 24; layer++) {
+            const unsigned short *input_norm = mu_engine_get_text_layer_tensor(engine, layer, "input_layernorm.weight", 1, hidden, 0);
+            const unsigned short *post_norm = mu_engine_get_text_layer_tensor(engine, layer, "post_attention_layernorm.weight", 1, hidden, 0);
+            const unsigned short *qw = mu_engine_get_text_layer_tensor(engine, layer, "self_attn.q_proj.weight", 2, hidden, hidden);
+            const unsigned short *qb = mu_engine_get_text_layer_tensor(engine, layer, "self_attn.q_proj.bias", 1, hidden, 0);
+            const unsigned short *kw = mu_engine_get_text_layer_tensor(engine, layer, "self_attn.k_proj.weight", 2, 128, hidden);
+            const unsigned short *kb = mu_engine_get_text_layer_tensor(engine, layer, "self_attn.k_proj.bias", 1, 128, 0);
+            const unsigned short *vw = mu_engine_get_text_layer_tensor(engine, layer, "self_attn.v_proj.weight", 2, 128, hidden);
+            const unsigned short *vb = mu_engine_get_text_layer_tensor(engine, layer, "self_attn.v_proj.bias", 1, 128, 0);
+            const unsigned short *ow = mu_engine_get_text_layer_tensor(engine, layer, "self_attn.o_proj.weight", 2, hidden, hidden);
+            const unsigned short *gate_w = mu_engine_get_text_layer_tensor(engine, layer, "mlp.gate_proj.weight", 2, inter, hidden);
+            const unsigned short *up_w = mu_engine_get_text_layer_tensor(engine, layer, "mlp.up_proj.weight", 2, inter, hidden);
+            const unsigned short *down_w = mu_engine_get_text_layer_tensor(engine, layer, "mlp.down_proj.weight", 2, hidden, inter);
+
+            if (!input_norm || !post_norm || !qw || !qb || !kw || !kb || !vw || !vb ||
+                !ow || !gate_w || !up_w || !down_w) {
+                mu_gpu_cmd_discard(ctx);
+                return -3;
+            }
+
+            mu_gpu_buf input_norm_buf = mu_gpu_get_weight_buf(gpu, input_norm, hidden * sizeof(unsigned short));
+            mu_gpu_buf post_norm_buf = mu_gpu_get_weight_buf(gpu, post_norm, hidden * sizeof(unsigned short));
+            mu_gpu_buf qw_buf = mu_gpu_get_weight_buf(gpu, qw, hidden * hidden * sizeof(unsigned short));
+            mu_gpu_buf qb_buf = mu_gpu_get_weight_buf(gpu, qb, hidden * sizeof(unsigned short));
+            mu_gpu_buf kw_buf = mu_gpu_get_weight_buf(gpu, kw, 128 * hidden * sizeof(unsigned short));
+            mu_gpu_buf kb_buf = mu_gpu_get_weight_buf(gpu, kb, 128 * sizeof(unsigned short));
+            mu_gpu_buf vw_buf = mu_gpu_get_weight_buf(gpu, vw, 128 * hidden * sizeof(unsigned short));
+            mu_gpu_buf vb_buf = mu_gpu_get_weight_buf(gpu, vb, 128 * sizeof(unsigned short));
+            mu_gpu_buf ow_buf = mu_gpu_get_weight_buf(gpu, ow, hidden * hidden * sizeof(unsigned short));
+            mu_gpu_buf gate_w_buf = mu_gpu_get_weight_buf(gpu, gate_w, inter * hidden * sizeof(unsigned short));
+            mu_gpu_buf up_w_buf = mu_gpu_get_weight_buf(gpu, up_w, inter * hidden * sizeof(unsigned short));
+            mu_gpu_buf down_w_buf = mu_gpu_get_weight_buf(gpu, down_w, hidden * inter * sizeof(unsigned short));
+
+            if (!input_norm_buf.ptr || !post_norm_buf.ptr || !qw_buf.ptr || !qb_buf.ptr ||
+                !kw_buf.ptr || !kb_buf.ptr || !vw_buf.ptr || !vb_buf.ptr || !ow_buf.ptr ||
+                !gate_w_buf.ptr || !up_w_buf.ptr || !down_w_buf.ptr) {
+                mu_gpu_cmd_discard(ctx);
+                return -4;
+            }
+
+            rc = mu_gpu_rmsnorm_bf16_rows_ctx(ctx, current_in, input_norm_buf, batch_size, hidden, eps, temp_normed);
+            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+
+            rc = mu_gpu_dense_f32_bias_rows_ctx(ctx, temp_normed, qw_buf, qb_buf, batch_size, hidden, hidden, temp_q);
+            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+
+            rc = mu_gpu_dense_f32_bias_rows_ctx(ctx, temp_normed, kw_buf, kb_buf, batch_size, hidden, 128, temp_k);
+            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+
+            rc = mu_gpu_dense_f32_bias_rows_ctx(ctx, temp_normed, vw_buf, vb_buf, batch_size, hidden, 128, temp_v);
+            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+
+            for (int b = 0; b < batch_size; b++) {
+                if (active_mask[b]) {
+                    mu_gpu_buf q_b = temp_q; q_b.offset += (size_t)b * 896u * sizeof(float);
+                    mu_gpu_buf k_b = temp_k; k_b.offset += (size_t)b * 128u * sizeof(float);
+                    mu_gpu_buf v_b = temp_v; v_b.offset += (size_t)b * 128u * sizeof(float);
+                    int abs_cache_pos = cache_offsets[b] + cache_lens[b] - 1;
+                    rc = mu_gpu_text_rope_cache_update_ctx(ctx, q_b, k_b, v_b, cache, layer, abs_cache_pos, &pos3_batched[b * 3]);
+                    if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+                }
+            }
+
+            rc = mu_gpu_text_attn_cached_resident_batched_ctx(ctx, temp_q, cache, layer, batch_size, lens_buf, offsets_buf, temp_attn);
+            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+
+            rc = mu_gpu_dense_f32_rows_ctx(ctx, temp_attn, ow_buf, batch_size, hidden, hidden, temp_proj);
+            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+
+            rc = mu_gpu_add_f32_ctx(ctx, current_in, temp_proj, temp_res1, batch_size * hidden);
+            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+
+            rc = mu_gpu_rmsnorm_bf16_rows_ctx(ctx, temp_res1, post_norm_buf, batch_size, hidden, eps, temp_normed);
+            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+
+            rc = mu_gpu_dense_bf16_rows_simdgroup_swiglu_ctx(ctx, temp_normed, gate_w_buf, up_w_buf, batch_size, hidden, inter, temp_fc1);
+            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+
+            rc = mu_gpu_dense_f32_rows_ctx(ctx, temp_fc1, down_w_buf, batch_size, inter, hidden, temp_proj);
+            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+
+            rc = mu_gpu_add_f32_ctx(ctx, temp_res1, temp_proj, current_out, batch_size * hidden);
+            if (rc != 0) { mu_gpu_cmd_discard(ctx); return rc; }
+
+            mu_gpu_buf tmp = current_in;
+            current_in = current_out;
+            current_out = tmp;
+        }
+
+        rc = mu_gpu_cmd_commit_and_wait(ctx);
+        if (rc == 0) {
+            mu_gpu_buf_copy_from(hidden_states_out_cpu, current_in, embed_bytes);
+        }
+        return rc;
+    }
 }
