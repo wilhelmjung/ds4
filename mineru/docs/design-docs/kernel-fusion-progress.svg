@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="2040" viewBox="0 0 1280 2040" role="img" aria-labelledby="title desc">
   <title id="title">MinerU Metal kernel fusion progress</title>
-  <desc id="desc">Current Metal decoder fusion status with default SIMDGroup FFN, opt-in QKV RoPE cache fusion, and next bottleneck targets.</desc>
+  <desc id="desc">Current Metal decoder fusion status with default SIMDGroup FFN, default ICB QKV RoPE cache fusion, and next bottleneck targets.</desc>
   <defs>
     <marker id="arrow" markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto" markerUnits="strokeWidth">
       <path d="M2 2 L10 6 L2 10 Z" fill="#1f1f1f"/>
@@ -24,13 +24,13 @@
   <rect x="0" y="0" width="1280" height="2040" fill="#fff"/>
 
   <text x="640" y="78" text-anchor="middle" class="title">MinerU Metal Kernel Fusion Progress</text>
-  <text x="640" y="116" text-anchor="middle" class="subtitle">Default decode uses SIMDGroup FFN; ICB remains opt-in and correct.</text>
+  <text x="640" y="116" text-anchor="middle" class="subtitle">Default and ICB decode use SIMDGroup FFN; ICB remains opt-in.</text>
 
   <g transform="translate(80 146)">
     <rect x="0" y="0" width="1120" height="132" rx="18" fill="#f8fafc" stroke="#cbd5e1" stroke-width="3"/>
     <text x="44" y="48" class="label">Current decode dispatch picture</text>
     <text x="44" y="86" class="small">Default: 145 dispatches / token</text>
-    <text x="360" y="86" class="small">ICB: 1 execution command / token; old FFN sequence</text>
+    <text x="360" y="86" class="small">ICB: 1 execution command / token; default FFN sequence</text>
     <text x="960" y="86" class="metric">-144 calls</text>
   </g>
 
@@ -60,7 +60,7 @@
 
     <rect x="150" y="610" width="490" height="78" class="box" fill="#fef9c3" stroke="#d6c944"/>
     <text x="395" y="641" text-anchor="middle" class="label">RoPE + KV-cache</text>
-    <text x="395" y="670" text-anchor="middle" class="small">Opt-in: fused with QKV projection</text>
+    <text x="395" y="670" text-anchor="middle" class="small">ICB default: fused with QKV projection</text>
     <rect x="78" y="350" width="634" height="360" class="fusion"/>
 
     <path class="wire" d="M395 688 L395 760"/>
@@ -118,10 +118,10 @@
     <text x="24" y="516" class="tiny">Text Prefill FlashAttn Tuning</text>
     <text x="24" y="546" class="tiny">Decoder FFN SIMDGroup default</text>
 
-    <text x="24" y="566" class="small">Opt-in result</text>
-    <text x="24" y="596" class="tiny">Dispatches: 145 -> 121/token</text>
+    <text x="24" y="566" class="small">ICB default result</text>
+    <text x="24" y="596" class="tiny">Dispatches: 219 -> 195/step</text>
     <text x="24" y="626" class="tiny">Correctness: exact</text>
-    <text x="24" y="656" class="tiny">QKV/RoPE fusion not promoted</text>
+    <text x="24" y="656" class="tiny">QKV/RoPE fusion promoted</text>
 
     <text x="24" y="696" class="small">BF16 KV-Cache (Opt-in)</text>
     <text x="24" y="726" class="tiny">Speedup: ~8.8% E2E faster</text>
@@ -129,19 +129,19 @@
 
     <text x="24" y="806" class="small">Decoder ICB (Opt-in)</text>
     <text x="24" y="836" class="tiny">MU_TEXT_DECODE_ICB=1</text>
-    <text x="24" y="866" class="tiny">Correct; misses new FFN path</text>
+    <text x="24" y="866" class="tiny">FFN sequence default</text>
   </g>
 
   <g transform="translate(916 1320)">
     <rect x="0" y="0" width="280" height="320" rx="22" fill="#fff7ed" stroke="#fed7aa" stroke-width="3"/>
     <text x="24" y="48" class="label">Next work</text>
     <text x="24" y="94" class="small">Pre-recorded Loops</text>
-    <text x="24" y="132" class="tiny">ICB correctness is verified.</text>
-    <text x="24" y="158" class="tiny">Next: ICB FFN sequence</text>
+    <text x="24" y="132" class="tiny">ICB FFN sequence is default.</text>
+    <text x="24" y="158" class="tiny">QKV/RoPE is default.</text>
     <text x="24" y="218" class="small">Decoder optimization</text>
-    <text x="24" y="256" class="tiny">Try cached-attention tiling</text>
-    <text x="24" y="282" class="tiny">with trace parity first.</text>
+    <text x="24" y="256" class="tiny">KV-group attention redesign</text>
+    <text x="24" y="282" class="tiny">only if A/B justifies it.</text>
   </g>
 
-  <text x="640" y="1988" text-anchor="middle" class="subtitle">Status: correctness exact; non-ICB decode FFN uses SIMDGroup by default.</text>
+  <text x="640" y="1988" text-anchor="middle" class="subtitle">Status: correctness exact; default decode and ICB FFN use SIMDGroup.</text>
 </svg>

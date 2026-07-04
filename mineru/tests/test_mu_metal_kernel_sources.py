@@ -185,6 +185,15 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn("[cmd setKernelBuffer:cache->dynamic_params_buf offset:20 atIndex:13]; // use_bf16_cache", host)
         self.assertIn("[cmd concurrentDispatchThreads:MTLSizeMake(32, 640, 1)", host)
 
+    def test_icb_qkv_rope_cache_fusion_is_default_with_escape_hatch(self):
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+        source = (ROOT / "mineru/mu.c").read_text()
+
+        self.assertIn('getenv("MU_TEXT_DECODE_QKV_ROPE_NO_FUSION")', host)
+        self.assertIn("!disable_qkv_rope_fusion", host)
+        self.assertIn('getenv("MU_TEXT_DECODE_QKV_ROPE_NO_FUSION")', source)
+        self.assertIn("int use_qkv_rope_fusion = getenv(\"MU_TEXT_DECODE_QKV_ROPE_NO_FUSION\") == NULL;", source)
+
     def test_text_decode_ffn_simdgroup_is_default_with_escape_hatch(self):
         host = (ROOT / "mineru/mu_metal.m").read_text()
 
@@ -192,6 +201,19 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn("!disable_simdgroup_ffn", host)
         self.assertIn("mu_gpu_dense_bf16_rows_simdgroup_swiglu_ctx(ctx, normed_buf, gate_w, up_w, 1, 896, 4864, mid_buf)", host)
         self.assertIn("mu_gpu_dense_f32_rows_ctx(ctx, mid_buf, down_w, 1, 4864, 896, proj_buf)", host)
+
+    def test_icb_ffn_simdgroup_sequence_is_default_with_escape_hatch(self):
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn('getenv("MU_TEXT_DECODE_ICB_FFN_NO_SIMDGROUP")', host)
+        self.assertIn("!disable_icb_ffn_simdgroup", host)
+        self.assertIn("NSUInteger ffn_mid_offset = 0;", host)
+        self.assertIn("if (use_ffn_simdgroup) { ffn_mid_offset = offset_a; offset_a += inter_bytes; }", host)
+        self.assertIn("[cmd setComputePipelineState:gpu->dense_bf16_rows_simdgroup_swiglu];", host)
+        self.assertIn("[cmd setKernelBuffer:cache->dynamic_params_buf offset:24 atIndex:5]; // inter", host)
+        self.assertIn("[cmd setKernelBuffer:cache->dynamic_params_buf offset:28 atIndex:6]; // rows", host)
+        self.assertIn("[cmd setComputePipelineState:gpu->dense_f32_rows];", host)
+        self.assertIn("NSUInteger ffn_commands = use_ffn_simdgroup ? 4 : 1;", host)
 
     def test_text_cached_attention_simd_is_default_with_escape_hatch(self):
         host = (ROOT / "mineru/mu_metal.m").read_text()

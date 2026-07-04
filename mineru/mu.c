@@ -5176,15 +5176,19 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                     mu_record_metal_stage(e, "text_final_norm");
                     mu_record_metal_stage(e, "text_logits");
                     if (timing_stats) {
-                        int use_qkv_rope_fusion = request_qkv_rope_fusion;
+                        int use_qkv_rope_fusion = getenv("MU_TEXT_DECODE_QKV_ROPE_NO_FUSION") == NULL;
+                        int use_ffn_simdgroup = getenv("MU_TEXT_DECODE_ICB_FFN_NO_SIMDGROUP") == NULL;
+                        int qkv_commands = use_qkv_rope_fusion ? 1 : 2;
+                        int qkv_dispatches = use_qkv_rope_fusion ? 2 : 3;
+                        int ffn_dispatches = use_ffn_simdgroup ? 4 : 1;
                         local_timing.cached_icb += mu_time_now_seconds() - icb_start;
                         local_timing.command_buffers += 1;
-                        local_timing.kernel_dispatches += use_qkv_rope_fusion ? (5 * 24 + 3) : (6 * 24 + 3);
-                        local_timing.qkv_dispatches += use_qkv_rope_fusion ? (2 * 24) : (3 * 24);
+                        local_timing.kernel_dispatches += (1 + qkv_commands + 1 + 1 + ffn_dispatches) * 24 + 3;
+                        local_timing.qkv_dispatches += qkv_dispatches * 24;
                         local_timing.attn_mlp_dispatches += 3 * 24;
                         local_timing.attention_dispatches += 24;
                         local_timing.o_proj_dispatches += 24;
-                        local_timing.mlp_dispatches += 24;
+                        local_timing.mlp_dispatches += ffn_dispatches * 24;
                         local_timing.logits_dispatches += 3;
                         local_timing.cached_step += mu_time_now_seconds() - step_start;
                         local_timing.steps = 1;

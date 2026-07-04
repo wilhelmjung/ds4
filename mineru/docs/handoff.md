@@ -22,8 +22,9 @@
 ### Decoder ICB Profiling & QKV/RoPE Fusion Fix
 - Added `text_generate_decode_cached_icb` timing so ICB decode time is visible instead of hidden behind zeroed split buckets.
 - Made `MU_TEXT_DECODE_PROFILE_SPLIT=1` bypass `MU_TEXT_DECODE_ICB=1`, keeping split profiling diagnostic and comparable.
-- Fixed the ICB-recorded `MU_TEXT_DECODE_QKV_ROPE_FUSION=1` command: dynamic parameters now bind in shader order (`pos3`, `cache_pos`, `cols`, `use_bf16_cache`), and the fused dispatch now covers the actual 640 output rows instead of 1152.
-- Result: the previous `layout` trace generation mismatch under `--kv-cache-bf16 --use-icb` plus `MU_TEXT_DECODE_QKV_ROPE_FUSION=1` is fixed. The path is correct but still not promoted because the fresh layout trace decode time was slower than default ICB (`0.2101s` vs `0.1858s`).
+- Fixed and promoted the ICB-recorded QKV/RoPE fusion: dynamic parameters now bind in shader order (`pos3`, `cache_pos`, `cols`, `use_bf16_cache`), and the fused dispatch now covers the actual 640 output rows instead of 1152.
+- The ICB path now fuses QKV projection and RoPE/KV-cache update by default. `MU_TEXT_DECODE_QKV_ROPE_NO_FUSION=1` keeps the old two-command ICB path available for comparison.
+- Fresh 5-run adjacent layout trace A/B with `--kv-cache-bf16 --use-icb`: fused QKV/RoPE averaged `0.1808s`; old ICB QKV/RoPE path averaged `0.1974s`. Post-promotion 3-run A/B was closer (`0.1946s` vs `0.1967s`) but kept the expected dispatch reduction (`585/144` vs `657/216`). All runs had trace parity OK.
 - Build warning cleanup: removed an unused `name` variable in the batched decode path.
 
 ### Decoder FFN SIMDGroup Default
@@ -32,7 +33,12 @@
 - Fresh `layout` trace A/B with `--kv-cache-bf16`:
   - New default: decode `0.1091s`, trace parity OK.
   - Old path via `MU_TEXT_DECODE_FFN_NO_SIMDGROUP=1`: decode `0.1459s`, trace parity OK.
-  - ICB path remains correct (`--use-icb`: decode `0.1601s`) but still records the old monolithic FFN command and does not use the new host-side FFN sequence.
+  - ICB now records RMSNorm + SIMDGroup SwiGLU + shader down projection + residual add by default. `MU_TEXT_DECODE_ICB_FFN_NO_SIMDGROUP=1` keeps the old monolithic FFN command available for comparison.
+  - Fresh 3-run adjacent layout trace A/B with `--kv-cache-bf16 --use-icb`: default ICB FFN averaged `0.2088s`; old FFN escape hatch averaged `0.2211s`. Both paths had trace parity OK.
+
+### Cached Attention Micro-Experiments
+- Tried a no-score recompute variant for cached decode attention. Correctness held, but layout ICB decode regressed (`0.4319s` vs adjacent default `0.2134s`), so it was not kept.
+- Tried a smaller `scores[2048]` variant for layout-sized prompts. Trace parity held, but follow-up A/B was noisy and did not produce a stable win, so it was not promoted or kept.
 
 ---
 
@@ -63,8 +69,8 @@ Below is the comparative performance timings of the fully optimized Metal engine
 ## 3. Next Steps & Future Plans
 
 1. **Decoder ICB / Attention Follow-up**:
-   - **Context**: The non-ICB decoder FFN now has a faster default path. ICB remains correct but misses that FFN improvement because it still records the old monolithic FFN kernel. QKV/RoPE fusion is correctness-fixed but not fast enough to promote.
-   - **Handoff Task**: Either record an ICB-compatible FFN sequence using RMSNorm + SIMDGroup SwiGLU + shader down-proj + residual add, or continue with one small cached-attention tiling experiment. Gate with `layout`/`text` trace parity and adjacent timing.
+   - **Context**: The ICB-compatible FFN sequence and QKV/RoPE fusion are now default and correctness-verified. QKV/RoPE timing is a modest/noisy win, but the dispatch reduction is stable. Cached-attention recompute/smaller-score-buffer probes did not produce a stable win.
+   - **Handoff Task**: Attempt a larger KV-group attention redesign that avoids seven repeated K/V reads per KV head, or stop decoder micro-kernel work and move back to vision FFN.
 2. **Re-implement Vision FFN Fusion using `simdgroup_matrix` GEMM primitives**:
    - **Context**: The existing `mu_vision_fused_ffn` kernel was disabled by default because it relied on sequential dot product loops, dropping warp occupancy and running slower than the unfused SIMD path.
    - **Handoff Task**: Re-architect `mu_vision_fused_ffn.metal` using MSL's cooperative matrix multiplication (`simdgroup_matrix`) only after decoder experiments stop showing cheap wins.

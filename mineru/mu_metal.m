@@ -4659,6 +4659,8 @@ struct mu_gpu_decode_dynamic_params {
     int cache_pos;
     int cache_len;
     char use_bf16_cache;
+    int inter;
+    int rows;
 };
 
 struct mu_token_logit {
@@ -4712,6 +4714,7 @@ static int mu_gpu_text_decode_icb_record(void *engine, mu_gpu_kv_cache *cache) {
     NSUInteger hidden_bytes = (NSUInteger)hidden * sizeof(float);
     NSUInteger q_out_bytes = (NSUInteger)q_out * sizeof(float);
     NSUInteger kv_out_bytes = (NSUInteger)kv_out * sizeof(float);
+    NSUInteger inter_bytes = (NSUInteger)inter * sizeof(float);
 
     int max_workers = getenv("MU_CONCURRENT_WORKERS") ? atoi(getenv("MU_CONCURRENT_WORKERS")) : 4;
     if (max_workers < 1) max_workers = 1;
@@ -4724,7 +4727,14 @@ static int mu_gpu_text_decode_icb_record(void *engine, mu_gpu_kv_cache *cache) {
     NSUInteger cur_hs_offset = offset_a;
     offset_a += hidden_bytes;
 
-    BOOL use_qkv_rope_fusion = (getenv("MU_TEXT_DECODE_QKV_ROPE_FUSION") != NULL);
+    BOOL disable_qkv_rope_fusion = getenv("MU_TEXT_DECODE_QKV_ROPE_NO_FUSION") != NULL;
+    BOOL use_qkv_rope_fusion = !disable_qkv_rope_fusion;
+    BOOL disable_icb_ffn_simdgroup = getenv("MU_TEXT_DECODE_ICB_FFN_NO_SIMDGROUP") != NULL;
+    BOOL use_ffn_simdgroup = (!disable_icb_ffn_simdgroup &&
+                              gpu->rmsnorm_bf16_probe &&
+                              gpu->dense_bf16_rows_simdgroup_swiglu &&
+                              gpu->dense_f32_rows &&
+                              gpu->add_f32);
 
     for (int layer = 0; layer < 24; layer++) {
         const unsigned short *input_norm = mu_engine_get_text_layer_tensor(engine, layer, "input_layernorm.weight", 1, hidden, 0);
@@ -4775,7 +4785,9 @@ static int mu_gpu_text_decode_icb_record(void *engine, mu_gpu_kv_cache *cache) {
         NSUInteger k_buf_offset = offset_a;  offset_a += kv_out_bytes;
         NSUInteger v_buf_offset = offset_a;  offset_a += kv_out_bytes;
         NSUInteger attn_offset = offset_a;   offset_a += q_out_bytes;
-        offset_a += hidden_bytes; // proj_offset is unused but offset needs to advance
+        NSUInteger proj_offset = offset_a; offset_a += hidden_bytes;
+        NSUInteger ffn_mid_offset = 0;
+        if (use_ffn_simdgroup) { ffn_mid_offset = offset_a; offset_a += inter_bytes; }
         NSUInteger hs_buf2_offset = offset_a; offset_a += hidden_bytes;
         NSUInteger out_hs_offset = offset_a; offset_a += hidden_bytes;
 
@@ -4896,8 +4908,67 @@ static int mu_gpu_text_decode_icb_record(void *engine, mu_gpu_kv_cache *cache) {
                      threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         }
 
-        // 5. Fused FFN (MLP)
-        {
+        // 5. FFN (MLP)
+        if (use_ffn_simdgroup) {
+            {
+                id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
+                [cmd setComputePipelineState:gpu->rmsnorm_bf16_probe];
+                [cmd setKernelBuffer:gpu->scratch_a offset:hs_buf2_offset atIndex:0];
+                [cmd setKernelBuffer:post_norm_buf offset:0 atIndex:1];
+                [cmd setKernelBuffer:gpu->scratch_a offset:normed_offset atIndex:2];
+                [cmd setKernelBuffer:gpu->const_hidden_buf offset:0 atIndex:3];
+                [cmd setKernelBuffer:gpu->const_eps_buf offset:0 atIndex:4];
+
+                NSUInteger width = gpu->rmsnorm_bf16_probe.threadExecutionWidth;
+                if (width < 1) width = 1;
+                if (width > (NSUInteger)hidden) width = (NSUInteger)hidden;
+                [cmd concurrentDispatchThreads:MTLSizeMake((NSUInteger)hidden, 1, 1)
+                         threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+            }
+            {
+                id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
+                [cmd setComputePipelineState:gpu->dense_bf16_rows_simdgroup_swiglu];
+                [cmd setKernelBuffer:gpu->scratch_a offset:normed_offset atIndex:0];
+                [cmd setKernelBuffer:gate_w_buf offset:0 atIndex:1];
+                [cmd setKernelBuffer:up_w_buf offset:0 atIndex:2];
+                [cmd setKernelBuffer:gpu->scratch_a offset:ffn_mid_offset atIndex:3];
+                [cmd setKernelBuffer:gpu->const_hidden_buf offset:0 atIndex:4]; // cols
+                [cmd setKernelBuffer:cache->dynamic_params_buf offset:24 atIndex:5]; // inter
+                [cmd setKernelBuffer:cache->dynamic_params_buf offset:28 atIndex:6]; // rows
+
+                [cmd concurrentDispatchThreadgroups:MTLSizeMake(((NSUInteger)inter + 31u) / 32u, 1, 1)
+                               threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            }
+            {
+                id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
+                [cmd setComputePipelineState:gpu->dense_f32_rows];
+                [cmd setKernelBuffer:gpu->scratch_a offset:ffn_mid_offset atIndex:0];
+                [cmd setKernelBuffer:down_w_buf offset:0 atIndex:1];
+                [cmd setKernelBuffer:gpu->scratch_a offset:proj_offset atIndex:2];
+                [cmd setKernelBuffer:cache->dynamic_params_buf offset:24 atIndex:3]; // inter
+                [cmd setKernelBuffer:gpu->const_hidden_buf offset:0 atIndex:4]; // out_cols
+
+                NSUInteger width = gpu->dense_f32_rows.threadExecutionWidth;
+                if (width < 1) width = 1;
+                if (width > (NSUInteger)hidden) width = (NSUInteger)hidden;
+                [cmd concurrentDispatchThreads:MTLSizeMake((NSUInteger)hidden, 1, 1)
+                         threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+            }
+            {
+                id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
+                [cmd setComputePipelineState:gpu->add_f32];
+                [cmd setKernelBuffer:gpu->scratch_a offset:hs_buf2_offset atIndex:0];
+                [cmd setKernelBuffer:gpu->scratch_a offset:proj_offset atIndex:1];
+                [cmd setKernelBuffer:gpu->scratch_a offset:out_hs_offset atIndex:2];
+                [cmd setKernelBuffer:gpu->const_hidden_buf offset:0 atIndex:3]; // n
+
+                NSUInteger width = gpu->add_f32.threadExecutionWidth;
+                if (width < 1) width = 1;
+                if (width > (NSUInteger)hidden) width = (NSUInteger)hidden;
+                [cmd concurrentDispatchThreads:MTLSizeMake((NSUInteger)hidden, 1, 1)
+                         threadsPerThreadgroup:MTLSizeMake(width, 1, 1)];
+            }
+        } else {
             id<MTLIndirectComputeCommand> cmd = mu_gpu_icb_get_cmd(cache->decode_icb, cmd_idx++);
             [cmd setComputePipelineState:gpu->text_decode_fused_ffn];
             [cmd setKernelBuffer:gpu->scratch_a offset:hs_buf2_offset atIndex:0];
@@ -5014,6 +5085,8 @@ int mu_gpu_text_decode_icb_execute(void *engine,
         params.cache_pos = cache_pos;
         params.cache_len = cache_pos + 1;
         params.use_bf16_cache = (getenv("MU_KV_CACHE_BF16") != NULL) ? 1 : 0;
+        params.inter = 4864;
+        params.rows = 1;
         memcpy([cache->dynamic_params_buf contents], &params, sizeof(params));
 
         // 3. Start command buffer and encoder
@@ -5034,8 +5107,17 @@ int mu_gpu_text_decode_icb_execute(void *engine,
         [encoder useResources:cache->resources count:cache->resource_count usage:MTLResourceUsageRead | MTLResourceUsageWrite];
 
         // 5. Execute pre-recorded ICB commands
-        BOOL use_qkv_rope_fusion = (getenv("MU_TEXT_DECODE_QKV_ROPE_FUSION") != NULL);
-        NSUInteger total_commands = use_qkv_rope_fusion ? (5 * 24 + 3) : (6 * 24 + 3);
+        BOOL disable_qkv_rope_fusion = getenv("MU_TEXT_DECODE_QKV_ROPE_NO_FUSION") != NULL;
+        BOOL use_qkv_rope_fusion = !disable_qkv_rope_fusion;
+        BOOL disable_icb_ffn_simdgroup = getenv("MU_TEXT_DECODE_ICB_FFN_NO_SIMDGROUP") != NULL;
+        BOOL use_ffn_simdgroup = (!disable_icb_ffn_simdgroup &&
+                                  gpu->rmsnorm_bf16_probe &&
+                                  gpu->dense_bf16_rows_simdgroup_swiglu &&
+                                  gpu->dense_f32_rows &&
+                                  gpu->add_f32);
+        NSUInteger qkv_commands = use_qkv_rope_fusion ? 1 : 2;
+        NSUInteger ffn_commands = use_ffn_simdgroup ? 4 : 1;
+        NSUInteger total_commands = (1 + qkv_commands + 1 + 1 + ffn_commands) * 24 + 3;
         [encoder executeCommandsInBuffer:cache->decode_icb withRange:NSMakeRange(0, total_commands)];
 
         [encoder endEncoding];

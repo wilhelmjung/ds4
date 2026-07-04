@@ -369,6 +369,9 @@ The current non-ICB Metal decode path implements the SwiGLU MLP with the shared
 SIMDGroup SwiGLU helper, followed by the down projection and residual add. The
 old monolithic decode FFN kernel remains available with
 `MU_TEXT_DECODE_FFN_NO_SIMDGROUP=1`.
+The ICB decode path records the same FFN sequence by default; its old
+monolithic FFN command remains available with
+`MU_TEXT_DECODE_ICB_FFN_NO_SIMDGROUP=1`.
 
 The text decoder needs a normal KV cache for generation. There is no DeepSeek
 compressed KV path. For MinerU page and block prompts, context lengths are
@@ -631,7 +634,11 @@ The design is successful when `mineru/mu.c` can:
 
 ## Immediate Next Step
 
-Keep the decoder work data-backed: either make the faster FFN sequence available
-inside the ICB recording path, or run one small cached-attention tiling
-experiment. Gate either path with `layout`/`text` trace parity and adjacent
-timing before promotion.
+Keep the decoder work data-backed: the faster FFN sequence is now default
+inside the ICB recording path, with the old path kept behind
+`MU_TEXT_DECODE_ICB_FFN_NO_SIMDGROUP=1`. Cached-attention recompute and smaller
+score-buffer probes were correctness-clean but not stable wins. ICB QKV/RoPE
+fusion is now default after trace-clean adjacent A/B; the old ICB path remains
+available with `MU_TEXT_DECODE_QKV_ROPE_NO_FUSION=1`. Its timing win is modest
+and noisy, but the dispatch reduction is stable. Next, either attempt a larger
+KV-group attention redesign or move back to vision FFN.
