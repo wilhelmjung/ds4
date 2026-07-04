@@ -3834,6 +3834,31 @@ int mu_gpu_text_decode_fused_ffn_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf hs_in,
     if (!ctx || !hs_in.ptr || !post_norm_w.ptr || !gate_w.ptr || !up_w.ptr || !down_w.ptr || !out.ptr) return -1;
     
     bool request_fallback = getenv("MU_TEXT_NO_FUSED_FFN") != NULL;
+    bool disable_simdgroup_ffn = getenv("MU_TEXT_DECODE_FFN_NO_SIMDGROUP") != NULL;
+    if (!request_fallback && !disable_simdgroup_ffn && ctx->gpu->dense_bf16_rows_simdgroup_swiglu) {
+        NSUInteger base_offset_a = ctx->alloc.offset_a;
+        NSUInteger base_offset_b = ctx->alloc.offset_b;
+
+        mu_gpu_buf normed_buf = mu_gpu_scratch_alloc_a_ctx(ctx, 896 * sizeof(float));
+        mu_gpu_buf mid_buf = mu_gpu_scratch_alloc_a_ctx(ctx, 4864 * sizeof(float));
+        mu_gpu_buf proj_buf = mu_gpu_scratch_alloc_a_ctx(ctx, 896 * sizeof(float));
+
+        if (!normed_buf.ptr || !mid_buf.ptr || !proj_buf.ptr) {
+            ctx->alloc.offset_a = base_offset_a;
+            ctx->alloc.offset_b = base_offset_b;
+            return -2;
+        }
+
+        int rc = mu_gpu_rmsnorm_bf16_probe_ctx(ctx, hs_in, post_norm_w, normed_buf, 896, eps);
+        if (rc == 0) rc = mu_gpu_dense_bf16_rows_simdgroup_swiglu_ctx(ctx, normed_buf, gate_w, up_w, 1, 896, 4864, mid_buf);
+        if (rc == 0) rc = mu_gpu_dense_f32_rows_ctx(ctx, mid_buf, down_w, 1, 4864, 896, proj_buf);
+        if (rc == 0) rc = mu_gpu_add_f32_ctx(ctx, hs_in, proj_buf, out, 896);
+
+        ctx->alloc.offset_a = base_offset_a;
+        ctx->alloc.offset_b = base_offset_b;
+        return rc;
+    }
+
     if (!request_fallback && ctx->gpu->text_decode_fused_ffn) {
         id<MTLBuffer> hs_in_buf = (__bridge id<MTLBuffer>)hs_in.ptr;
         id<MTLBuffer> post_norm_w_buf = (__bridge id<MTLBuffer>)post_norm_w.ptr;
@@ -4787,12 +4812,12 @@ static int mu_gpu_text_decode_icb_record(void *engine, mu_gpu_kv_cache *cache) {
             [cmd setKernelBuffer:gpu->scratch_a offset:q_buf_offset atIndex:7];
             [cmd setKernelBuffer:cache->k_cache offset:kv_offset atIndex:8];
             [cmd setKernelBuffer:cache->v_cache offset:kv_offset atIndex:9];
-            [cmd setKernelBuffer:cache->dynamic_params_buf offset:12 atIndex:10]; // cache_pos
-            [cmd setKernelBuffer:cache->dynamic_params_buf offset:0 atIndex:11]; // pos3
-            [cmd setKernelBuffer:cache->dynamic_params_buf offset:20 atIndex:12]; // use_bf16_cache
-            [cmd setKernelBuffer:gpu->const_hidden_buf offset:0 atIndex:13]; // cols
+            [cmd setKernelBuffer:cache->dynamic_params_buf offset:0 atIndex:10]; // pos3
+            [cmd setKernelBuffer:cache->dynamic_params_buf offset:12 atIndex:11]; // cache_pos
+            [cmd setKernelBuffer:gpu->const_hidden_buf offset:0 atIndex:12]; // cols
+            [cmd setKernelBuffer:cache->dynamic_params_buf offset:20 atIndex:13]; // use_bf16_cache
 
-            [cmd concurrentDispatchThreads:MTLSizeMake(32, 1152, 1)
+            [cmd concurrentDispatchThreads:MTLSizeMake(32, 640, 1)
                      threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
         } else {
             // Unfused QKV Proj
@@ -5093,7 +5118,6 @@ int mu_gpu_text_decode_step_batched(mu_gpu *gpu, void *engine,
         mu_gpu_buf current_in = ping_buf;
         mu_gpu_buf current_out = pong_buf;
 
-        char name[256];
         for (int layer = 0; layer < 24; layer++) {
             const unsigned short *input_norm = mu_engine_get_text_layer_tensor(engine, layer, "input_layernorm.weight", 1, hidden, 0);
             const unsigned short *post_norm = mu_engine_get_text_layer_tensor(engine, layer, "post_attention_layernorm.weight", 1, hidden, 0);

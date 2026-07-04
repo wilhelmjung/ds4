@@ -21,6 +21,7 @@ class MuTextTimingSourceTests(unittest.TestCase):
         self.assertIn('"text_generate_decode_cached_qkv"', source)
         self.assertIn('"text_generate_decode_cached_attn_mlp"', source)
         self.assertIn('"text_generate_decode_cached_logits"', source)
+        self.assertIn('"text_generate_decode_cached_icb"', source)
         self.assertIn('"text_generate_decode_command_buffers"', source)
         self.assertIn('"text_generate_decode_kernel_dispatches"', source)
         self.assertIn('"text_generate_decode_qkv_dispatches"', source)
@@ -37,6 +38,7 @@ class MuTextTimingSourceTests(unittest.TestCase):
         self.assertIn("o_proj_dispatches", source)
         self.assertIn("mlp_dispatches", source)
         self.assertIn("logits_dispatches", source)
+        self.assertIn("cached_icb", source)
         self.assertIn("typedef struct mu_text_prefill_timing", source)
         self.assertIn("mu_text_prefill_timing_add", source)
         self.assertIn("mu_text_decode_timing_add", source)
@@ -67,6 +69,7 @@ class MuTextTimingSourceTests(unittest.TestCase):
         self.assertIn("text_decode_profile_o_proj", source)
         self.assertIn("text_decode_profile_mlp", source)
         self.assertIn("text_decode_profile_logits", source)
+        self.assertIn('getenv("MU_TEXT_DECODE_ICB") != NULL && !profile_split', source)
 
 
 if __name__ == "__main__":

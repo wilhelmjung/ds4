@@ -19,6 +19,21 @@
 - Wrapped `mu_gpu_destroy` in `@autoreleasepool` in [mu_metal.m](file:///Users/will/github/ds4/mineru/mu_metal.m) to force immediate reclaim of Metal buffers, preventing process OOM crashes (`Killed: 9`).
 - Refactored [mu_test.c](file:///Users/will/github/ds4/mineru/tests/mu_test.c) to reuse a single `global_gpu` context and declared weight arrays as `static const` to prevent cache address collisions.
 
+### Decoder ICB Profiling & QKV/RoPE Fusion Fix
+- Added `text_generate_decode_cached_icb` timing so ICB decode time is visible instead of hidden behind zeroed split buckets.
+- Made `MU_TEXT_DECODE_PROFILE_SPLIT=1` bypass `MU_TEXT_DECODE_ICB=1`, keeping split profiling diagnostic and comparable.
+- Fixed the ICB-recorded `MU_TEXT_DECODE_QKV_ROPE_FUSION=1` command: dynamic parameters now bind in shader order (`pos3`, `cache_pos`, `cols`, `use_bf16_cache`), and the fused dispatch now covers the actual 640 output rows instead of 1152.
+- Result: the previous `layout` trace generation mismatch under `--kv-cache-bf16 --use-icb` plus `MU_TEXT_DECODE_QKV_ROPE_FUSION=1` is fixed. The path is correct but still not promoted because the fresh layout trace decode time was slower than default ICB (`0.2101s` vs `0.1858s`).
+- Build warning cleanup: removed an unused `name` variable in the batched decode path.
+
+### Decoder FFN SIMDGroup Default
+- Replaced the non-ICB default decoder FFN path with the existing prefill SIMDGroup SwiGLU helper plus `dense_f32_rows` down projection and residual add.
+- Kept the old monolithic `mu_text_decode_fused_ffn` path behind `MU_TEXT_DECODE_FFN_NO_SIMDGROUP=1`; `MU_TEXT_NO_FUSED_FFN=1` still forces the fully unfused fallback.
+- Fresh `layout` trace A/B with `--kv-cache-bf16`:
+  - New default: decode `0.1091s`, trace parity OK.
+  - Old path via `MU_TEXT_DECODE_FFN_NO_SIMDGROUP=1`: decode `0.1459s`, trace parity OK.
+  - ICB path remains correct (`--use-icb`: decode `0.1601s`) but still records the old monolithic FFN command and does not use the new host-side FFN sequence.
+
 ---
 
 ## 2. Verified Performance Baseline (10-Page Timings)
@@ -47,8 +62,11 @@ Below is the comparative performance timings of the fully optimized Metal engine
 
 ## 3. Next Steps & Future Plans
 
-1. **Re-implement Vision FFN Fusion using `simdgroup_matrix` GEMM primitives**:
+1. **Decoder ICB / Attention Follow-up**:
+   - **Context**: The non-ICB decoder FFN now has a faster default path. ICB remains correct but misses that FFN improvement because it still records the old monolithic FFN kernel. QKV/RoPE fusion is correctness-fixed but not fast enough to promote.
+   - **Handoff Task**: Either record an ICB-compatible FFN sequence using RMSNorm + SIMDGroup SwiGLU + shader down-proj + residual add, or continue with one small cached-attention tiling experiment. Gate with `layout`/`text` trace parity and adjacent timing.
+2. **Re-implement Vision FFN Fusion using `simdgroup_matrix` GEMM primitives**:
    - **Context**: The existing `mu_vision_fused_ffn` kernel was disabled by default because it relied on sequential dot product loops, dropping warp occupancy and running slower than the unfused SIMD path.
-   - **Handoff Task**: Re-architect `mu_vision_fused_ffn.metal` using MSL's cooperative matrix multiplication (`simdgroup_matrix`) to achieve maximum GPU hardware throughput while keeping activation/residual fusions intact.
-2. **Push/Publish Local Commits**:
+   - **Handoff Task**: Re-architect `mu_vision_fused_ffn.metal` using MSL's cooperative matrix multiplication (`simdgroup_matrix`) only after decoder experiments stop showing cheap wins.
+3. **Push/Publish Local Commits**:
    - **Handoff Task**: Push the local branch `codex/mineru-metal-backend` (currently 20 commits ahead) to remote repository.

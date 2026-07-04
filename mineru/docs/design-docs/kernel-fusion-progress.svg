@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="2040" viewBox="0 0 1280 2040" role="img" aria-labelledby="title desc">
   <title id="title">MinerU Metal kernel fusion progress</title>
-  <desc id="desc">Current Metal decoder fusion status with default fusions, opt-in QKV RoPE cache fusion, and next bottleneck targets.</desc>
+  <desc id="desc">Current Metal decoder fusion status with default SIMDGroup FFN, opt-in QKV RoPE cache fusion, and next bottleneck targets.</desc>
   <defs>
     <marker id="arrow" markerWidth="12" markerHeight="12" refX="9" refY="6" orient="auto" markerUnits="strokeWidth">
       <path d="M2 2 L10 6 L2 10 Z" fill="#1f1f1f"/>
@@ -24,13 +24,13 @@
   <rect x="0" y="0" width="1280" height="2040" fill="#fff"/>
 
   <text x="640" y="78" text-anchor="middle" class="title">MinerU Metal Kernel Fusion Progress</text>
-  <text x="640" y="116" text-anchor="middle" class="subtitle">Default path stays stable; opt-in ICB eliminates driver-side CPU encoding and dispatch overhead.</text>
+  <text x="640" y="116" text-anchor="middle" class="subtitle">Default decode uses SIMDGroup FFN; ICB remains opt-in and correct.</text>
 
   <g transform="translate(80 146)">
     <rect x="0" y="0" width="1120" height="132" rx="18" fill="#f8fafc" stroke="#cbd5e1" stroke-width="3"/>
     <text x="44" y="48" class="label">Current decode dispatch picture</text>
     <text x="44" y="86" class="small">Default: 145 dispatches / token</text>
-    <text x="360" y="86" class="small">ICB (Indirect Command Buffer): 1 execution command / token</text>
+    <text x="360" y="86" class="small">ICB: 1 execution command / token; old FFN sequence</text>
     <text x="960" y="86" class="metric">-144 calls</text>
   </g>
 
@@ -87,7 +87,7 @@
     <path class="wire" d="M395 1304 L395 1370"/>
     <rect x="172" y="1370" width="446" height="96" class="box" fill="#b8a8ff" stroke="#6f55e8"/>
     <text x="395" y="1410" text-anchor="middle" class="label">MLP / SwiGLU</text>
-    <text x="395" y="1440" text-anchor="middle" class="small">fused by default for prefill</text>
+    <text x="395" y="1440" text-anchor="middle" class="small">decode default: SIMDGroup SwiGLU</text>
     <rect x="150" y="1348" width="490" height="140" class="enabled"/>
 
     <path class="wire" d="M395 1466 L395 1530"/>
@@ -116,11 +116,12 @@
     <text x="24" y="456" class="tiny">FFN/SwiGLU prefill fusion</text>
     <text x="24" y="486" class="tiny">FlashAttention Occupancy Tuning</text>
     <text x="24" y="516" class="tiny">Text Prefill FlashAttn Tuning</text>
+    <text x="24" y="546" class="tiny">Decoder FFN SIMDGroup default</text>
 
     <text x="24" y="566" class="small">Opt-in result</text>
     <text x="24" y="596" class="tiny">Dispatches: 145 -> 121/token</text>
     <text x="24" y="626" class="tiny">Correctness: exact</text>
-    <text x="24" y="656" class="tiny">Default unchanged: E2E slower</text>
+    <text x="24" y="656" class="tiny">QKV/RoPE fusion not promoted</text>
 
     <text x="24" y="696" class="small">BF16 KV-Cache (Opt-in)</text>
     <text x="24" y="726" class="tiny">Speedup: ~8.8% E2E faster</text>
@@ -128,19 +129,19 @@
 
     <text x="24" y="806" class="small">Decoder ICB (Opt-in)</text>
     <text x="24" y="836" class="tiny">MU_TEXT_DECODE_ICB=1</text>
-    <text x="24" y="866" class="tiny">Speedup: ~3.0% decode speedup</text>
+    <text x="24" y="866" class="tiny">Correct; misses new FFN path</text>
   </g>
 
   <g transform="translate(916 1320)">
     <rect x="0" y="0" width="280" height="320" rx="22" fill="#fff7ed" stroke="#fed7aa" stroke-width="3"/>
     <text x="24" y="48" class="label">Next work</text>
     <text x="24" y="94" class="small">Pre-recorded Loops</text>
-    <text x="24" y="132" class="tiny">ICB is fully implemented.</text>
-    <text x="24" y="158" class="tiny">Next: verify dynamic shapes</text>
+    <text x="24" y="132" class="tiny">ICB correctness is verified.</text>
+    <text x="24" y="158" class="tiny">Next: ICB FFN sequence</text>
     <text x="24" y="218" class="small">Decoder optimization</text>
-    <text x="24" y="256" class="tiny">Pre-record multi-page paths</text>
-    <text x="24" y="282" class="tiny">or profile vision tower SDPA.</text>
+    <text x="24" y="256" class="tiny">Try cached-attention tiling</text>
+    <text x="24" y="282" class="tiny">with trace parity first.</text>
   </g>
 
-  <text x="640" y="1988" text-anchor="middle" class="subtitle">Status: correctness exact, decoder ICB eliminates dispatch loops, custom MSL remains default.</text>
+  <text x="640" y="1988" text-anchor="middle" class="subtitle">Status: correctness exact; non-ICB decode FFN uses SIMDGroup by default.</text>
 </svg>

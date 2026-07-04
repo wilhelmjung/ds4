@@ -365,6 +365,11 @@ RMSNorm
   -> residual
 ```
 
+The current non-ICB Metal decode path implements the SwiGLU MLP with the shared
+SIMDGroup SwiGLU helper, followed by the down projection and residual add. The
+old monolithic decode FFN kernel remains available with
+`MU_TEXT_DECODE_FFN_NO_SIMDGROUP=1`.
+
 The text decoder needs a normal KV cache for generation. There is no DeepSeek
 compressed KV path. For MinerU page and block prompts, context lengths are
 expected to be modest enough that a straightforward per-layer KV cache is fine
@@ -626,7 +631,7 @@ The design is successful when `mineru/mu.c` can:
 
 ## Immediate Next Step
 
-Before writing `mineru/mu.c`, create the trace harness. It should lock down the exact
-inputs and intermediate tensors produced by the known-good Transformers path.
-That gives the C implementation a tight correctness target and prevents the
-engine from becoming a plausible-looking but incompatible Qwen2-VL clone.
+Keep the decoder work data-backed: either make the faster FFN sequence available
+inside the ICB recording path, or run one small cached-attention tiling
+experiment. Gate either path with `layout`/`text` trace parity and adjacent
+timing before promotion.

@@ -167,6 +167,7 @@ typedef struct mu_text_decode_timing {
     double cached_qkv;
     double cached_attn_mlp;
     double cached_logits;
+    double cached_icb;
     int command_buffers;
     int kernel_dispatches;
     int qkv_dispatches;
@@ -203,6 +204,7 @@ static void mu_text_decode_timing_add(mu_text_decode_timing *dst,
     dst->cached_qkv += src->cached_qkv;
     dst->cached_attn_mlp += src->cached_attn_mlp;
     dst->cached_logits += src->cached_logits;
+    dst->cached_icb += src->cached_icb;
     dst->command_buffers += src->command_buffers;
     dst->kernel_dispatches += src->kernel_dispatches;
     dst->qkv_dispatches += src->qkv_dispatches;
@@ -4614,6 +4616,8 @@ int mu_text_generate_greedy(mu_engine *e, const int *input_ids, int n_ids,
                                   decode_timing.cached_attn_mlp);
             mu_timing_log_seconds(timing, "text_generate_decode_cached_logits",
                                   decode_timing.cached_logits);
+            mu_timing_log_seconds(timing, "text_generate_decode_cached_icb",
+                                  decode_timing.cached_icb);
             mu_timing_log_seconds(timing, "text_generate_decode_command_buffers",
                                   (double)decode_timing.command_buffers);
             mu_timing_log_seconds(timing, "text_generate_decode_kernel_dispatches",
@@ -5155,8 +5159,9 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
             return top_rc;
         }
         if (layer_resident) {
-            if (getenv("MU_TEXT_DECODE_ICB") != NULL) {
+            if (getenv("MU_TEXT_DECODE_ICB") != NULL && !profile_split) {
                 mu_token_logit best_out[1];
+                double icb_start = timing_stats ? mu_time_now_seconds() : 0.0;
                 int icb_rc = mu_gpu_text_decode_icb_execute(e, gpu_cache, cache_pos, pos3, hidden_state, top_k, best_out);
                 if (icb_rc == 0) {
                     out[0].id = best_out[0].id;
@@ -5171,6 +5176,16 @@ static int mu_text_cached_step(mu_engine *e, int token_id, const int pos3[3],
                     mu_record_metal_stage(e, "text_final_norm");
                     mu_record_metal_stage(e, "text_logits");
                     if (timing_stats) {
+                        int use_qkv_rope_fusion = request_qkv_rope_fusion;
+                        local_timing.cached_icb += mu_time_now_seconds() - icb_start;
+                        local_timing.command_buffers += 1;
+                        local_timing.kernel_dispatches += use_qkv_rope_fusion ? (5 * 24 + 3) : (6 * 24 + 3);
+                        local_timing.qkv_dispatches += use_qkv_rope_fusion ? (2 * 24) : (3 * 24);
+                        local_timing.attn_mlp_dispatches += 3 * 24;
+                        local_timing.attention_dispatches += 24;
+                        local_timing.o_proj_dispatches += 24;
+                        local_timing.mlp_dispatches += 24;
+                        local_timing.logits_dispatches += 3;
                         local_timing.cached_step += mu_time_now_seconds() - step_start;
                         local_timing.steps = 1;
                         mu_text_decode_timing_add(timing_stats, &local_timing);
@@ -5894,6 +5909,8 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
                                       decode_timing.cached_attn_mlp);
                 mu_timing_log_seconds(timing, "text_generate_decode_cached_logits",
                                       decode_timing.cached_logits);
+                mu_timing_log_seconds(timing, "text_generate_decode_cached_icb",
+                                      decode_timing.cached_icb);
                 mu_timing_log_seconds(timing, "text_generate_decode_command_buffers",
                                       (double)decode_timing.command_buffers);
                 mu_timing_log_seconds(timing, "text_generate_decode_kernel_dispatches",
@@ -5928,6 +5945,8 @@ static int mu_cpu_text_generate_greedy_with_image_embeds(mu_engine *e,
                               decode_timing.cached_attn_mlp);
         mu_timing_log_seconds(timing, "text_generate_decode_cached_logits",
                               decode_timing.cached_logits);
+        mu_timing_log_seconds(timing, "text_generate_decode_cached_icb",
+                              decode_timing.cached_icb);
         mu_timing_log_seconds(timing, "text_generate_decode_command_buffers",
                               (double)decode_timing.command_buffers);
         mu_timing_log_seconds(timing, "text_generate_decode_kernel_dispatches",

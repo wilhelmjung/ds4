@@ -176,6 +176,23 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn('getenv("MU_TEXT_DECODE_QKV_ROPE_FUSION")', source)
         self.assertIn("mu_gpu_text_decode_qkv_rope_cache_ctx(ctx", source)
 
+    def test_icb_qkv_rope_cache_fusion_binds_dynamic_params_in_shader_order(self):
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn("[cmd setKernelBuffer:cache->dynamic_params_buf offset:0 atIndex:10]; // pos3", host)
+        self.assertIn("[cmd setKernelBuffer:cache->dynamic_params_buf offset:12 atIndex:11]; // cache_pos", host)
+        self.assertIn("[cmd setKernelBuffer:gpu->const_hidden_buf offset:0 atIndex:12]; // cols", host)
+        self.assertIn("[cmd setKernelBuffer:cache->dynamic_params_buf offset:20 atIndex:13]; // use_bf16_cache", host)
+        self.assertIn("[cmd concurrentDispatchThreads:MTLSizeMake(32, 640, 1)", host)
+
+    def test_text_decode_ffn_simdgroup_is_default_with_escape_hatch(self):
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn('getenv("MU_TEXT_DECODE_FFN_NO_SIMDGROUP")', host)
+        self.assertIn("!disable_simdgroup_ffn", host)
+        self.assertIn("mu_gpu_dense_bf16_rows_simdgroup_swiglu_ctx(ctx, normed_buf, gate_w, up_w, 1, 896, 4864, mid_buf)", host)
+        self.assertIn("mu_gpu_dense_f32_rows_ctx(ctx, mid_buf, down_w, 1, 4864, 896, proj_buf)", host)
+
     def test_text_cached_attention_simd_is_default_with_escape_hatch(self):
         host = (ROOT / "mineru/mu_metal.m").read_text()
 
@@ -246,7 +263,7 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn('getenv("MU_VISION_ATTN_NO_MPSGRAPH")', host)
         self.assertIn("mu_gpu_vision_attn_rows_mpsgraph_stage", host)
         self.assertIn("scaledDotProductAttentionWithQueryTensor", host)
-        self.assertIn("runWithMTLCommandQueue", host)
+        self.assertIn("encodeToCommandBuffer", host)
         self.assertIn("path=mpsgraph", host)
         self.assertIn("kernel void mu_vision_attn_pack_qkv_mpsgraph", metal)
 

@@ -75,7 +75,7 @@ graph TB
         EmbedScatter --> Resident["Resident Decode Loop<br/>one command buffer per token"]
         Resident --> QKV["cached QKV / RoPE / KV-cache update"]
         QKV --> TextAttn["cached attention SIMD"]
-        TextAttn --> TextFFN["MLP / FFN kernels"]
+        TextAttn --> TextFFN["SwiGLU MLP<br/>SIMDGroup default"]
         TextFFN --> VocabProj["Vocabulary Projection<br/>151,936 logits"]
         VocabProj --> Logits["Greedy token output"]
     end
@@ -106,7 +106,7 @@ The spatial merger reduces the number of visual tokens to accelerate decoder thr
 The text decoder generates tokens autoregressively:
 *   **Dimensions**: Layers = 24, Hidden Size = 896, Intermediate Size = 4864, Attention Heads = 14, KV Heads = 2 (using Grouped Query Attention / GQA).
 *   **M-RoPE**: Incorporates 3D positional embeddings for visual tokens and 1D positional embeddings for text tokens.
-*   **FFN (SwiGLU)**: Uses gated SiLU activations with three projection matrices: Gate, Up, and Down.
+*   **FFN (SwiGLU)**: Uses gated SiLU activations with three projection matrices: Gate, Up, and Down. The current non-ICB Metal decode path defaults to the shared SIMDGroup SwiGLU helper plus down projection and residual add; `MU_TEXT_DECODE_FFN_NO_SIMDGROUP=1` keeps the old monolithic FFN path available for comparison.
 
 ```mermaid
 graph TD
