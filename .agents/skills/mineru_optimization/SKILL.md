@@ -40,5 +40,4 @@ This guide compiles key architectural patterns and lessons learned during the op
 ## 7. Current 10-Page Metal Baseline
 - **Rule**: Use the refreshed sequential Metal artifact `/tmp/mu_10page_seq_qkv2sg_refresh.json` as the current local M5 Metal-only regression baseline after Vision dense 2SG, QKV 2SG, BF16 KV cache, and decode ICB defaults.
 - **Numbers**: The run completed `10/10` pages with `0` failures and `0` fallback rows in `174.984202s` total (`17.498420s/page`), `4.07x` faster than the existing PyTorch/MPS warm-rerun reference.
-- **Benchmark Scope**: Concurrent Metal timings were not refreshed in that run; do not infer worker-scaling conclusions from the sequential baseline.
-
+- **Concurrency Scope**: A short pages `224,244,303` probe showed worker contention still dominates: mean page timing was `14.326735s` at `--threads 1`, `27.831143s` at `--threads 2`, and `52.627625s` at `--threads 4`, all with zero fallback rows. Keep `--threads 1` as the recommended baseline mode until shared GPU scratch, command queue serialization, weight-cache locking, and ICB overlap are profiled.

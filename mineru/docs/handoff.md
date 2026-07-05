@@ -111,9 +111,27 @@ Command:
 - **Mean stage timings**: `page_total=17.498420s`, `layout_vision_encode=6.162498s`, `vision_encode=9.659590s`, `layout_generate=7.760307s`, `text_generate_prefill=4.605782s`, `text_generate_decode=3.103447s`, `content_total=3.538578s`.
 - **Output artifacts**: `/tmp/mu_10page_seq_qkv2sg_refresh.json` and `/tmp/mu_10page_seq_qkv2sg_refresh_outputs/metal_page_*.json`.
 
+### 3-Page Concurrent Probe
+
+After the refreshed sequential baseline, a short pages `224,244,303` probe was run with `--kv-cache-bf16 --use-icb --timing` to decide whether a full 10-page concurrent refresh was worth running.
+
+| Threads | Completed | Fallback Rows | Total Page Timings | Mean Page Timing | Mean `layout_generate` | Mean `vision_encode` |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| 1 | 3/3 | 0 | 42.980205s | 14.326735s | 6.208955s | 8.042122s |
+| 2 | 3/3 | 0 | 83.493428s | 27.831143s | 12.470181s | 15.267998s |
+| 4 | 3/3 | 0 | 157.882875s | 52.627625s | 29.306230s | 23.205935s |
+
+- **Decision**: do not run the 10-page concurrent refresh yet. Worker contention is still large enough that `--threads 1` remains the recommended baseline mode.
+- **Artifacts**: `/tmp/mu_probe_threads1_qkv2sg.json`, `/tmp/mu_probe_threads2_qkv2sg.json`, and `/tmp/mu_probe_threads4_qkv2sg.json`.
+- **Run note**: under Codex sandboxing, Metal benchmark harness commands must use the already-approved script entry (`/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_benchmark_pages.py ...`) or explicit escalation. Unapproved wrappers such as `/usr/bin/time`, `python -m ...`, or inline environment assignments can make `mu_gpu_create` fail before the page starts.
+
 ---
 
 ## 3. Next Steps & Future Plans
 
-1. **Push/Publish Local Commits**:
-   - **Handoff Task**: Push the local branch `codex/mineru-metal-backend` after this handoff/update commit if remote publication is desired.
+1. **Worker Contention Root Cause**:
+   - **Context**: 3-page probes show `threads=2/4` are correct but much slower per page than `threads=1`, especially in `layout_generate`, text prefill/decode, and Vision encode.
+   - **Handoff Task**: Profile worker contention before any full concurrent baseline refresh. Start by checking shared GPU scratch, command queue serialization, weight-cache locking, and ICB decode overlap.
+2. **Sequential Optimization**:
+   - **Context**: The current reliable baseline is the 10-page sequential Metal run at `174.984202s`.
+   - **Handoff Task**: Keep optimizing from fresh `--timing` / split-profile evidence under `--threads 1`.

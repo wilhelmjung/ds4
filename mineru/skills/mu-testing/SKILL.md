@@ -55,6 +55,9 @@ Current reference artifacts:
 /tmp/mu-metal-vs-mps-b2b-10page-20260624.metrics.json
 /tmp/mu_10page_seq_qkv2sg_refresh.json
 /tmp/mu_10page_seq_qkv2sg_refresh_outputs/metal_page_*.json
+/tmp/mu_probe_threads1_qkv2sg.json
+/tmp/mu_probe_threads2_qkv2sg.json
+/tmp/mu_probe_threads4_qkv2sg.json
 ```
 
 Current local M5 benchmark expectation:
@@ -63,6 +66,9 @@ Current local M5 benchmark expectation:
 - Metal sequential with Vision dense/QKV 2SG, BF16 KV cache, and decode ICB:
   `174.984202s` total, `17.498420s/page`.
 - Metal sequential is `4.07x` faster than PyTorch/MPS on the 10-page gate.
+- 3-page concurrent probe mean page timing regresses with more workers:
+  `14.326735s` at `--threads 1`, `27.831143s` at `--threads 2`, and
+  `52.627625s` at `--threads 4`.
 - Metal fallback rows are zero.
 
 ## Acceptance Criteria

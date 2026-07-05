@@ -42,6 +42,12 @@ It completed 10 / 10 pages with zero fallback rows in `174.984202s`
 (`17.498420s/page`), or `4.07x` faster than the existing PyTorch/MPS warm-rerun
 reference. Treat MPS as a regression reference, not the immediate blocker.
 
+A 3-page concurrent probe on pages `224,244,303` showed worker contention still
+dominates: mean page timing was `14.326735s` at `--threads 1`, `27.831143s` at
+`--threads 2`, and `52.627625s` at `--threads 4`, all with zero fallback rows.
+Keep `--threads 1` as the recommended baseline mode until concurrency is
+profiled directly.
+
 Start the next optimization cycle from fresh `--timing` / split-profile
 evidence. Do not spend another cycle on LayerNorm, attention, or 1SG-vs-2SG
 micro-variants unless the profile changes. Keep `MU_DENSE_ROWS_NO_2SG=1` as the
