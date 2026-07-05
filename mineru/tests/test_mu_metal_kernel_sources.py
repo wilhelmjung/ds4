@@ -24,6 +24,19 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn('"mu_dense_bf16_bias_rows_tiled"', host)
         self.assertIn('getenv("MU_DENSE_ROWS_TILED")', host)
 
+    def test_dense_rows_2sg_is_default_with_escape_hatch(self):
+        metal = (ROOT / "mineru/metal/mu_dense.metal").read_text()
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn("kernel void mu_dense_bf16_bias_rows_simdgroup_2sg", metal)
+        self.assertIn("kernel void mu_dense_bf16_bias_rows_simdgroup_quick_gelu_2sg", metal)
+        self.assertIn("dense_bf16_bias_rows_simdgroup_2sg", host)
+        self.assertIn("dense_bf16_bias_rows_simdgroup_quick_gelu_2sg", host)
+        self.assertIn('"mu_dense_bf16_bias_rows_simdgroup_2sg"', host)
+        self.assertIn('"mu_dense_bf16_bias_rows_simdgroup_quick_gelu_2sg"', host)
+        self.assertIn('getenv("MU_DENSE_ROWS_NO_2SG")', host)
+        self.assertIn("!disable_2sg", host)
+
     def test_dense_shape_benchmark_compares_mps_cpu_and_current_metal(self):
         bench = (ROOT / "mineru/tests/mu_dense_shape_bench.m").read_text()
 

@@ -1,6 +1,6 @@
 # Handoff Report: Metal Backend Optimizations & Performance Baseline
 
-## 1. Accomplished Work (Phases 23 & 24)
+## 1. Accomplished Work (Phases 23-25)
 
 ### Indirect Command Buffer (ICB) Concurrency Fix
 - **Problem**: Concurrent layout extraction (e.g. `--threads 2` or `4` workers) with `MU_TEXT_DECODE_ICB=1` caused data races because the pre-recorded ICB bound absolute, zero-based scratch buffer offsets, leading threads to overwrite intermediate hidden states and output logits.
@@ -40,6 +40,26 @@
 - Tried a no-score recompute variant for cached decode attention. Correctness held, but layout ICB decode regressed (`0.4319s` vs adjacent default `0.2134s`), so it was not kept.
 - Tried a smaller `scores[2048]` variant for layout-sized prompts. Trace parity held, but follow-up A/B was noisy and did not produce a stable win, so it was not promoted or kept.
 
+### Vision Split Profiling, Attention Rejection, and Dense 2SG Default
+- Ran sequential `MU_VISION_PROFILE_SPLIT=1` profiling on pages 224, 244, and 303. The stable hot stages were Vision attention (`5.591659s` total across 96 blocks), FFN `fc1_gelu` (`3.325887s`), FFN `fc2` (`3.555260s`), QKV (`2.524866s`), and projection (`0.857976s`).
+- Rejected existing attention variants after direct A/B:
+  - `MU_VISION_ATTN_FLASH_K16=1` on page 244: `vision_encode=26.223042s`, `attention=21.264510s`.
+  - `MU_VISION_ATTN_MSL_PACKED_5476=1` on page 244: `vision_encode=20.139595s`, `attention=15.439565s`.
+  - Adjacent default on page 244: `vision_encode=7.119092s`, `attention=1.860926s`.
+- Added two 2-simdgroup dense kernels in [mu_dense.metal](file:///Users/will/github/ds4/mineru/metal/mu_dense.metal): generic BF16+bias rows and BF16+bias+QuickGELU rows. Each threadgroup now computes two 8-row tiles for the same 32 output columns, sharing one weight tile load across two simdgroups.
+- Promoted the 2SG dense path to default for existing SIMDGroup dense shapes in [mu_metal.m](file:///Users/will/github/ds4/mineru/mu_metal.m). `MU_DENSE_ROWS_NO_2SG=1` keeps the old 1SG path available for comparison.
+- 3-page default-vs-2SG profile A/B:
+  - `vision_encode` mean: `7.225235s -> 6.889842s`.
+  - `page_total` mean: `12.118075s -> 11.898402s`.
+  - `fc1_gelu` total: `3.325887s -> 3.050101s`.
+  - `fc2` total: `3.555260s -> 3.026327s`.
+  - `proj` total: `0.857976s -> 0.786274s`.
+- Verification:
+  - `make -B mu`
+  - `./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/layout.json`
+  - `/Users/will/github/mineru-model/.venv/bin/python -m unittest mineru.tests.test_mu_metal_kernel_sources`
+  - `git diff --check`
+
 ---
 
 ## 2. Verified Performance Baseline (10-Page Timings)
@@ -68,11 +88,11 @@ Below is the comparative performance timings of the fully optimized Metal engine
 
 ## 3. Next Steps & Future Plans
 
-1. **Decoder ICB / Attention Follow-up**:
-   - **Context**: The ICB-compatible FFN sequence and QKV/RoPE fusion are now default and correctness-verified. QKV/RoPE timing is a modest/noisy win, but the dispatch reduction is stable. Cached-attention recompute/smaller-score-buffer probes did not produce a stable win.
-   - **Handoff Task**: Attempt a larger KV-group attention redesign that avoids seven repeated K/V reads per KV head, or stop decoder micro-kernel work and move back to vision FFN.
-2. **Re-implement Vision FFN Fusion using `simdgroup_matrix` GEMM primitives**:
-   - **Context**: The existing `mu_vision_fused_ffn` kernel was disabled by default because it relied on sequential dot product loops, dropping warp occupancy and running slower than the unfused SIMD path.
-   - **Handoff Task**: Re-architect `mu_vision_fused_ffn.metal` using MSL's cooperative matrix multiplication (`simdgroup_matrix`) only after decoder experiments stop showing cheap wins.
+1. **Vision QKV 2SG Probe**:
+   - **Context**: The 2SG pattern produced a stable win for generic dense and QuickGELU dense. QKV still costs about `0.84s/page` across 32 vision blocks.
+   - **Handoff Task**: Apply the same two-simdgroup weight-sharing pattern to `mu_dense_bf16_bias_rows_simdgroup_qkv` behind an escape hatch first. Promote only if page 224/244/303 split profiles show a stable win and trace parity holds.
+2. **Full 10-Page Baseline Refresh**:
+   - **Context**: The 10-page table above predates the Vision 2SG dense default.
+   - **Handoff Task**: Re-run the 10-page optimized sequential baseline with `--kv-cache-bf16 --use-icb` after the current commit if a clean machine window is available. Avoid concurrent benchmark conclusions until worker contention is re-profiled.
 3. **Push/Publish Local Commits**:
-   - **Handoff Task**: Push the local branch `codex/mineru-metal-backend` (currently 20 commits ahead) to remote repository.
+   - **Handoff Task**: Push the local branch `codex/mineru-metal-backend` after this handoff/update commit if remote publication is desired.

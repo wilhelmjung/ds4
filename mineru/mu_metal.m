@@ -114,7 +114,9 @@ struct mu_gpu {
     id<MTLComputePipelineState> dense_bf16_bias_rows_simd;
     id<MTLComputePipelineState> dense_bf16_bias_rows_tiled;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup;
+    id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_2sg;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_quick_gelu;
+    id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_quick_gelu_2sg;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_gelu;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_qkv;
     id<MTLComputePipelineState> dense_bf16_rows_simdgroup_swiglu;
@@ -1051,8 +1053,12 @@ int mu_gpu_create(mu_gpu **out) {
                                                                @"mu_dense_bf16_bias_rows_tiled");
         gpu->dense_bf16_bias_rows_simdgroup = mu_gpu_make_pipeline(device, @"mu_dense.metal",
                                                                    @"mu_dense_bf16_bias_rows_simdgroup");
+        gpu->dense_bf16_bias_rows_simdgroup_2sg = mu_gpu_make_pipeline(device, @"mu_dense.metal",
+                                                                       @"mu_dense_bf16_bias_rows_simdgroup_2sg");
         gpu->dense_bf16_bias_rows_simdgroup_quick_gelu = mu_gpu_make_pipeline(device, @"mu_dense.metal",
                                                                               @"mu_dense_bf16_bias_rows_simdgroup_quick_gelu");
+        gpu->dense_bf16_bias_rows_simdgroup_quick_gelu_2sg = mu_gpu_make_pipeline(device, @"mu_dense.metal",
+                                                                                  @"mu_dense_bf16_bias_rows_simdgroup_quick_gelu_2sg");
         gpu->dense_bf16_bias_rows_simdgroup_gelu = mu_gpu_make_pipeline(device, @"mu_dense.metal",
                                                                         @"mu_dense_bf16_bias_rows_simdgroup_gelu");
         gpu->dense_bf16_bias_rows_simdgroup_qkv = mu_gpu_make_pipeline(device, @"mu_dense.metal",
@@ -1136,7 +1142,9 @@ void mu_gpu_destroy(mu_gpu *gpu) {
         gpu->dense_bf16_bias_rows_simd = nil;
         gpu->dense_bf16_bias_rows_tiled = nil;
         gpu->dense_bf16_bias_rows_simdgroup = nil;
+        gpu->dense_bf16_bias_rows_simdgroup_2sg = nil;
         gpu->dense_bf16_bias_rows_simdgroup_quick_gelu = nil;
+        gpu->dense_bf16_bias_rows_simdgroup_quick_gelu_2sg = nil;
         gpu->dense_bf16_bias_rows_simdgroup_gelu = nil;
         gpu->dense_bf16_bias_rows_simdgroup_qkv = nil;
         gpu->dense_bf16_rows_simdgroup_swiglu = nil;
@@ -3691,11 +3699,17 @@ int mu_gpu_dense_bf16_bias_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_bu
     id<MTLBuffer> out_buf = (__bridge id<MTLBuffer>)out.ptr;
 
     bool request_mps = getenv("MU_DENSE_ROWS_MPS") != NULL;
+    bool disable_2sg = getenv("MU_DENSE_ROWS_NO_2SG") != NULL;
+    id<MTLComputePipelineState> simdgroup_pipeline =
+        (!disable_2sg && ctx->gpu->dense_bf16_bias_rows_simdgroup_2sg)
+            ? ctx->gpu->dense_bf16_bias_rows_simdgroup_2sg
+            : ctx->gpu->dense_bf16_bias_rows_simdgroup;
+    bool use_2sg = simdgroup_pipeline == ctx->gpu->dense_bf16_bias_rows_simdgroup_2sg;
     bool use_simdgroup = mu_gpu_dense_mps_shape(cols, out_cols) &&
-                         ctx->gpu->dense_bf16_bias_rows_simdgroup &&
+                         simdgroup_pipeline &&
                          getenv("MU_DENSE_ROWS_NO_SIMDGROUP") == NULL;
     if (use_simdgroup && !request_mps) {
-        [ctx->encoder setComputePipelineState:ctx->gpu->dense_bf16_bias_rows_simdgroup];
+        [ctx->encoder setComputePipelineState:simdgroup_pipeline];
         [ctx->encoder setBuffer:x_buf offset:x.offset atIndex:0];
         [ctx->encoder setBuffer:w_buf offset:w.offset atIndex:1];
         [ctx->encoder setBuffer:bias_buf offset:bias.offset atIndex:2];
@@ -3705,7 +3719,10 @@ int mu_gpu_dense_bf16_bias_rows_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x, mu_gpu_bu
         [ctx->encoder setBytes:&x_rows length:sizeof(x_rows) atIndex:6];
 
         MTLSize grid = MTLSizeMake(((NSUInteger)out_cols + 31u) / 32u, ((NSUInteger)x_rows + 7u) / 8u, 1);
-        MTLSize threads = MTLSizeMake(32, 1, 1);
+        if (use_2sg) {
+            grid.height = ((NSUInteger)x_rows + 15u) / 16u;
+        }
+        MTLSize threads = MTLSizeMake(use_2sg ? 64u : 32u, 1, 1);
         [ctx->encoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
         return 0;
     }
@@ -3762,8 +3779,14 @@ int mu_gpu_dense_bf16_bias_rows_quick_gelu_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x
     if (!ctx || !x.ptr || !w.ptr || !bias.ptr || !out.ptr || x_rows <= 0 || cols <= 0 || out_cols <= 0) return -1;
     
     bool request_mps = getenv("MU_DENSE_ROWS_MPS") != NULL;
+    bool disable_2sg = getenv("MU_DENSE_ROWS_NO_2SG") != NULL;
+    id<MTLComputePipelineState> simdgroup_pipeline =
+        (!disable_2sg && ctx->gpu->dense_bf16_bias_rows_simdgroup_quick_gelu_2sg)
+            ? ctx->gpu->dense_bf16_bias_rows_simdgroup_quick_gelu_2sg
+            : ctx->gpu->dense_bf16_bias_rows_simdgroup_quick_gelu;
+    bool use_2sg = simdgroup_pipeline == ctx->gpu->dense_bf16_bias_rows_simdgroup_quick_gelu_2sg;
     bool use_simdgroup = mu_gpu_dense_mps_shape(cols, out_cols) &&
-                         ctx->gpu->dense_bf16_bias_rows_simdgroup_quick_gelu &&
+                         simdgroup_pipeline &&
                          getenv("MU_DENSE_ROWS_NO_SIMDGROUP") == NULL;
                          
     if (use_simdgroup && !request_mps) {
@@ -3772,7 +3795,7 @@ int mu_gpu_dense_bf16_bias_rows_quick_gelu_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x
         id<MTLBuffer> bias_buf = (__bridge id<MTLBuffer>)bias.ptr;
         id<MTLBuffer> out_buf = (__bridge id<MTLBuffer>)out.ptr;
 
-        [ctx->encoder setComputePipelineState:ctx->gpu->dense_bf16_bias_rows_simdgroup_quick_gelu];
+        [ctx->encoder setComputePipelineState:simdgroup_pipeline];
         [ctx->encoder setBuffer:x_buf offset:x.offset atIndex:0];
         [ctx->encoder setBuffer:w_buf offset:w.offset atIndex:1];
         [ctx->encoder setBuffer:bias_buf offset:bias.offset atIndex:2];
@@ -3782,7 +3805,10 @@ int mu_gpu_dense_bf16_bias_rows_quick_gelu_ctx(mu_gpu_cmd_ctx *ctx, mu_gpu_buf x
         [ctx->encoder setBytes:&x_rows length:sizeof(x_rows) atIndex:6];
 
         MTLSize grid = MTLSizeMake(((NSUInteger)out_cols + 31u) / 32u, ((NSUInteger)x_rows + 7u) / 8u, 1);
-        MTLSize threads = MTLSizeMake(32, 1, 1);
+        if (use_2sg) {
+            grid.height = ((NSUInteger)x_rows + 15u) / 16u;
+        }
+        MTLSize threads = MTLSizeMake(use_2sg ? 64u : 32u, 1, 1);
         [ctx->encoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
         return 0;
     }
