@@ -1,9 +1,43 @@
 #include "mu.h"
 
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
+
+static double mu_cli_time_now_seconds(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
+}
+
+static int mu_concurrency_profile_enabled(void) {
+    const char *v = getenv("MU_CONCURRENCY_PROFILE");
+    return v && *v && strcmp(v, "0") != 0;
+}
+
+static void mu_concurrency_profile_printf(FILE *fp, int worker_id,
+                                          const char *event,
+                                          const char *page,
+                                          double worker_start,
+                                          const char *fmt, ...) {
+    if (!mu_concurrency_profile_enabled() || !event) return;
+    if (!fp) fp = stderr;
+    fprintf(fp,
+            "mu_profile stage=concurrency worker=%d event=%s page=%s elapsed=%.6f",
+            worker_id, event, page ? page : "none",
+            mu_cli_time_now_seconds() - worker_start);
+    if (fmt && *fmt) {
+        fputc(' ', fp);
+        va_list ap;
+        va_start(ap, fmt);
+        vfprintf(fp, fmt, ap);
+        va_end(ap);
+    }
+    fputc('\n', fp);
+}
 
 static char *read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
@@ -1943,6 +1977,8 @@ typedef struct {
     mu_preprocessed_page *prep;
     int rc;
     int worker_id;
+    double start_seconds;
+    double end_seconds;
 } mu_prefetch_task;
 
 static void *mu_prefetch_thread_fn(void *arg) {
@@ -1950,7 +1986,13 @@ static void *mu_prefetch_thread_fn(void *arg) {
 #ifdef __APPLE__
     mu_gpu_set_thread_worker_id(task->worker_id);
 #endif
+    if (mu_concurrency_profile_enabled()) {
+        task->start_seconds = mu_cli_time_now_seconds();
+    }
     task->rc = mu_preprocess_page_cpu(task->engine, task->path, &task->prep);
+    if (mu_concurrency_profile_enabled()) {
+        task->end_seconds = mu_cli_time_now_seconds();
+    }
     return NULL;
 }
 
@@ -1962,6 +2004,8 @@ typedef struct {
 static void *mu_worker_thread_fn(void *arg) {
     mu_worker_args *args = (mu_worker_args *)arg;
     mu_work_queue *q = args->queue;
+    const double worker_start = mu_cli_time_now_seconds();
+    double curr_prefetch_seconds = 0.0;
     
 #ifdef __APPLE__
     mu_gpu_set_thread_worker_id(args->worker_id);
@@ -1977,6 +2021,7 @@ static void *mu_worker_thread_fn(void *arg) {
     // Eagerly prefetch the first page synchronously
     mu_preprocessed_page *curr_prep = NULL;
     if (next_idx != -1) {
+        double prefetch_start = mu_cli_time_now_seconds();
 #ifdef __APPLE__
         mu_gpu_set_thread_worker_id(args->worker_id + q->max_workers);
 #endif
@@ -1984,6 +2029,7 @@ static void *mu_worker_thread_fn(void *arg) {
 #ifdef __APPLE__
         mu_gpu_set_thread_worker_id(args->worker_id);
 #endif
+        curr_prefetch_seconds = mu_cli_time_now_seconds() - prefetch_start;
         if (rc != 0) {
             fprintf(stderr, "First page prefetch failed for %s: %d\n", q->images[next_idx], rc);
             pthread_mutex_lock(&q->mutex);
@@ -2015,10 +2061,13 @@ static void *mu_worker_thread_fn(void *arg) {
             prefetch_args.prep = NULL;
             prefetch_args.rc = 0;
             prefetch_args.worker_id = args->worker_id + q->max_workers;
+            prefetch_args.start_seconds = 0.0;
+            prefetch_args.end_seconds = 0.0;
             if (pthread_create(&prefetch_thread, NULL, mu_prefetch_thread_fn, &prefetch_args) == 0) {
                 prefetch_started = 1;
             } else {
                 fprintf(stderr, "Failed to spawn prefetch thread for %s, falling back to sync\n", prefetch_args.path);
+                prefetch_args.start_seconds = mu_cli_time_now_seconds();
 #ifdef __APPLE__
                 mu_gpu_set_thread_worker_id(args->worker_id + q->max_workers);
 #endif
@@ -2026,6 +2075,7 @@ static void *mu_worker_thread_fn(void *arg) {
 #ifdef __APPLE__
                 mu_gpu_set_thread_worker_id(args->worker_id);
 #endif
+                prefetch_args.end_seconds = mu_cli_time_now_seconds();
             }
         }
 
@@ -2039,9 +2089,55 @@ static void *mu_worker_thread_fn(void *arg) {
         } else {
             fprintf(stderr, "mu_page_start page=%s\n", path);
         }
+        mu_concurrency_profile_printf(log_fp, args->worker_id, "parse_start",
+                                      path, worker_start,
+                                      "prefetch_seconds=%.6f", curr_prefetch_seconds);
+        if (fetch_idx != -1) {
+            mu_concurrency_profile_printf(log_fp, args->worker_id,
+                                          prefetch_started ? "prefetch_spawn" : "prefetch_sync",
+                                          path, worker_start,
+                                          "target_page=%s", q->images[fetch_idx]);
+        }
 
         mu_result *result = NULL;
+        double parse_start = mu_cli_time_now_seconds();
         int rc = mu_parse_preprocessed_page(q->engine, curr_prep, &result);
+        mu_concurrency_profile_printf(log_fp, args->worker_id, "parse_end",
+                                      path, worker_start,
+                                      "seconds=%.6f rc=%d",
+                                      mu_cli_time_now_seconds() - parse_start, rc);
+
+        // Wait for prefetch thread to complete
+        mu_preprocessed_page *next_prep = NULL;
+        double next_prefetch_seconds = 0.0;
+        if (fetch_idx != -1) {
+            double join_start = mu_cli_time_now_seconds();
+            mu_concurrency_profile_printf(log_fp, args->worker_id,
+                                          "prefetch_join_start", path,
+                                          worker_start,
+                                          "target_page=%s", q->images[fetch_idx]);
+            if (prefetch_started) {
+                pthread_join(prefetch_thread, NULL);
+            }
+            if (prefetch_args.start_seconds > 0.0 && prefetch_args.end_seconds >= prefetch_args.start_seconds) {
+                next_prefetch_seconds = prefetch_args.end_seconds - prefetch_args.start_seconds;
+            }
+            mu_concurrency_profile_printf(log_fp, args->worker_id,
+                                          "prefetch_join_end", path,
+                                          worker_start,
+                                          "target_page=%s seconds=%.6f prefetch_seconds=%.6f",
+                                          q->images[fetch_idx],
+                                          mu_cli_time_now_seconds() - join_start,
+                                          next_prefetch_seconds);
+            if (prefetch_args.rc != 0) {
+                fprintf(stderr, "Prefetch failed for %s: %d\n", q->images[fetch_idx], prefetch_args.rc);
+                pthread_mutex_lock(&q->mutex);
+                q->failed = 1;
+                pthread_mutex_unlock(&q->mutex);
+            } else {
+                next_prep = prefetch_args.prep;
+            }
+        }
 
         if (log_fp) {
             fprintf(log_fp, "mu_page_end page=%s\n", path);
@@ -2056,22 +2152,6 @@ static void *mu_worker_thread_fn(void *arg) {
             free(log_buf);
         } else {
             fprintf(stderr, "mu_page_end page=%s\n", path);
-        }
-
-        // Wait for prefetch thread to complete
-        mu_preprocessed_page *next_prep = NULL;
-        if (fetch_idx != -1) {
-            if (prefetch_started) {
-                pthread_join(prefetch_thread, NULL);
-            }
-            if (prefetch_args.rc != 0) {
-                fprintf(stderr, "Prefetch failed for %s: %d\n", q->images[fetch_idx], prefetch_args.rc);
-                pthread_mutex_lock(&q->mutex);
-                q->failed = 1;
-                pthread_mutex_unlock(&q->mutex);
-            } else {
-                next_prep = prefetch_args.prep;
-            }
         }
 
         // Free current preprocessed page
@@ -2121,6 +2201,7 @@ static void *mu_worker_thread_fn(void *arg) {
 
         // Move to the next page
         curr_prep = next_prep;
+        curr_prefetch_seconds = next_prefetch_seconds;
         next_idx = fetch_idx;
     }
     return NULL;

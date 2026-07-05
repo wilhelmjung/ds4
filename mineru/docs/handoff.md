@@ -155,13 +155,36 @@ Command:
 - **Mean stage timings**: `layout_vision_encode=8.745170s`, `vision_encode=12.006544s`, `layout_generate=12.410343s`, `text_generate_prefill=6.282512s`, `text_generate_decode=6.056410s`, `content_total=3.297320s`.
 - **Output artifacts**: `/tmp/mu_10page_threads2_qkv2sg_refresh.json` and `/tmp/mu_10page_threads2_qkv2sg_refresh_outputs/metal_page_*.json`.
 
+### Worker Contention Profile and Weight-Cache Rejection
+
+Added `MU_CONCURRENCY_PROFILE=1` diagnostics for concurrent runs:
+
+- [mu_cli.c](file:///Users/will/github/ds4/mineru/mu_cli.c) now records worker/page events (`parse_start`, `parse_end`, `prefetch_spawn`, `prefetch_join_start`, `prefetch_join_end`) into each page-scoped log stream.
+- [mu_metal.m](file:///Users/will/github/ds4/mineru/mu_metal.m) now records `command_wait` events around Metal command buffer commits and `weight_cache` events with mutex wait/hold timing, cache hit/miss, and copy/no-copy allocation flags.
+- [mu.c](file:///Users/will/github/ds4/mineru/mu.c) exposes the thread-local log stream to Metal profiling so worker logs stay grouped by page.
+
+The first profile on pages `224,244,303` showed real weight-cache mutex cost, but a direct optimization attempt was rejected:
+
+| Variant | Artifact | Completed | Fallback Rows | Wall Time | Weight-Cache Wait Sum | Weight-Cache Hold Sum | Copied Events | Hit+Copied Events |
+| :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| Serialized default, initial profile | `/tmp/mu_concurrency_profile_threads2.json` | 3/3 | 0 | 47.738335s | 3222.598ms | 8284.470ms | 680 | 0 |
+| Lock-free miss + pending guard | `/tmp/mu_concurrency_profile_threads2_after_pending.json` | 3/3 | 0 | 75.911148s | 1928.931ms | 1.579ms | 680 | 0 |
+| Lock-free miss + pending guard, no profile | `/tmp/mu_probe_wall_threads2_weight_cache_pending.json` | 3/3 | 0 | 108.154561s | n/a | n/a | n/a | n/a |
+| Current serialized default after rejection | `/tmp/mu_concurrency_profile_threads2_serialized_default.json` | 3/3 | 0 | 56.647298s | 1879.283ms | 6425.993ms | 680 | 0 |
+| Current serialized default, no profile | `/tmp/mu_probe_wall_threads2_serialized_default.json` | 3/3 | 0 | 58.902828s | n/a | n/a | n/a | n/a |
+
+- **Conclusion**: Do not move `newBufferWithBytes*` weight-cache misses outside the global mutex by default. The mutex wait looked bad in isolation, but it also throttles cold-cache weight copies. Allowing different weights to allocate concurrently increased Metal command wait and wall time.
+- **Rejected path**: a pending/condition-variable guard fixed duplicate allocations (`hit+copied` returned to `0`) but still regressed wall time. The pending code was not kept.
+- **Current code state**: keeps serialized weight-cache miss allocation and retains the `MU_CONCURRENCY_PROFILE=1` diagnostics for future contention work.
+
 ---
 
 ## 3. Next Steps & Future Plans
 
 1. **Worker Contention Root Cause**:
    - **Context**: `threads=2` improves 10-page wall-clock throughput, but per-page latency regresses. `threads=4` is not useful on the 3-page probe.
-   - **Handoff Task**: Reduce `threads=2` contention before testing higher concurrency. Start by checking shared GPU scratch, command queue serialization, weight-cache locking, and ICB decode overlap.
+   - **Known dead end**: weight-cache lock-free miss allocation is rejected; it reduced mutex hold time but worsened wall time (`75.911148s` profiled, `108.154561s` no-profile on the 3-page probe).
+   - **Handoff Task**: Continue with `MU_CONCURRENCY_PROFILE=1`, focusing on command queue serialization, ICB decode overlap, warm-cache scheduling, and shared scratch pressure rather than unlocking weight-cache allocation.
 2. **Sequential Optimization**:
    - **Context**: The current reliable baseline is the 10-page sequential Metal run at `174.984202s`.
    - **Handoff Task**: Keep optimizing from fresh `--timing` / split-profile evidence under `--threads 1`.

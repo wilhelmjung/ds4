@@ -63,6 +63,11 @@ Current reference artifacts:
 /tmp/mu_probe_wall_threads4_qkv2sg.json
 /tmp/mu_10page_threads2_qkv2sg_refresh.json
 /tmp/mu_10page_threads2_qkv2sg_refresh_outputs/metal_page_*.json
+/tmp/mu_concurrency_profile_threads2.json
+/tmp/mu_concurrency_profile_threads2_after_pending.json
+/tmp/mu_probe_wall_threads2_weight_cache_pending.json
+/tmp/mu_concurrency_profile_threads2_serialized_default.json
+/tmp/mu_probe_wall_threads2_serialized_default.json
 ```
 
 Current local M5 benchmark expectation:
@@ -74,6 +79,11 @@ Current local M5 benchmark expectation:
 - Metal `--threads 2` completes the same 10-page gate in `126.861503s` wall
   time with `24.487243s` mean page latency. Use this as the batch-throughput
   baseline; keep sequential as the single-page latency baseline.
+- `MU_CONCURRENCY_PROFILE=1` is the current contention profiler. The
+  weight-cache lock-free miss + pending experiment is rejected: it completed
+  pages `224,244,303` with zero fallback rows, but regressed wall time to
+  `75.911148s` profiled and `108.154561s` no-profile. Current default keeps
+  weight-cache miss allocation serialized.
 - Metal fallback rows are zero.
 
 ## Acceptance Criteria
@@ -104,6 +114,9 @@ For PyTorch/MPS back-to-back validation:
 - Rerun CPU only when CPU code, parsing semantics, token limits, model weights,
   or comparison logic changed.
 - Rerun Metal after each meaningful Metal optimization.
+- For concurrency optimizations, collect both a `MU_CONCURRENCY_PROFILE=1`
+  artifact and a no-profile wall-clock artifact; profile counters alone are
+  not enough to promote a change.
 - Rerun MPS only for explicit back-to-back comparisons or when the MPS reference
   environment changed.
 - Update `mineru/docs/mu-performance-report.md` only with measured artifact

@@ -20,6 +20,8 @@ This guide compiles key architectural patterns and lessons learned during the op
 ## 3. Concurrency and Thread Safety
 - **Rule**: When executing multiple worker threads via `--threads > 1`, keep all shared buffers and caches thread-safe.
 - **Weight Cache**: Protect the global `weight_cache` lookups and allocations in `mu_metal.m` using a `pthread_mutex_t`.
+- **Weight-Cache Allocation Throttle**: Do not move `newBufferWithBytes*` weight-cache misses outside the global mutex by default. A lock-free miss path with a pending/condition-variable guard removed duplicate allocations, but regressed the pages `224,244,303` probe to `75.911148s` profiled and `108.154561s` no-profile wall time. Treat the mutex as both synchronization and cold-cache copy throttle unless a fresh adjacent benchmark proves otherwise.
+- **Concurrency Profiling**: Use `MU_CONCURRENCY_PROFILE=1` for `--threads > 1` work. It records page worker events, Metal `command_wait` timings, and weight-cache wait/hold/copy stats in page-scoped logs. Always pair it with a no-profile wall-clock artifact before promoting a concurrency change.
 - **MPS Objects**: Metal Performance Shaders (MPS) kernel objects (such as `MPSMatrixMultiplication`) are **not thread-safe** for concurrent `encodeToCommandBuffer` calls. When `MU_CONCURRENT_WORKERS > 1`, bypass the kernel cache and allocate a fresh MPS kernel object per-call.
 
 ## 4. Occupancy and Register Pressure Tuning
@@ -41,3 +43,4 @@ This guide compiles key architectural patterns and lessons learned during the op
 - **Rule**: Use `/tmp/mu_10page_seq_qkv2sg_refresh.json` as the single-page latency baseline and `/tmp/mu_10page_threads2_qkv2sg_refresh.json` as the batch-throughput baseline after Vision dense 2SG, QKV 2SG, BF16 KV cache, and decode ICB defaults.
 - **Numbers**: Sequential completed `10/10` pages with `0` failures and `0` fallback rows in `174.984202s` summed page time (`17.498420s/page`). `--threads 2` completed the same gate in `126.861503s` wall time with `24.487243s` mean page latency, a `1.38x` throughput speedup over sequential and `5.62x` over the existing PyTorch/MPS warm-rerun reference.
 - **Concurrency Scope**: `--threads 2` is the current throughput recommendation; `--threads 4` was slower than `--threads 2` on the pages `224,244,303` probe. Before raising concurrency, profile shared GPU scratch, command queue serialization, weight-cache locking, and ICB overlap.
+- **Rejected Concurrency Direction**: Weight-cache lock-free allocation is already measured and rejected. The next concurrency pass should focus on command queue serialization, ICB decode overlap, warm-cache scheduling, and shared scratch pressure.

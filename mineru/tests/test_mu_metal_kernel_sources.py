@@ -256,6 +256,30 @@ class MuMetalKernelSourceTests(unittest.TestCase):
         self.assertIn("@selector(GPUStartTime)", host)
         self.assertIn("@selector(GPUEndTime)", host)
 
+    def test_concurrency_profile_hooks_are_wired(self):
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+        cli = (ROOT / "mineru/mu_cli.c").read_text()
+
+        self.assertIn('getenv("MU_CONCURRENCY_PROFILE")', host)
+        self.assertIn('getenv("MU_CONCURRENCY_PROFILE")', cli)
+        self.assertIn("mu_profile stage=concurrency", host)
+        self.assertIn("mu_profile stage=concurrency", cli)
+        self.assertIn("event=command_wait", host)
+        self.assertIn("event=weight_cache", host)
+        self.assertIn("event=%s", cli)
+        self.assertIn('"parse_start"', cli)
+        self.assertIn('"prefetch_join_end"', cli)
+
+    def test_weight_cache_profiles_default_serialized_miss_path(self):
+        host = (ROOT / "mineru/mu_metal.m").read_text()
+
+        self.assertIn("mu_gpu_weight_cache_allocate_buffer", host)
+        self.assertIn("id<MTLBuffer> buffer = mu_gpu_weight_cache_allocate_buffer", host)
+        self.assertIn("mu_gpu_profile_weight_cache(0, stored, length", host)
+        self.assertIn("double unlock_time = profile ? local_time_now_seconds() : 0.0;\n    pthread_mutex_unlock(&weight_cache_mutex);", host)
+        self.assertNotIn("pthread_cond_wait(&weight_cache_cond", host)
+        self.assertNotIn("mu_gpu_weight_cache_pending_index", host)
+
     def test_command_context_can_preserve_scratch_offsets_for_profile_splits(self):
         header = (ROOT / "mineru/mu_gpu.h").read_text()
         host = (ROOT / "mineru/mu_metal.m").read_text()

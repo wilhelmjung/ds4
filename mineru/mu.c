@@ -113,6 +113,10 @@ void mu_set_thread_log_stream(FILE *fp) {
     tl_log_stream = fp;
 }
 
+FILE *mu_get_thread_log_stream(void) {
+    return tl_log_stream;
+}
+
 static int mu_record_cpu_fallback(mu_engine *e, const char *stage) {
     if (!e) return -1;
     if (e->opt.backend != MU_BACKEND_METAL) return 0;

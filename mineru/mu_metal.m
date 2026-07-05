@@ -22,13 +22,23 @@ int mu_engine_hidden_size(const mu_engine *e);
 #include <unistd.h>
 #include <sys/time.h>
 
+FILE *mu_get_thread_log_stream(void);
+
 static double local_time_now_seconds(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (double)tv.tv_sec + (double)tv.tv_usec / 1000000.0;
 }
 
-static pthread_mutex_t weight_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int mu_concurrency_profile_enabled(void) {
+    const char *v = getenv("MU_CONCURRENCY_PROFILE");
+    return v && *v && strcmp(v, "0") != 0;
+}
+
+static FILE *mu_concurrency_profile_stream(void) {
+    FILE *fp = mu_get_thread_log_stream();
+    return fp ? fp : stderr;
+}
 
 @protocol MTLCommandBufferProfiling <NSObject>
 @property (readonly) double kernelStartTime;
@@ -37,8 +47,76 @@ static pthread_mutex_t weight_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 @property (readonly) double GPUEndTime;
 @end
 
-#define MU_GPU_WEIGHT_CACHE_CAP 1024
+static __thread int tl_worker_id = 0;
+
+static void mu_gpu_profile_command_wait(id<MTLCommandBuffer> command_buffer,
+                                        const char *fallback_label,
+                                        double commit_start,
+                                        double commit_end,
+                                        double wait_end) {
+    if (!mu_concurrency_profile_enabled() || !command_buffer) return;
+
+    double kernel_start = 0.0;
+    double kernel_end = 0.0;
+    double gpu_start = 0.0;
+    double gpu_end = 0.0;
+    id<MTLCommandBufferProfiling> cb = (id<MTLCommandBufferProfiling>)command_buffer;
+    if ([cb respondsToSelector:@selector(kernelStartTime)]) {
+        kernel_start = cb.kernelStartTime;
+    }
+    if ([cb respondsToSelector:@selector(kernelEndTime)]) {
+        kernel_end = cb.kernelEndTime;
+    }
+    if ([cb respondsToSelector:@selector(GPUStartTime)]) {
+        gpu_start = cb.GPUStartTime;
+    }
+    if ([cb respondsToSelector:@selector(GPUEndTime)]) {
+        gpu_end = cb.GPUEndTime;
+    }
+
+    NSString *label = command_buffer.label;
+    const char *label_str = label ? [label UTF8String] : fallback_label;
+    if (!label_str) label_str = "unlabeled";
+
+    double gpu_ms = (gpu_start > 0.0 && gpu_end > 0.0) ? (gpu_end - gpu_start) * 1000.0 : -1.0;
+    double kernel_ms = (kernel_start > 0.0 && kernel_end > 0.0) ? (kernel_end - kernel_start) * 1000.0 : -1.0;
+    double queue_ms = (kernel_end > 0.0 && gpu_start > 0.0) ? (gpu_start - kernel_end) * 1000.0 : -1.0;
+    if (kernel_ms < 0.0) kernel_ms = -1.0;
+    if (gpu_ms < 0.0) gpu_ms = -1.0;
+    if (queue_ms < 0.0) queue_ms = -1.0;
+    FILE *fp = mu_concurrency_profile_stream();
+    fprintf(fp,
+            "mu_profile stage=concurrency worker=%d event=command_wait label=%s "
+            "commit_ms=%.3f wait_ms=%.3f total_ms=%.3f kernel_ms=%.3f gpu_ms=%.3f queue_ms=%.3f\n",
+            tl_worker_id, label_str,
+            (commit_end - commit_start) * 1000.0,
+            (wait_end - commit_end) * 1000.0,
+            (wait_end - commit_start) * 1000.0,
+            kernel_ms, gpu_ms, queue_ms);
+}
+
+static void mu_gpu_profile_weight_cache(int hit, int stored, NSUInteger length,
+                                        double wait_start,
+                                        double lock_acquired,
+                                        double unlock_time,
+                                        int cache_count,
+                                        int no_copy,
+                                        int copied) {
+    if (!mu_concurrency_profile_enabled()) return;
+    FILE *fp = mu_concurrency_profile_stream();
+    fprintf(fp,
+            "mu_profile stage=concurrency worker=%d event=weight_cache hit=%d stored=%d "
+            "length=%lu wait_ms=%.3f hold_ms=%.3f cache_count=%d no_copy=%d copied=%d\n",
+            tl_worker_id, hit, stored, (unsigned long)length,
+            (lock_acquired - wait_start) * 1000.0,
+            (unlock_time - lock_acquired) * 1000.0,
+            cache_count, no_copy, copied);
+}
+
 #define MU_GPU_DENSE_MPS_WEIGHT_CACHE_CAP 256
+#define MU_GPU_WEIGHT_CACHE_CAP 1024
+
+static pthread_mutex_t weight_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 typedef struct {
     const void *cpu_ptr;
@@ -292,33 +370,11 @@ static int mu_gpu_dense_f32_rows_mps(mu_gpu *gpu,
                                      int x_rows, int cols, int out_cols,
                                      float *out);
 
-static id<MTLBuffer> mu_gpu_get_or_create_buffer(mu_gpu *gpu, const void *cpu_ptr, NSUInteger length) {
-    if (!gpu || !cpu_ptr || length == 0) return nil;
-
-    pthread_mutex_lock(&weight_cache_mutex);
-
-    // Check if it's already cached
-    for (int i = 0; i < gpu->weight_cache_count; i++) {
-        if (gpu->weight_cache[i].cpu_ptr == cpu_ptr) {
-            gpu->weight_cache_hits++;
-            id<MTLBuffer> buf = gpu->weight_cache[i].buffer;
-            pthread_mutex_unlock(&weight_cache_mutex);
-            return buf;
-        }
-    }
-
-    gpu->weight_cache_misses++;
-
-    if (gpu->weight_cache_count >= MU_GPU_WEIGHT_CACHE_CAP) {
-        if (getenv("MU_METAL_DEBUG")) {
-            fprintf(stderr, "Warning: Metal weight cache capacity reached (%d)\n", MU_GPU_WEIGHT_CACHE_CAP);
-        }
-        gpu->weight_cache_copy_allocs++;
-        id<MTLBuffer> buf = [gpu->device newBufferWithBytes:cpu_ptr length:length options:MTLResourceStorageModeShared];
-        pthread_mutex_unlock(&weight_cache_mutex);
-        return buf;
-    }
-
+static id<MTLBuffer> mu_gpu_weight_cache_allocate_buffer(mu_gpu *gpu,
+                                                         const void *cpu_ptr,
+                                                         NSUInteger length,
+                                                         int *no_copy,
+                                                         int *copied) {
     id<MTLBuffer> buffer = nil;
     static int page_size = 0;
     if (page_size == 0) {
@@ -331,25 +387,72 @@ static id<MTLBuffer> mu_gpu_get_or_create_buffer(mu_gpu *gpu, const void *cpu_pt
                                                 length:length
                                                options:MTLResourceStorageModeShared
                                            deallocator:nil];
-        if (buffer) {
-            gpu->weight_cache_no_copy_allocs++;
-        }
+        if (buffer && no_copy) *no_copy = 1;
     }
 
     if (!buffer) {
         buffer = [gpu->device newBufferWithBytes:cpu_ptr
                                           length:length
                                          options:MTLResourceStorageModeShared];
-        if (buffer) {
-            gpu->weight_cache_copy_allocs++;
+        if (buffer && copied) *copied = 1;
+    }
+    return buffer;
+}
+
+static id<MTLBuffer> mu_gpu_get_or_create_buffer(mu_gpu *gpu, const void *cpu_ptr, NSUInteger length) {
+    if (!gpu || !cpu_ptr || length == 0) return nil;
+
+    int profile = mu_concurrency_profile_enabled();
+    double wait_start = profile ? local_time_now_seconds() : 0.0;
+    pthread_mutex_lock(&weight_cache_mutex);
+    double lock_acquired = profile ? local_time_now_seconds() : 0.0;
+
+    for (int i = 0; i < gpu->weight_cache_count; i++) {
+        if (gpu->weight_cache[i].cpu_ptr == cpu_ptr) {
+            gpu->weight_cache_hits++;
+            id<MTLBuffer> buf = gpu->weight_cache[i].buffer;
+            NSUInteger cached_length = gpu->weight_cache[i].length;
+            int cache_count = gpu->weight_cache_count;
+            double unlock_time = profile ? local_time_now_seconds() : 0.0;
+            pthread_mutex_unlock(&weight_cache_mutex);
+            mu_gpu_profile_weight_cache(1, 1, cached_length,
+                                        wait_start, lock_acquired, unlock_time,
+                                        cache_count, 0, 0);
+            return buf;
         }
     }
 
+    gpu->weight_cache_misses++;
+
+    if (gpu->weight_cache_count >= MU_GPU_WEIGHT_CACHE_CAP) {
+        if (getenv("MU_METAL_DEBUG")) {
+            fprintf(stderr, "Warning: Metal weight cache capacity reached (%d)\n", MU_GPU_WEIGHT_CACHE_CAP);
+        }
+        gpu->weight_cache_copy_allocs++;
+        id<MTLBuffer> buf = [gpu->device newBufferWithBytes:cpu_ptr
+                                                     length:length
+                                                    options:MTLResourceStorageModeShared];
+        int cache_count = gpu->weight_cache_count;
+        double unlock_time = profile ? local_time_now_seconds() : 0.0;
+        pthread_mutex_unlock(&weight_cache_mutex);
+        mu_gpu_profile_weight_cache(0, 0, length, wait_start, lock_acquired,
+                                    unlock_time, cache_count, 0, buf ? 1 : 0);
+        return buf;
+    }
+
+    int no_copy = 0;
+    int copied = 0;
+    id<MTLBuffer> buffer = mu_gpu_weight_cache_allocate_buffer(gpu, cpu_ptr, length,
+                                                               &no_copy, &copied);
+    if (no_copy) gpu->weight_cache_no_copy_allocs++;
+    if (copied) gpu->weight_cache_copy_allocs++;
+    int stored = 0;
     if (buffer) {
         gpu->weight_cache[gpu->weight_cache_count].cpu_ptr = cpu_ptr;
         gpu->weight_cache[gpu->weight_cache_count].length = length;
         gpu->weight_cache[gpu->weight_cache_count].buffer = buffer;
         gpu->weight_cache_count++;
+        stored = 1;
     }
 
     if (!buffer) {
@@ -358,11 +461,14 @@ static id<MTLBuffer> mu_gpu_get_or_create_buffer(mu_gpu *gpu, const void *cpu_pt
         }
     }
 
+    int cache_count = gpu->weight_cache_count;
+    double unlock_time = profile ? local_time_now_seconds() : 0.0;
     pthread_mutex_unlock(&weight_cache_mutex);
+    mu_gpu_profile_weight_cache(0, stored, length, wait_start,
+                                lock_acquired, unlock_time, cache_count,
+                                no_copy, copied);
     return buffer;
 }
-
-static __thread int tl_worker_id = 0;
 
 typedef struct {
     mu_gpu *gpu;
@@ -496,25 +602,35 @@ int mu_gpu_cmd_commit_and_wait(mu_gpu_cmd_ctx *ctx) {
             const char *env = getenv("MU_LATENCY_PROFILE");
             check_profile = (env && strcmp(env, "0") != 0) ? 1 : 0;
         }
+        int concurrency_profile = mu_concurrency_profile_enabled();
+        int any_profile = check_profile || concurrency_profile;
 
         double t_commit_start = 0.0;
         double t_commit_end = 0.0;
         double t_wait_end = 0.0;
 
-        if (check_profile) {
+        if (any_profile) {
             t_commit_start = local_time_now_seconds();
         }
 
         [ctx->command_buffer commit];
 
-        if (check_profile) {
+        if (any_profile) {
             t_commit_end = local_time_now_seconds();
         }
 
         [ctx->command_buffer waitUntilCompleted];
 
-        if (check_profile) {
+        if (any_profile) {
             t_wait_end = local_time_now_seconds();
+        }
+        if (concurrency_profile) {
+            mu_gpu_profile_command_wait(ctx->command_buffer, "ctx",
+                                        t_commit_start, t_commit_end,
+                                        t_wait_end);
+        }
+
+        if (check_profile) {
             double kernel_start = 0.0;
             double kernel_end = 0.0;
             double gpu_start = 0.0;
@@ -5131,6 +5247,7 @@ int mu_gpu_text_decode_icb_execute(void *engine,
         // 3. Start command buffer and encoder
         id<MTLCommandBuffer> command_buffer = [gpu->queue commandBuffer];
         if (!command_buffer) return -2;
+        command_buffer.label = @"text_decode_icb_execute";
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (!encoder) return -3;
 
@@ -5160,8 +5277,16 @@ int mu_gpu_text_decode_icb_execute(void *engine,
         [encoder executeCommandsInBuffer:cache->decode_icb withRange:NSMakeRange(0, total_commands)];
 
         [encoder endEncoding];
+        int concurrency_profile = mu_concurrency_profile_enabled();
+        double t_commit_start = concurrency_profile ? local_time_now_seconds() : 0.0;
         [command_buffer commit];
+        double t_commit_end = concurrency_profile ? local_time_now_seconds() : 0.0;
         [command_buffer waitUntilCompleted];
+        double t_wait_end = concurrency_profile ? local_time_now_seconds() : 0.0;
+        if (concurrency_profile) {
+            mu_gpu_profile_command_wait(command_buffer, "text_decode_icb_execute",
+                                        t_commit_start, t_commit_end, t_wait_end);
+        }
 
         if (command_buffer.status != MTLCommandBufferStatusCompleted) return -4;
 

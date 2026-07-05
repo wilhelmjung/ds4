@@ -54,6 +54,15 @@ evidence. Do not spend another cycle on LayerNorm, attention, or 1SG-vs-2SG
 micro-variants unless the profile changes. Keep `MU_DENSE_ROWS_NO_2SG=1` as the
 A/B escape hatch for the Vision dense and QKV 2SG defaults.
 
+For `--threads > 1` work, use `MU_CONCURRENCY_PROFILE=1` before changing shared
+runtime behavior. It records page worker events, Metal command waits, and
+weight-cache wait/hold/copy stats in page-scoped logs. The weight-cache
+lock-free miss path with a pending guard is a measured dead end: it removed
+duplicate allocations but regressed pages `224,244,303` to `75.911148s`
+profiled and `108.154561s` no-profile wall time. Keep weight-cache miss
+allocation serialized by default; focus next on command queue overlap, ICB
+decode scheduling, warm-cache behavior, and scratch pressure.
+
 ## Coding Rules
 
 - Use `apply_patch` for manual edits.
@@ -64,6 +73,8 @@ A/B escape hatch for the Vision dense and QKV 2SG defaults.
   instead of silently falling back.
 - For performance work, reduce copies or dispatch cost only after preserving
   exact CPU parity.
+- Do not move `newBufferWithBytes*` weight-cache misses outside
+  `weight_cache_mutex` without a new adjacent benchmark proving wall-time gain.
 
 ## Common Commands
 

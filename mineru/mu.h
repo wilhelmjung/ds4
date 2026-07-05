@@ -70,6 +70,7 @@ int mu_parse_image_rgb(mu_engine *e, const uint8_t *rgb, int width, int height,
 void mu_result_free(mu_result *r);
 int mu_result_write_json(const mu_result *r, FILE *fp);
 int mu_result_write_markdown(const mu_result *r, FILE *fp);
+FILE *mu_get_thread_log_stream(void);
 int mu_parse_layout_markup(const char *text, mu_layout_block *blocks, int max_blocks);
 char *mu_render_chat_prompt(const char *prompt, bool has_image);
 int mu_tokenize_text(mu_engine *e, const char *text, int *out, int max_out);
