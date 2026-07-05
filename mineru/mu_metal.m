@@ -119,6 +119,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_quick_gelu_2sg;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_gelu;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_qkv;
+    id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_qkv_2sg;
     id<MTLComputePipelineState> dense_bf16_rows_simdgroup_swiglu;
     id<MTLComputePipelineState> text_decode_fused_ffn;
     id<MTLComputePipelineState> text_decode_qkv_proj_simd;
@@ -1063,6 +1064,8 @@ int mu_gpu_create(mu_gpu **out) {
                                                                         @"mu_dense_bf16_bias_rows_simdgroup_gelu");
         gpu->dense_bf16_bias_rows_simdgroup_qkv = mu_gpu_make_pipeline(device, @"mu_dense.metal",
                                                                        @"mu_dense_bf16_bias_rows_simdgroup_qkv");
+        gpu->dense_bf16_bias_rows_simdgroup_qkv_2sg = mu_gpu_make_pipeline(device, @"mu_dense.metal",
+                                                                           @"mu_dense_bf16_bias_rows_simdgroup_qkv_2sg");
         gpu->dense_bf16_rows_simdgroup_swiglu = mu_gpu_make_pipeline(device, @"mu_dense_ffn_prefill.metal",
                                                                      @"mu_dense_bf16_rows_simdgroup_swiglu");
         gpu->text_decode_fused_ffn = mu_gpu_make_pipeline(device, @"mu_text_fused_ffn.metal",
@@ -1147,6 +1150,7 @@ void mu_gpu_destroy(mu_gpu *gpu) {
         gpu->dense_bf16_bias_rows_simdgroup_quick_gelu_2sg = nil;
         gpu->dense_bf16_bias_rows_simdgroup_gelu = nil;
         gpu->dense_bf16_bias_rows_simdgroup_qkv = nil;
+        gpu->dense_bf16_bias_rows_simdgroup_qkv_2sg = nil;
         gpu->dense_bf16_rows_simdgroup_swiglu = nil;
         gpu->text_decode_fused_ffn = nil;
         gpu->text_decode_qkv_proj_simd = nil;
@@ -2282,13 +2286,19 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
             }
 
             bool request_mps = getenv("MU_DENSE_ROWS_MPS") != NULL;
+            bool disable_2sg = getenv("MU_DENSE_ROWS_NO_2SG") != NULL;
+            id<MTLComputePipelineState> qkv_pipeline =
+                (!disable_2sg && gpu->dense_bf16_bias_rows_simdgroup_qkv_2sg)
+                    ? gpu->dense_bf16_bias_rows_simdgroup_qkv_2sg
+                    : gpu->dense_bf16_bias_rows_simdgroup_qkv;
+            bool use_2sg = qkv_pipeline == gpu->dense_bf16_bias_rows_simdgroup_qkv_2sg;
             bool use_simdgroup = mu_gpu_dense_mps_shape(1280, 3840) &&
-                                 gpu->dense_bf16_bias_rows_simdgroup_qkv &&
+                                 qkv_pipeline &&
                                  getenv("MU_DENSE_ROWS_NO_SIMDGROUP") == NULL &&
                                  !request_mps;
 
             if (use_simdgroup) {
-                [ctx->encoder setComputePipelineState:gpu->dense_bf16_bias_rows_simdgroup_qkv];
+                [ctx->encoder setComputePipelineState:qkv_pipeline];
                 [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)temp_normed.ptr offset:temp_normed.offset atIndex:0];
                 [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)qkv_w_buf.ptr offset:qkv_w_buf.offset atIndex:1];
                 [ctx->encoder setBuffer:(__bridge id<MTLBuffer>)qkv_b_buf.ptr offset:qkv_b_buf.offset atIndex:2];
@@ -2301,7 +2311,10 @@ int mu_gpu_vision_encode(mu_gpu *gpu, void *engine,
                 [ctx->encoder setBytes:&rows length:sizeof(rows) atIndex:7];
 
                 MTLSize grid = MTLSizeMake(((NSUInteger)3840 + 31u) / 32u, ((NSUInteger)rows + 7u) / 8u, 1);
-                MTLSize threads = MTLSizeMake(32, 1, 1);
+                if (use_2sg) {
+                    grid.height = ((NSUInteger)rows + 15u) / 16u;
+                }
+                MTLSize threads = MTLSizeMake(use_2sg ? 64u : 32u, 1, 1);
                 [ctx->encoder dispatchThreadgroups:grid threadsPerThreadgroup:threads];
             } else {
                 rc = mu_gpu_dense_bf16_bias_rows_ctx(ctx, temp_normed, qkv_w_buf, qkv_b_buf, rows, 1280, 1280, temp_q);

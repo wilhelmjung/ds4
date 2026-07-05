@@ -30,14 +30,22 @@ observable through traces, smoke tests, or benchmark artifacts.
 
 ## Current Performance Direction
 
-Current native Metal is faster than the fresh local PyTorch/MPS 10-page
-baseline. Treat MPS as a regression reference, not the immediate blocker.
+Current native Metal sequential is faster than the existing PyTorch/MPS
+warm-rerun 10-page baseline. With Vision dense 2SG, QKV 2SG, BF16 KV cache,
+and decode ICB enabled, the refreshed Metal artifact is:
 
-Start the next optimization cycle with per-kernel timing inside
-`text_generate_decode` / `content_region_generate`. Do not spend another cycle
-on LayerNorm or attention micro-variants without new timing evidence. Keep the
-remaining vision FFN pair as the fallback target if decoder dispatch overhead
-is not cheaply reducible.
+```text
+/tmp/mu_10page_seq_qkv2sg_refresh.json
+```
+
+It completed 10 / 10 pages with zero fallback rows in `174.984202s`
+(`17.498420s/page`), or `4.07x` faster than the existing PyTorch/MPS warm-rerun
+reference. Treat MPS as a regression reference, not the immediate blocker.
+
+Start the next optimization cycle from fresh `--timing` / split-profile
+evidence. Do not spend another cycle on LayerNorm, attention, or 1SG-vs-2SG
+micro-variants unless the profile changes. Keep `MU_DENSE_ROWS_NO_2SG=1` as the
+A/B escape hatch for the Vision dense and QKV 2SG defaults.
 
 ## Coding Rules
 

@@ -960,6 +960,116 @@ kernel void mu_dense_bf16_bias_rows_simdgroup_qkv(device const float *x [[buffer
     }
 }
 
+kernel void mu_dense_bf16_bias_rows_simdgroup_qkv_2sg(device const float *x [[buffer(0)]],
+                                                      device const ushort *w [[buffer(1)]],
+                                                      device const ushort *bias [[buffer(2)]],
+                                                      device float *q_out [[buffer(3)]],
+                                                      device float *kv_out [[buffer(4)]],
+                                                      constant int &cols [[buffer(5)]],
+                                                      constant int &out_cols [[buffer(6)]],
+                                                      constant int &x_rows [[buffer(7)]],
+                                                      uint2 tg [[threadgroup_position_in_grid]],
+                                                      uint lane [[thread_index_in_simdgroup]],
+                                                      uint sg [[simdgroup_index_in_threadgroup]]) {
+    int row_start = (int)tg.y * 16 + (int)sg * 8;
+    int col_start = (int)tg.x * 32;
+
+    threadgroup float shared_x[2 * 8 * 8];
+    threadgroup float shared_w[32 * 8];
+
+    threadgroup float *x_tile = shared_x + (int)sg * 64;
+
+    simdgroup_matrix<float, 8, 8> acc[4];
+    for (int b = 0; b < 4; b++) {
+        acc[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    }
+
+    for (int k = 0; k < cols; k += 8) {
+        {
+            int idx0 = (int)lane * 2;
+            int idx1 = idx0 + 1;
+
+            int r0 = row_start + idx0 / 8;
+            int c0 = k + idx0 % 8;
+            float val0 = 0.0f;
+            if (r0 < x_rows && c0 < cols) {
+                val0 = x[(size_t)r0 * (size_t)cols + c0];
+            }
+            x_tile[idx0] = val0;
+
+            int r1 = row_start + idx1 / 8;
+            int c1 = k + idx1 % 8;
+            float val1 = 0.0f;
+            if (r1 < x_rows && c1 < cols) {
+                val1 = x[(size_t)r1 * (size_t)cols + c1];
+            }
+            x_tile[idx1] = val1;
+        }
+
+        if (sg == 0) {
+            int oc = col_start + (int)lane;
+            if (oc < out_cols && k < cols) {
+                device const ushort4 *w_vec = (device const ushort4 *)(w + (size_t)oc * (size_t)cols + k);
+                ushort4 v0 = w_vec[0];
+                ushort4 v1 = w_vec[1];
+                shared_w[lane * 8 + 0] = mu_bf16_to_f32(v0.x);
+                shared_w[lane * 8 + 1] = mu_bf16_to_f32(v0.y);
+                shared_w[lane * 8 + 2] = mu_bf16_to_f32(v0.z);
+                shared_w[lane * 8 + 3] = mu_bf16_to_f32(v0.w);
+                shared_w[lane * 8 + 4] = mu_bf16_to_f32(v1.x);
+                shared_w[lane * 8 + 5] = mu_bf16_to_f32(v1.y);
+                shared_w[lane * 8 + 6] = mu_bf16_to_f32(v1.z);
+                shared_w[lane * 8 + 7] = mu_bf16_to_f32(v1.w);
+            } else {
+                for (int c_idx = 0; c_idx < 8; c_idx++) {
+                    shared_w[lane * 8 + c_idx] = 0.0f;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        simdgroup_matrix<float, 8, 8> x_matrix;
+        simdgroup_load(x_matrix, x_tile, 8, ulong2(0, 0), false);
+
+        for (int b = 0; b < 4; b++) {
+            simdgroup_matrix<float, 8, 8> w_matrix;
+            simdgroup_load(w_matrix, shared_w + b * 64, 8, ulong2(0, 0), true);
+            simdgroup_multiply_accumulate(acc[b], x_matrix, w_matrix, acc[b]);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    threadgroup float shared_out[2 * 8 * 32];
+    threadgroup float *out_tile = shared_out + (int)sg * 8 * 32;
+    for (int b = 0; b < 4; b++) {
+        simdgroup_store(acc[b], out_tile + b * 8, 32, ulong2(0, 0), false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int step = 0; step < 8; step++) {
+        int linear_idx = step * 32 + (int)lane;
+        int r_offset = linear_idx / 32;
+        int c_offset = linear_idx % 32;
+
+        int r = row_start + r_offset;
+        int c = col_start + c_offset;
+
+        if (r < x_rows && c < out_cols) {
+            float val = out_tile[r_offset * 32 + c_offset];
+            float b_val = mu_bf16_to_f32(bias[c]);
+            float final_val = mu_round_bf16(val + b_val);
+            if (c < 1280) {
+                q_out[(size_t)r * 1280u + c] = final_val;
+            } else {
+                kv_out[(size_t)r * 2560u + (c - 1280)] = final_val;
+            }
+        }
+    }
+}
+
 
 kernel void mu_text_decode_qkv_proj_simd(device const float *x [[buffer(0)]],
                                          device const ushort *qw [[buffer(1)]],

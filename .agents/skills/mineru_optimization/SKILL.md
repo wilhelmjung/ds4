@@ -15,6 +15,7 @@ This guide compiles key architectural patterns and lessons learned during the op
 - **GQA Attention**: Fused FlashAttention (`mu_vision_attn_rows_flash` and `mu_text_prefill_attn_flash`) must compute online softmax statistics dynamically to avoid costly intermediate QK transpose and softmax allocations.
 - **FFN SwiGLU**: Fuse gate projection, up projection, SiLU activation, and element-wise multiplication into a single SIMD-group unified kernel (`mu_dense_bf16_rows_simdgroup_swiglu`). This eliminates 2 dispatches per layer and removes intermediate buffers.
 - **Residual Addition**: Fuse output projections directly with the residual summation to save intermediate VRAM writes/reads.
+- **Vision Dense/QKV 2SG**: Prefer the two-simdgroup row kernels for the established Vision dense shapes, including fused QKV projection. `QKV` is the fused Query/Key/Value projection; `2SG` means one threadgroup runs two simdgroups, computes two 8-row tiles, and shares the same loaded weight tile. Keep `MU_DENSE_ROWS_NO_2SG=1` as the single escape hatch for 1SG A/B checks.
 
 ## 3. Concurrency and Thread Safety
 - **Rule**: When executing multiple worker threads via `--threads > 1`, keep all shared buffers and caches thread-safe.
@@ -36,4 +37,8 @@ This guide compiles key architectural patterns and lessons learned during the op
 - **Compute Barriers**: By default, compute commands in an ICB are dispatched concurrently. To enforce sequential execution order and prevent data hazards between dependent layers, call `[cmd setBarrier]` sequentially on all indirect commands (except the first one).
 - **Pipeline Setup**: Ensure all target compute pipelines are created using `MTLComputePipelineDescriptor` with `supportIndirectCommandBuffers = YES` enabled, otherwise calling `setComputePipelineState:` on an indirect command will crash (EXC_BAD_ACCESS).
 
+## 7. Current 10-Page Metal Baseline
+- **Rule**: Use the refreshed sequential Metal artifact `/tmp/mu_10page_seq_qkv2sg_refresh.json` as the current local M5 Metal-only regression baseline after Vision dense 2SG, QKV 2SG, BF16 KV cache, and decode ICB defaults.
+- **Numbers**: The run completed `10/10` pages with `0` failures and `0` fallback rows in `174.984202s` total (`17.498420s/page`), `4.07x` faster than the existing PyTorch/MPS warm-rerun reference.
+- **Benchmark Scope**: Concurrent Metal timings were not refreshed in that run; do not infer worker-scaling conclusions from the sequential baseline.
 

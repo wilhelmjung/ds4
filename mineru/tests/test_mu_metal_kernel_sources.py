@@ -30,11 +30,15 @@ class MuMetalKernelSourceTests(unittest.TestCase):
 
         self.assertIn("kernel void mu_dense_bf16_bias_rows_simdgroup_2sg", metal)
         self.assertIn("kernel void mu_dense_bf16_bias_rows_simdgroup_quick_gelu_2sg", metal)
+        self.assertIn("kernel void mu_dense_bf16_bias_rows_simdgroup_qkv_2sg", metal)
         self.assertIn("dense_bf16_bias_rows_simdgroup_2sg", host)
         self.assertIn("dense_bf16_bias_rows_simdgroup_quick_gelu_2sg", host)
+        self.assertIn("dense_bf16_bias_rows_simdgroup_qkv_2sg", host)
         self.assertIn('"mu_dense_bf16_bias_rows_simdgroup_2sg"', host)
         self.assertIn('"mu_dense_bf16_bias_rows_simdgroup_quick_gelu_2sg"', host)
+        self.assertIn('"mu_dense_bf16_bias_rows_simdgroup_qkv_2sg"', host)
         self.assertIn('getenv("MU_DENSE_ROWS_NO_2SG")', host)
+        self.assertIn("(!disable_2sg && gpu->dense_bf16_bias_rows_simdgroup_qkv_2sg)", host)
         self.assertIn("!disable_2sg", host)
 
     def test_dense_shape_benchmark_compares_mps_cpu_and_current_metal(self):

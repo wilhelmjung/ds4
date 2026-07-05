@@ -53,13 +53,16 @@ Current reference artifacts:
 /tmp/mu-metal-layernorm-simd-b2b-10page-20260624.json
 /tmp/mu-metal-layernorm-simd-b2b-10page-20260624/metal_page_*.json
 /tmp/mu-metal-vs-mps-b2b-10page-20260624.metrics.json
+/tmp/mu_10page_seq_qkv2sg_refresh.json
+/tmp/mu_10page_seq_qkv2sg_refresh_outputs/metal_page_*.json
 ```
 
 Current local M5 benchmark expectation:
 
-- PyTorch/MPS measured: `521.6959s` total, `52.1696s/page`.
-- Metal no-fallback: `328.0251s` total, `32.8025s/page`.
-- Metal is `1.5904x` faster than PyTorch/MPS on the 10-page gate.
+- PyTorch/MPS warm-rerun reference: `712.34s` total, `71.23s/page`.
+- Metal sequential with Vision dense/QKV 2SG, BF16 KV cache, and decode ICB:
+  `174.984202s` total, `17.498420s/page`.
+- Metal sequential is `4.07x` faster than PyTorch/MPS on the 10-page gate.
 - Metal fallback rows are zero.
 
 ## Acceptance Criteria

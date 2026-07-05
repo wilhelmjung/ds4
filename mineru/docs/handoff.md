@@ -60,39 +60,60 @@
   - `/Users/will/github/mineru-model/.venv/bin/python -m unittest mineru.tests.test_mu_metal_kernel_sources`
   - `git diff --check`
 
+### Vision QKV 2SG Default
+- Added `mu_dense_bf16_bias_rows_simdgroup_qkv_2sg`, applying the same two-simdgroup weight-sharing pattern to the fused Vision QKV projection.
+- Terminology: `QKV` means the fused Query/Key/Value projection in each Vision attention block. `2SG` means one Metal threadgroup uses two simdgroups, computing two 8-row tiles at once.
+- The 2SG QKV kernel computes 16 rows per threadgroup and lets both simdgroups share the same loaded weight tile, reducing duplicate weight reads versus the old one-simdgroup QKV path.
+- Probed it behind `MU_DENSE_QKV_2SG=1`, then promoted it to default after adjacent page 224/244/303 split profiles showed stable QKV wins:
+  - Page 224: `0.802685s -> 0.759387s`.
+  - Page 244: `0.795874s -> 0.731034s`.
+  - Page 303: `0.795189s -> 0.726481s`.
+- `MU_DENSE_ROWS_NO_2SG=1` remains the escape hatch for the old one-simdgroup QKV path.
+- Verification:
+  - `/Users/will/github/mineru-model/.venv/bin/python -m unittest mineru.tests.test_mu_metal_kernel_sources`
+  - `make -B mu`
+  - `MU_METAL_DEBUG=1 ./mu --backend metal --no-cpu-fallback --check-trace mineru/tests/mu-traces/layout.json`
+
 ---
 
 ## 2. Verified Performance Baseline (10-Page Timings)
 
-Below is the comparative performance timings of the fully optimized Metal engine (with both `--kv-cache-bf16` and `--use-icb` active) compared to the **PyTorch MPS (Warm Rerun)** baseline:
+Below is the refreshed sequential 10-page timing for the fully optimized Metal engine with `--kv-cache-bf16 --use-icb` active after the Vision 2SG dense and QKV 2SG defaults. The PyTorch MPS column is the existing warm-rerun reference; concurrent Metal timings were not refreshed and are intentionally omitted until worker contention is re-profiled.
 
-| Page | PyTorch MPS (Warm Rerun) (s) | Metal Seq (Optimized) (s) | Speedup (Seq vs MPS) | Metal Concur (Optimized) (s) | Speedup (Concur vs MPS) |
+Command:
+
+```bash
+/Users/will/github/mineru-model/.venv/bin/python -m mineru.tests.mu_benchmark_pages \
+  --backend metal --threads 1 --pages 224,234,237,241,244,247,258,281,303,334 \
+  --timeout 7200 --timing --kv-cache-bf16 --use-icb \
+  --out /tmp/mu_10page_seq_qkv2sg_refresh.json \
+  --save-output-dir /tmp/mu_10page_seq_qkv2sg_refresh_outputs
+```
+
+| Page | PyTorch MPS (Warm Rerun) (s) | Metal Seq (Refreshed) (s) | Speedup (Seq vs MPS) | Prior Metal Seq (s) | Seq Refresh Speedup |
 | :---: | :---: | :---: | :---: | :---: | :---: |
-| Page 224 | 118.81s | 24.27s | 4.89x | 33.39s | 3.56x |
-| Page 234 | 157.22s | 32.94s | 4.77x | 38.40s | 4.09x |
-| Page 237 | 169.46s | 29.10s | 5.82x | 43.79s | 3.87x |
-| Page 241 | 75.94s | 25.42s | 2.99x | 50.03s | 1.52x |
-| Page 244 | 65.08s | 22.28s | 2.92x | 60.99s | 1.07x |
-| Page 247 | 51.55s | 30.37s | 1.70x | 45.89s | 1.12x |
-| Page 258 | 25.60s | 15.82s | 1.62x | 61.95s | 0.41x |
-| Page 281 | 17.88s | 14.50s | 1.23x | 65.40s | 0.27x |
-| Page 303 | 15.18s | 16.49s | 0.92x | 49.01s | 0.31x |
-| Page 334 | 15.62s | 15.33s | 1.02x | 48.40s | 0.32x |
-| **Total** | **712.34s** | **226.53s** | **3.14x** | **497.25s** | **1.43x** |
-| **Mean** | **71.23s** | **22.65s** | **3.14x** | **49.72s** | **1.43x** |
+| Page 224 | 118.81s | 19.56s | 6.08x | 24.27s | 1.24x |
+| Page 234 | 157.22s | 15.58s | 10.09x | 32.94s | 2.11x |
+| Page 237 | 169.46s | 24.09s | 7.03x | 29.10s | 1.21x |
+| Page 241 | 75.94s | 25.56s | 2.97x | 25.42s | 0.99x |
+| Page 244 | 65.08s | 16.30s | 3.99x | 22.28s | 1.37x |
+| Page 247 | 51.55s | 15.94s | 3.23x | 30.37s | 1.91x |
+| Page 258 | 25.60s | 13.33s | 1.92x | 15.82s | 1.19x |
+| Page 281 | 17.88s | 16.50s | 1.08x | 14.50s | 0.88x |
+| Page 303 | 15.18s | 15.57s | 0.98x | 16.49s | 1.06x |
+| Page 334 | 15.62s | 12.56s | 1.24x | 15.33s | 1.22x |
+| **Total** | **712.34s** | **174.98s** | **4.07x** | **226.52s** | **1.29x** |
+| **Mean** | **71.23s** | **17.50s** | **4.07x** | **22.65s** | **1.29x** |
 
-- **Sequential Acceleration**: The optimized sequential Metal engine is **3.14x faster** than PyTorch MPS.
-- **Parity Status**: 100% bit-exact layout extraction correctness parity is achieved.
+- **Sequential acceleration**: refreshed Metal sequential is **4.07x faster** than the existing PyTorch MPS warm-rerun reference.
+- **Refresh delta**: refreshed Metal sequential is **1.29x faster** than the prior Metal sequential baseline (`226.52s -> 174.98s` total).
+- **Run status**: completed `10/10` pages, `0` failures, `0` Metal fallback rows.
+- **Mean stage timings**: `page_total=17.498420s`, `layout_vision_encode=6.162498s`, `vision_encode=9.659590s`, `layout_generate=7.760307s`, `text_generate_prefill=4.605782s`, `text_generate_decode=3.103447s`, `content_total=3.538578s`.
+- **Output artifacts**: `/tmp/mu_10page_seq_qkv2sg_refresh.json` and `/tmp/mu_10page_seq_qkv2sg_refresh_outputs/metal_page_*.json`.
 
 ---
 
 ## 3. Next Steps & Future Plans
 
-1. **Vision QKV 2SG Probe**:
-   - **Context**: The 2SG pattern produced a stable win for generic dense and QuickGELU dense. QKV still costs about `0.84s/page` across 32 vision blocks.
-   - **Handoff Task**: Apply the same two-simdgroup weight-sharing pattern to `mu_dense_bf16_bias_rows_simdgroup_qkv` behind an escape hatch first. Promote only if page 224/244/303 split profiles show a stable win and trace parity holds.
-2. **Full 10-Page Baseline Refresh**:
-   - **Context**: The 10-page table above predates the Vision 2SG dense default.
-   - **Handoff Task**: Re-run the 10-page optimized sequential baseline with `--kv-cache-bf16 --use-icb` after the current commit if a clean machine window is available. Avoid concurrent benchmark conclusions until worker contention is re-profiled.
-3. **Push/Publish Local Commits**:
+1. **Push/Publish Local Commits**:
    - **Handoff Task**: Push the local branch `codex/mineru-metal-backend` after this handoff/update commit if remote publication is desired.
