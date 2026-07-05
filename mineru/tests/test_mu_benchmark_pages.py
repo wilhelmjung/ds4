@@ -137,6 +137,36 @@ class MuBenchmarkPagesTest(unittest.TestCase):
             ],
         )
 
+    def test_summarize_preserves_multi_page_wall_seconds(self) -> None:
+        args = SimpleNamespace(
+            backend="metal",
+            pages=[224, 244],
+            max_new_tokens=None,
+            content_max_new_tokens=None,
+            skip_content=False,
+            timing=True,
+        )
+        rows = [
+            {
+                "page": 224,
+                "returncode": 0,
+                "seconds": 10.0,
+                "fallback_detected": False,
+                "run_wall_seconds": 12.5,
+            },
+            {
+                "page": 244,
+                "returncode": 0,
+                "seconds": 11.0,
+                "fallback_detected": False,
+                "run_wall_seconds": 12.5,
+            },
+        ]
+
+        summary = mu_benchmark_pages.summarize(args, rows)
+
+        self.assertEqual(summary["run_wall_seconds"], 12.5)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -181,13 +181,18 @@ def summarize(args: argparse.Namespace, rows: list[dict]) -> dict:
     completed = [r for r in rows if r.get("returncode") == 0 and "error" not in r]
     total = sum(float(r["seconds"]) for r in completed)
     mean = total / len(completed) if completed else 0.0
+    run_wall_seconds = [
+        float(r["run_wall_seconds"])
+        for r in rows
+        if "run_wall_seconds" in r
+    ]
     timing_sums: dict[str, float] = {}
     timing_counts: dict[str, int] = {}
     for row in completed:
         for stage, seconds in dict(row.get("stage_timings") or {}).items():
             timing_sums[stage] = timing_sums.get(stage, 0.0) + float(seconds)
             timing_counts[stage] = timing_counts.get(stage, 0) + 1
-    return {
+    summary = {
         "backend": args.backend,
         "pages": args.pages,
         "max_new_tokens": args.max_new_tokens,
@@ -205,6 +210,9 @@ def summarize(args: argparse.Namespace, rows: list[dict]) -> dict:
         "fallback_rows": sum(1 for r in rows if r.get("fallback_detected")),
         "rows": rows,
     }
+    if run_wall_seconds:
+        summary["run_wall_seconds"] = max(run_wall_seconds)
+    return summary
 
 
 def write_summary(args: argparse.Namespace, rows: list[dict]) -> None:
@@ -325,8 +333,10 @@ def main() -> None:
             )
             returncode = result.returncode
             stderr_out = result.stderr
+            run_wall_seconds = time.perf_counter() - start
         except subprocess.TimeoutExpired as exc:
             returncode = -1
+            run_wall_seconds = time.perf_counter() - start
             stderr_out = exc.stderr or ""
             if isinstance(stderr_out, bytes):
                 stderr_out = stderr_out.decode("utf-8", errors="replace")
@@ -350,6 +360,7 @@ def main() -> None:
                 "returncode": returncode,
                 "content_max_new_tokens": args.content_max_new_tokens,
                 "fallback_detected": fallback_detected,
+                "run_wall_seconds": run_wall_seconds,
                 "stderr_tail": page_stderr[-4000:],
             }
 

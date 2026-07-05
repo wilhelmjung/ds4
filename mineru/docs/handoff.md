@@ -113,25 +113,55 @@ Command:
 
 ### 3-Page Concurrent Probe
 
-After the refreshed sequential baseline, a short pages `224,244,303` probe was run with `--kv-cache-bf16 --use-icb --timing` to decide whether a full 10-page concurrent refresh was worth running.
+After the refreshed sequential baseline, [mu_benchmark_pages.py](file:///Users/will/github/ds4/mineru/tests/mu_benchmark_pages.py) was updated to record top-level `run_wall_seconds` for multi-page runs. This matters because `total_seconds` sums per-page `page_total` timings and double-counts overlapping work during concurrent runs.
 
-| Threads | Completed | Fallback Rows | Total Page Timings | Mean Page Timing | Mean `layout_generate` | Mean `vision_encode` |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| 1 | 3/3 | 0 | 42.980205s | 14.326735s | 6.208955s | 8.042122s |
-| 2 | 3/3 | 0 | 83.493428s | 27.831143s | 12.470181s | 15.267998s |
-| 4 | 3/3 | 0 | 157.882875s | 52.627625s | 29.306230s | 23.205935s |
+A short pages `224,244,303` probe was then run with `--kv-cache-bf16 --use-icb --timing` to decide whether a full 10-page concurrent refresh was worth running.
 
-- **Decision**: do not run the 10-page concurrent refresh yet. Worker contention is still large enough that `--threads 1` remains the recommended baseline mode.
-- **Artifacts**: `/tmp/mu_probe_threads1_qkv2sg.json`, `/tmp/mu_probe_threads2_qkv2sg.json`, and `/tmp/mu_probe_threads4_qkv2sg.json`.
+| Threads | Completed | Fallback Rows | Wall Time | Total Page Timings | Mean Page Timing |
+| :---: | :---: | :---: | :---: | :---: | :---: |
+| 1 | 3/3 | 0 | 49.436264s | 44.829072s | 14.943024s |
+| 2 | 3/3 | 0 | 42.753367s | 64.635224s | 21.545075s |
+| 4 | 3/3 | 0 | 45.106882s | 115.796723s | 38.598908s |
+
+- **Decision**: `--threads 2` improves batch throughput despite worse per-page latency, so a full 10-page `threads=2` refresh was run. `--threads 4` was not promoted because it was slower than `threads=2` on the 3-page probe.
+- **Artifacts**: `/tmp/mu_probe_wall_threads1_qkv2sg.json`, `/tmp/mu_probe_wall_threads2_qkv2sg.json`, and `/tmp/mu_probe_wall_threads4_qkv2sg.json`.
 - **Run note**: under Codex sandboxing, Metal benchmark harness commands must use the already-approved script entry (`/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_benchmark_pages.py ...`) or explicit escalation. Unapproved wrappers such as `/usr/bin/time`, `python -m ...`, or inline environment assignments can make `mu_gpu_create` fail before the page starts.
+
+### 10-Page `threads=2` Throughput Refresh
+
+Command:
+
+```bash
+/Users/will/github/mineru-model/.venv/bin/python mineru/tests/mu_benchmark_pages.py \
+  --backend metal --threads 2 --pages 224,234,237,241,244,247,258,281,303,334 \
+  --timeout 7200 --timing --kv-cache-bf16 --use-icb \
+  --out /tmp/mu_10page_threads2_qkv2sg_refresh.json \
+  --save-output-dir /tmp/mu_10page_threads2_qkv2sg_refresh_outputs
+```
+
+| Metric | Value |
+| :--- | :---: |
+| Completed | 10/10 |
+| Failed | 0 |
+| Fallback rows | 0 |
+| Wall time | 126.861503s |
+| Sum of page timings | 244.872435s |
+| Mean page latency | 24.487243s |
+| Throughput speedup vs Metal sequential | 1.38x |
+| Throughput speedup vs PyTorch MPS warm-rerun | 5.62x |
+
+- **Recommendation**: use `--threads 2` for batch throughput and `--threads 1` when single-page latency is the priority.
+- **Latency tradeoff**: mean page latency is `1.40x` slower than the sequential baseline (`24.487243s` vs `17.498420s`) because concurrent page timings include contention.
+- **Mean stage timings**: `layout_vision_encode=8.745170s`, `vision_encode=12.006544s`, `layout_generate=12.410343s`, `text_generate_prefill=6.282512s`, `text_generate_decode=6.056410s`, `content_total=3.297320s`.
+- **Output artifacts**: `/tmp/mu_10page_threads2_qkv2sg_refresh.json` and `/tmp/mu_10page_threads2_qkv2sg_refresh_outputs/metal_page_*.json`.
 
 ---
 
 ## 3. Next Steps & Future Plans
 
 1. **Worker Contention Root Cause**:
-   - **Context**: 3-page probes show `threads=2/4` are correct but much slower per page than `threads=1`, especially in `layout_generate`, text prefill/decode, and Vision encode.
-   - **Handoff Task**: Profile worker contention before any full concurrent baseline refresh. Start by checking shared GPU scratch, command queue serialization, weight-cache locking, and ICB decode overlap.
+   - **Context**: `threads=2` improves 10-page wall-clock throughput, but per-page latency regresses. `threads=4` is not useful on the 3-page probe.
+   - **Handoff Task**: Reduce `threads=2` contention before testing higher concurrency. Start by checking shared GPU scratch, command queue serialization, weight-cache locking, and ICB decode overlap.
 2. **Sequential Optimization**:
    - **Context**: The current reliable baseline is the 10-page sequential Metal run at `174.984202s`.
    - **Handoff Task**: Keep optimizing from fresh `--timing` / split-profile evidence under `--threads 1`.

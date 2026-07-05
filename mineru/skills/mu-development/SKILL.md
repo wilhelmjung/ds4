@@ -42,11 +42,12 @@ It completed 10 / 10 pages with zero fallback rows in `174.984202s`
 (`17.498420s/page`), or `4.07x` faster than the existing PyTorch/MPS warm-rerun
 reference. Treat MPS as a regression reference, not the immediate blocker.
 
-A 3-page concurrent probe on pages `224,244,303` showed worker contention still
-dominates: mean page timing was `14.326735s` at `--threads 1`, `27.831143s` at
-`--threads 2`, and `52.627625s` at `--threads 4`, all with zero fallback rows.
-Keep `--threads 1` as the recommended baseline mode until concurrency is
-profiled directly.
+A 3-page wall-clock probe on pages `224,244,303` showed `--threads 2` improves
+batch throughput (`49.436264s -> 42.753367s`) despite worse per-page latency;
+`--threads 4` was slower than `--threads 2`. A 10-page `threads=2` refresh
+completed in `126.861503s` wall time with zero fallback rows, a `1.38x`
+throughput speedup over the sequential `174.984202s` baseline. Use `--threads 2`
+for batch throughput and `--threads 1` for single-page latency.
 
 Start the next optimization cycle from fresh `--timing` / split-profile
 evidence. Do not spend another cycle on LayerNorm, attention, or 1SG-vs-2SG
