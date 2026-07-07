@@ -145,6 +145,7 @@ class MuBenchmarkPagesTest(unittest.TestCase):
             content_max_new_tokens=None,
             skip_content=False,
             timing=True,
+            warmup_runs=0,
         )
         rows = [
             {
@@ -166,6 +167,27 @@ class MuBenchmarkPagesTest(unittest.TestCase):
         summary = mu_benchmark_pages.summarize(args, rows)
 
         self.assertEqual(summary["run_wall_seconds"], 12.5)
+
+    def test_run_warmups_records_discarded_runs(self) -> None:
+        args = SimpleNamespace(timeout=10, keep_going=False, warmup_runs=2)
+        completed = SimpleNamespace(returncode=0, stderr="warm\n")
+
+        with mock.patch.object(mu_benchmark_pages.time, "perf_counter",
+                               side_effect=[1.0, 3.0, 4.0, 7.5]):
+            with mock.patch.object(mu_benchmark_pages.subprocess, "run",
+                                   return_value=completed) as run_mock:
+                with mock.patch("builtins.print"):
+                    rows = mu_benchmark_pages.run_warmups(["mu", "--json"], args, {"MU_TIMING": "1"})
+
+        self.assertEqual(
+            rows,
+            [
+                {"run": 1, "returncode": 0, "run_wall_seconds": 2.0, "stderr_tail": "warm\n"},
+                {"run": 2, "returncode": 0, "run_wall_seconds": 3.5, "stderr_tail": "warm\n"},
+            ],
+        )
+        self.assertEqual(run_mock.call_count, 2)
+        self.assertEqual(run_mock.call_args.kwargs["env"], {"MU_TIMING": "1"})
 
 
 if __name__ == "__main__":

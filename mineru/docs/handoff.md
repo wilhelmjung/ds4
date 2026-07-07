@@ -177,14 +177,31 @@ The first profile on pages `224,244,303` showed real weight-cache mutex cost, bu
 - **Rejected path**: a pending/condition-variable guard fixed duplicate allocations (`hit+copied` returned to `0`) but still regressed wall time. The pending code was not kept.
 - **Current code state**: keeps serialized weight-cache miss allocation and retains the `MU_CONCURRENCY_PROFILE=1` diagnostics for future contention work.
 
+Follow-up contention probes were also measured and not kept:
+
+| Probe | Artifact | Completed | Fallback Rows | Wall Time | Sum of Page Timings | Decision |
+| :--- | :--- | :---: | :---: | :---: | :---: | :--- |
+| Default before multi-queue A/B | `/tmp/mu_multiq_default_threads2.json` | 3/3 | 0 | 125.483086s | 183.206093s | Baseline for adjacent A/B only; run was cold/noisy. |
+| `MU_METAL_MULTI_QUEUE=1` worker command queues | `/tmp/mu_multiq_optin_threads2.json` | 3/3 | 0 | 134.306501s | 194.580037s | Rejected; multiple command queues did not reduce contention and was slower. |
+| Default before prefetch A/B | `/tmp/mu_prefetch_default_threads2.json` | 3/3 | 0 | 120.556958s | 192.821130s | Baseline for adjacent A/B only; run was cold/noisy. |
+| Disable background prefetch thread | `/tmp/mu_prefetch_disabled_threads2.json` | 3/3 | 0 | 62.323259s | 93.583718s | Not kept; apparent win disappeared after reverse-order warm check. |
+| Default after prefetch-disabled run | `/tmp/mu_prefetch_default_after_disabled_threads2.json` | 3/3 | 0 | 60.013088s | 96.432857s | Reverse-order check was slightly faster than disabling prefetch. |
+
+- **Conclusion**: do not add a multi-command-queue path or a prefetch-disable switch from the current evidence. The large cold/warm swing means adjacent A/B order must be reversed before promoting any future worker-contention change.
+
+Benchmark harness update:
+
+- [mu_benchmark_pages.py](file:///Users/will/github/ds4/mineru/tests/mu_benchmark_pages.py) now supports `--warmup-runs N` for multi-page commands. Warmup runs execute the same command before the measured run, discard outputs, and record `warmup_rows` in the summary JSON.
+- Smoke check artifact: `/tmp/mu_warmup_smoke.json` used `--warmup-runs 1 --skip-content` on page `303`; warmup returned `0` in `30.292954s`, measured run returned `0` in `36.296708s`, and the summary recorded one `warmup_rows` entry.
+
 ---
 
 ## 3. Next Steps & Future Plans
 
 1. **Worker Contention Root Cause**:
    - **Context**: `threads=2` improves 10-page wall-clock throughput, but per-page latency regresses. `threads=4` is not useful on the 3-page probe.
-   - **Known dead end**: weight-cache lock-free miss allocation is rejected; it reduced mutex hold time but worsened wall time (`75.911148s` profiled, `108.154561s` no-profile on the 3-page probe).
-   - **Handoff Task**: Continue with `MU_CONCURRENCY_PROFILE=1`, focusing on command queue serialization, ICB decode overlap, warm-cache scheduling, and shared scratch pressure rather than unlocking weight-cache allocation.
+   - **Known dead ends**: weight-cache lock-free miss allocation is rejected; it reduced mutex hold time but worsened wall time (`75.911148s` profiled, `108.154561s` no-profile on the 3-page probe). `MU_METAL_MULTI_QUEUE=1` was slower (`134.306501s` vs adjacent default `125.483086s`). Disabling the background prefetch thread was not a stable win after reverse-order checking (`62.323259s` vs warm default `60.013088s`).
+   - **Handoff Task**: Continue with `MU_CONCURRENCY_PROFILE=1`, focusing on ICB decode overlap, cold/warm benchmark control, and shared scratch pressure rather than unlocking weight-cache allocation, adding multiple command queues, or disabling prefetch by default. Use `--warmup-runs 1` or reverse-order A/B before promoting any concurrency result.
 2. **Sequential Optimization**:
    - **Context**: The current reliable baseline is the 10-page sequential Metal run at `174.984202s`.
    - **Handoff Task**: Keep optimizing from fresh `--timing` / split-profile evidence under `--threads 1`.

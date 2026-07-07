@@ -177,7 +177,43 @@ def run_one(
     return row
 
 
-def summarize(args: argparse.Namespace, rows: list[dict]) -> dict:
+def run_warmups(cmd: list[str], args: argparse.Namespace, env: dict[str, str] | None) -> list[dict]:
+    rows = []
+    for run_idx in range(1, args.warmup_runs + 1):
+        start = time.perf_counter()
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=ROOT,
+                check=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=args.timeout,
+                env=env,
+            )
+            returncode = result.returncode
+            stderr_out = result.stderr
+        except subprocess.TimeoutExpired as exc:
+            returncode = -1
+            stderr_out = exc.stderr or ""
+            if isinstance(stderr_out, bytes):
+                stderr_out = stderr_out.decode("utf-8", errors="replace")
+        row = {
+            "run": run_idx,
+            "returncode": returncode,
+            "run_wall_seconds": time.perf_counter() - start,
+            "stderr_tail": stderr_out[-4000:],
+        }
+        rows.append(row)
+        print(json.dumps({"warmup": row}, ensure_ascii=False), flush=True)
+        if returncode != 0 and not args.keep_going:
+            raise SystemExit(f"warmup run {run_idx} failed with code {returncode}")
+    return rows
+
+
+def summarize(args: argparse.Namespace, rows: list[dict],
+              warmup_rows: list[dict] | None = None) -> dict:
     completed = [r for r in rows if r.get("returncode") == 0 and "error" not in r]
     total = sum(float(r["seconds"]) for r in completed)
     mean = total / len(completed) if completed else 0.0
@@ -199,6 +235,7 @@ def summarize(args: argparse.Namespace, rows: list[dict]) -> dict:
         "content_max_new_tokens": args.content_max_new_tokens,
         "skip_content": args.skip_content,
         "timing": args.timing,
+        "warmup_runs": args.warmup_runs,
         "total_seconds": total,
         "mean_seconds": mean,
         "mean_stage_timings": {
@@ -212,12 +249,15 @@ def summarize(args: argparse.Namespace, rows: list[dict]) -> dict:
     }
     if run_wall_seconds:
         summary["run_wall_seconds"] = max(run_wall_seconds)
+    if warmup_rows:
+        summary["warmup_rows"] = warmup_rows
     return summary
 
 
-def write_summary(args: argparse.Namespace, rows: list[dict]) -> None:
+def write_summary(args: argparse.Namespace, rows: list[dict],
+                  warmup_rows: list[dict] | None = None) -> None:
     Path(args.out).write_text(
-        json.dumps(summarize(args, rows), indent=2, ensure_ascii=False),
+        json.dumps(summarize(args, rows, warmup_rows), indent=2, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -255,10 +295,13 @@ def main() -> None:
     parser.add_argument("--keep-going", action="store_true")
     parser.add_argument("--save-output-dir", type=Path)
     parser.add_argument("--timing", action="store_true")
+    parser.add_argument("--warmup-runs", type=int, default=0)
     parser.add_argument("--markdown", action="store_true")
     parser.add_argument("--kv-cache-bf16", action="store_true")
     parser.add_argument("--use-icb", action="store_true")
     args = parser.parse_args()
+    if args.warmup_runs < 0:
+        parser.error("--warmup-runs must be >= 0")
 
     rows = load_resume_rows(args)
     done_pages = {
@@ -317,6 +360,8 @@ def main() -> None:
             env["MU_CONTENT_MAX_NEW_TOKENS"] = str(args.content_max_new_tokens)
         if args.timing:
             env["MU_TIMING"] = "1"
+
+        warmup_rows = run_warmups(cmd, args, env) if args.warmup_runs else []
 
         print(f"Running command: {' '.join(cmd)}")
         start = time.perf_counter()
@@ -400,11 +445,11 @@ def main() -> None:
 
             rows.append(row)
             print(json.dumps(row, ensure_ascii=False), flush=True)
-            write_summary(args, rows)
+            write_summary(args, rows, warmup_rows)
             if "error" in row and not args.keep_going:
                 raise SystemExit(row["error"])
 
-    write_summary(args, rows)
+    write_summary(args, rows, warmup_rows)
 
 
 if __name__ == "__main__":
