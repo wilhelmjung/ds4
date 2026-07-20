@@ -230,6 +230,7 @@ struct mu_gpu {
     int dense_mps_896_4864_rows;
     int dense_mps_4864_896_rows;
     char device_name[256];
+    int device_tier;
 
     // Weight Buffer Cache
     mu_gpu_cached_buffer weight_cache[MU_GPU_WEIGHT_CACHE_CAP];
@@ -1215,6 +1216,15 @@ int mu_gpu_create(mu_gpu **out) {
         } else {
             strlcpy(gpu->device_name, "unknown", sizeof(gpu->device_name));
         }
+        gpu->device_tier = 1;
+        if (strstr(gpu->device_name, "Pro") || strstr(gpu->device_name, "Max")) {
+            gpu->device_tier = 2;
+        } else if (strstr(gpu->device_name, "Ultra") || strstr(gpu->device_name, "M5")) {
+            gpu->device_tier = 3;
+        }
+        if (getenv("MU_METAL_DEBUG")) {
+            fprintf(stderr, "mu_metal: detected device '%s' (Tier %d)\n", gpu->device_name, gpu->device_tier);
+        }
         gpu->scratch_size = 3072ULL * 1024ULL * 1024ULL; // 3.0 GB
         gpu->scratch_a = [device newBufferWithLength:gpu->scratch_size options:MTLResourceStorageModeShared];
         gpu->scratch_b = [device newBufferWithLength:gpu->scratch_size options:MTLResourceStorageModeShared];
@@ -1353,6 +1363,11 @@ bool mu_gpu_available(const mu_gpu *gpu) {
 const char *mu_gpu_device_name(const mu_gpu *gpu) {
     if (!gpu || !gpu->device_name[0]) return "none";
     return gpu->device_name;
+}
+
+int mu_gpu_device_tier(const mu_gpu *gpu) {
+    if (!gpu) return 1;
+    return gpu->device_tier;
 }
 
 int mu_gpu_dense_probe(mu_gpu *gpu, const float *x,
