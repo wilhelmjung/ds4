@@ -186,8 +186,11 @@ Follow-up contention probes were also measured and not kept:
 | Default before prefetch A/B | `/tmp/mu_prefetch_default_threads2.json` | 3/3 | 0 | 120.556958s | 192.821130s | Baseline for adjacent A/B only; run was cold/noisy. |
 | Disable background prefetch thread | `/tmp/mu_prefetch_disabled_threads2.json` | 3/3 | 0 | 62.323259s | 93.583718s | Not kept; apparent win disappeared after reverse-order warm check. |
 | Default after prefetch-disabled run | `/tmp/mu_prefetch_default_after_disabled_threads2.json` | 3/3 | 0 | 60.013088s | 96.432857s | Reverse-order check was slightly faster than disabling prefetch. |
+| Force CPU patch embed in background prefetch thread | `/tmp/mu_prefetch_cpu_patch_optin.json` | 3/3 | 0 | 42.214261s | 59.068116s | Rejected after reverse-order check; adjacent default was slightly faster. |
+| Default after CPU patch-embed opt-in | `/tmp/mu_prefetch_cpu_patch_default_after_optin.json` | 3/3 | 0 | 41.852267s | 61.835183s | Hot reverse-order baseline; confirms the opt-in did not produce a stable wall-clock win. |
 
 - **Conclusion**: do not add a multi-command-queue path or a prefetch-disable switch from the current evidence. The large cold/warm swing means adjacent A/B order must be reversed before promoting any future worker-contention change.
+- **CPU patch-embed prefetch probe**: a temporary `MU_PREFETCH_CPU_PATCH_EMBED=1` probe forced the background prefetch thread to use CPU patch embedding while leaving the main page path unchanged. It was deleted because the reverse-order default run was faster (`41.852267s` vs `42.214261s` wall), so GPU patch embed in prefetch is not currently proven to be the contention root cause.
 
 Benchmark harness update:
 
@@ -200,7 +203,7 @@ Benchmark harness update:
 
 1. **Worker Contention Root Cause**:
    - **Context**: `threads=2` improves 10-page wall-clock throughput, but per-page latency regresses. `threads=4` is not useful on the 3-page probe.
-   - **Known dead ends**: weight-cache lock-free miss allocation is rejected; it reduced mutex hold time but worsened wall time (`75.911148s` profiled, `108.154561s` no-profile on the 3-page probe). `MU_METAL_MULTI_QUEUE=1` was slower (`134.306501s` vs adjacent default `125.483086s`). Disabling the background prefetch thread was not a stable win after reverse-order checking (`62.323259s` vs warm default `60.013088s`).
+   - **Known dead ends**: weight-cache lock-free miss allocation is rejected; it reduced mutex hold time but worsened wall time (`75.911148s` profiled, `108.154561s` no-profile on the 3-page probe). `MU_METAL_MULTI_QUEUE=1` was slower (`134.306501s` vs adjacent default `125.483086s`). Disabling the background prefetch thread was not a stable win after reverse-order checking (`62.323259s` vs warm default `60.013088s`). Forcing CPU patch embedding in the background prefetch thread also failed reverse-order validation (`42.214261s` opt-in vs `41.852267s` adjacent default).
    - **Handoff Task**: Continue with `MU_CONCURRENCY_PROFILE=1`, focusing on ICB decode overlap, cold/warm benchmark control, and shared scratch pressure rather than unlocking weight-cache allocation, adding multiple command queues, or disabling prefetch by default. Use `--warmup-runs 1` or reverse-order A/B before promoting any concurrency result.
 2. **Sequential Optimization**:
    - **Context**: The current reliable baseline is the 10-page sequential Metal run at `174.984202s`.
