@@ -193,6 +193,7 @@ struct mu_gpu {
     id<MTLComputePipelineState> dense_bf16_bias_rows_tiled;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_2sg;
+    id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_add_2sg;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_quick_gelu;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_quick_gelu_2sg;
     id<MTLComputePipelineState> dense_bf16_bias_rows_simdgroup_gelu;
@@ -1172,6 +1173,8 @@ int mu_gpu_create(mu_gpu **out) {
                                                                    @"mu_dense_bf16_bias_rows_simdgroup");
         gpu->dense_bf16_bias_rows_simdgroup_2sg = mu_gpu_make_pipeline(device, @"mu_dense.metal",
                                                                        @"mu_dense_bf16_bias_rows_simdgroup_2sg");
+        gpu->dense_bf16_bias_rows_simdgroup_add_2sg = mu_gpu_make_pipeline(device, @"mu_dense.metal",
+                                                                           @"mu_dense_bf16_bias_rows_simdgroup_add_2sg");
         gpu->dense_bf16_bias_rows_simdgroup_quick_gelu = mu_gpu_make_pipeline(device, @"mu_dense.metal",
                                                                               @"mu_dense_bf16_bias_rows_simdgroup_quick_gelu");
         gpu->dense_bf16_bias_rows_simdgroup_quick_gelu_2sg = mu_gpu_make_pipeline(device, @"mu_dense.metal",
@@ -1262,6 +1265,7 @@ void mu_gpu_destroy(mu_gpu *gpu) {
         gpu->dense_bf16_bias_rows_tiled = nil;
         gpu->dense_bf16_bias_rows_simdgroup = nil;
         gpu->dense_bf16_bias_rows_simdgroup_2sg = nil;
+        gpu->dense_bf16_bias_rows_simdgroup_add_2sg = nil;
         gpu->dense_bf16_bias_rows_simdgroup_quick_gelu = nil;
         gpu->dense_bf16_bias_rows_simdgroup_quick_gelu_2sg = nil;
         gpu->dense_bf16_bias_rows_simdgroup_gelu = nil;
