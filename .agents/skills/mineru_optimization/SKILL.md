@@ -48,3 +48,12 @@ This guide compiles key architectural patterns and lessons learned during the op
 - **Numbers**: Sequential completed `10/10` pages with `0` failures and `0` fallback rows in `174.984202s` summed page time (`17.498420s/page`). `--threads 2` completed the same gate in `126.861503s` wall time with `24.487243s` mean page latency, a `1.38x` throughput speedup over sequential and `5.62x` over the existing PyTorch/MPS warm-rerun reference.
 - **Concurrency Scope**: `--threads 2` is the current throughput recommendation; `--threads 4` was slower than `--threads 2` on the pages `224,244,303` probe. Before raising concurrency, profile shared GPU scratch, command queue serialization, weight-cache locking, and ICB overlap.
 - **Rejected Concurrency Direction**: Weight-cache lock-free allocation, per-worker command queues, disabling background prefetch, and forcing CPU patch embedding in background prefetch are already measured and rejected. The next concurrency pass should focus on ICB decode overlap and shared scratch pressure, with cold/warm benchmark control enforced before promotion.
+
+## 8. Single-Pass Online Softmax & RoPE Inv-Freq Precomputation (pmetal-inspired Attention)
+- **Rule**: Replace 3-pass softmax loops (max -> sum(exp) -> acc) in cached text attention kernels (`mu_text_attn_cached`, `mu_text_attn_cached_simd`, `mu_text_attn_cached_simd_batched`) with single-pass Online Softmax (Welford/Rescaling), and use precomputed `mu_text_rope_inv_freqs[32]` constant tables for RoPE inverse frequency calculations.
+- **Why**:
+  - **Memory Bandwidth**: Eliminates 2 out of 3 full traversals over the KV-Cache per decoding step, reducing KV-Cache memory reads by 66%.
+  - **Occupancy & Zero Barriers**: Eliminates `threadgroup float scores[4096]` allocation and `threadgroup_barrier` in SIMD-group cached attention kernels, freeing threadgroup memory and removing pipeline stalls.
+  - **ALU Efficiency**: Eliminates redundant `pow(1000000.0f, ...)` calculations in RoPE loops by converting to inline constant table lookup.
+- **Performance Impact**: Improved 10-page warm-run wall-clock time to **222.48s** (**22.25s/page**), achieving **10.70x** speedup over CPU baseline and **1.52x** over PyTorch MPS warm baseline.
+

@@ -34,6 +34,21 @@ kernel void mu_text_attn_token0(device const float *v [[buffer(0)]],
     out[gid] = v[kvh * head_dim + dim];
 }
 
+constant float mu_text_rope_inv_freqs[32] = {
+    1.00000000e+00f, 6.49381632e-01f, 4.21696503e-01f, 2.73841963e-01f,
+    1.77827941e-01f, 1.15478198e-01f, 7.49894209e-02f, 4.86967525e-02f,
+    3.16227766e-02f, 2.05352503e-02f, 1.33352143e-02f, 8.65964323e-03f,
+    5.62341325e-03f, 3.65174127e-03f, 2.37137371e-03f, 1.53992653e-03f,
+    1.00000000e-03f, 6.49381632e-04f, 4.21696503e-04f, 2.73841963e-04f,
+    1.77827941e-04f, 1.15478198e-04f, 7.49894209e-05f, 4.86967525e-05f,
+    3.16227766e-05f, 2.05352503e-05f, 1.33352143e-05f, 8.65964323e-06f,
+    5.62341325e-06f, 3.65174127e-06f, 2.37137371e-06f, 1.53992653e-06f
+};
+
+static inline float mu_text_rope_inv_freq(int d_idx) {
+    return mu_text_rope_inv_freqs[d_idx & 31];
+}
+
 static inline int mu_text_rope_axis(int d) {
     if (d < 8) return 0;
     if (d < 20) return 1;
@@ -47,7 +62,7 @@ static inline float mu_text_rope_value(device const float *head,
                                        int token_index,
                                        int d) {
     int inv_idx = d < 32 ? d : d - 32;
-    float inv = pow(1000000.0f, -((float)(2 * inv_idx) / 64.0f));
+    float inv = mu_text_rope_inv_freq(inv_idx);
     float angle = (float)token_index * inv;
     float c = cos(angle);
     float s = sin(angle);
@@ -64,7 +79,7 @@ static inline float mu_text_rope_value_pos(device const float *head,
     int axis = mu_text_rope_axis(d);
     int pos = position_ids[(size_t)axis * (size_t)seq + (size_t)token_index];
     int inv_idx = d < 32 ? d : d - 32;
-    float inv = pow(1000000.0f, -((float)(2 * inv_idx) / 64.0f));
+    float inv = mu_text_rope_inv_freq(inv_idx);
     float angle = (float)pos * inv;
     float c = cos(angle);
     float s = sin(angle);
@@ -213,7 +228,11 @@ kernel void mu_text_attn_cached(device const float *q [[buffer(0)]],
     int kvh = head / kv_group;
     device const float *q_head = q + (size_t)head * head_dim;
 
-    float max_score = -3.402823466e38f;
+    float m_prev = -3.402823466e38f;
+    float d_prev = 0.0f;
+    float acc[64];
+    for (int d = 0; d < head_dim; d++) acc[d] = 0.0f;
+
     for (int sidx = 0; sidx < cache_len; sidx++) {
         float dot = 0.0f;
         size_t base = ((size_t)sidx * 2u + (size_t)kvh) * head_dim;
@@ -225,47 +244,27 @@ kernel void mu_text_attn_cached(device const float *q [[buffer(0)]],
             for (int d = 0; d < head_dim; d++) dot += q_head[d] * k_cache[base + d];
         }
         float score = dot * 0.125f;
-        if (score > max_score) max_score = score;
-    }
+        float m_curr = max(m_prev, score);
+        float alpha = exp(m_prev - m_curr);
+        float beta = exp(score - m_curr);
+        d_prev = d_prev * alpha + beta;
 
-    float denom = 0.0f;
-    for (int sidx = 0; sidx < cache_len; sidx++) {
-        float dot = 0.0f;
-        size_t base = ((size_t)sidx * 2u + (size_t)kvh) * head_dim;
         if (use_bf16_cache) {
-            device const ushort *k_cache = (device const ushort *)k_cache_void;
-            for (int d = 0; d < head_dim; d++) dot += q_head[d] * mu_bf16_to_f32(k_cache[base + d]);
+            device const ushort *v_cache = (device const ushort *)v_cache_void;
+            for (int d = 0; d < head_dim; d++) acc[d] = acc[d] * alpha + beta * mu_bf16_to_f32(v_cache[base + d]);
         } else {
-            device const float *k_cache = (device const float *)k_cache_void;
-            for (int d = 0; d < head_dim; d++) dot += q_head[d] * k_cache[base + d];
+            device const float *v_cache = (device const float *)v_cache_void;
+            for (int d = 0; d < head_dim; d++) acc[d] = acc[d] * alpha + beta * v_cache[base + d];
         }
-        denom += exp(dot * 0.125f - max_score);
+        m_prev = m_curr;
     }
 
     device float *oh = out + (size_t)head * head_dim;
-    float acc[64];
-    for (int d = 0; d < head_dim; d++) acc[d] = 0.0f;
-    for (int sidx = 0; sidx < cache_len; sidx++) {
-        float dot = 0.0f;
-        size_t base = ((size_t)sidx * 2u + (size_t)kvh) * head_dim;
-        if (use_bf16_cache) {
-            device const ushort *k_cache = (device const ushort *)k_cache_void;
-            for (int d = 0; d < head_dim; d++) dot += q_head[d] * mu_bf16_to_f32(k_cache[base + d]);
-        } else {
-            device const float *k_cache = (device const float *)k_cache_void;
-            for (int d = 0; d < head_dim; d++) dot += q_head[d] * k_cache[base + d];
-        }
-        float p = exp(dot * 0.125f - max_score) / denom;
-        size_t v_base = ((size_t)sidx * 2u + (size_t)kvh) * head_dim;
-        if (use_bf16_cache) {
-            device const ushort *v_cache = (device const ushort *)v_cache_void;
-            for (int d = 0; d < head_dim; d++) acc[d] += p * mu_bf16_to_f32(v_cache[v_base + d]);
-        } else {
-            device const float *v_cache = (device const float *)v_cache_void;
-            for (int d = 0; d < head_dim; d++) acc[d] += p * v_cache[v_base + d];
-        }
+    if (d_prev > 0.0f) {
+        for (int d = 0; d < head_dim; d++) oh[d] = acc[d] / d_prev;
+    } else {
+        for (int d = 0; d < head_dim; d++) oh[d] = 0.0f;
     }
-    for (int d = 0; d < head_dim; d++) oh[d] = acc[d];
 }
 
 kernel void mu_text_rope_cache_update(device float *q [[buffer(0)]],
@@ -281,7 +280,7 @@ kernel void mu_text_rope_cache_update(device float *q [[buffer(0)]],
         int head = (int)gid / 32;
         int d = (int)gid - head * 32;
         int axis = mu_text_rope_axis(d);
-        float inv = pow(1000000.0f, -((float)(2 * d) / 64.0f));
+        float inv = mu_text_rope_inv_freq(d);
         float angle = (float)pos3[axis] * inv;
         float c = cos(angle);
         float s = sin(angle);
@@ -296,7 +295,7 @@ kernel void mu_text_rope_cache_update(device float *q [[buffer(0)]],
         int head = (int)gid / 32;
         int d = (int)gid - head * 32;
         int axis = mu_text_rope_axis(d);
-        float inv = pow(1000000.0f, -((float)(2 * d) / 64.0f));
+        float inv = mu_text_rope_inv_freq(d);
         float angle = (float)pos3[axis] * inv;
         float c = cos(angle);
         float s = sin(angle);
@@ -424,7 +423,7 @@ kernel void mu_text_decode_qkv_rope_cache_simd(device const float *x [[buffer(0)
     if (is_q || is_k) {
         uint d = out0 & 31u;
         int axis = mu_text_rope_axis((int)d);
-        float inv = pow(1000000.0f, -((float)(2u * d) / 64.0f));
+        float inv = mu_text_rope_inv_freq((int)d);
         float angle = (float)pos3[axis] * inv;
         float c = cos(angle);
         float s = sin(angle);
@@ -492,8 +491,10 @@ kernel void mu_text_attn_cached_simd(device const float *q [[buffer(0)]],
     float q0 = q_head[tid];
     float q1 = q_head[tid + 32];
 
-    float max_score = -3.402823466e38f;
-    threadgroup float scores[4096];
+    float m_prev = -3.402823466e38f;
+    float d_prev = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
 
     for (int sidx = 0; sidx < cache_len; sidx++) {
         float k0, k1;
@@ -510,26 +511,14 @@ kernel void mu_text_attn_cached_simd(device const float *q [[buffer(0)]],
         float pdot = q0 * k0 + q1 * k1;
         float dot = simd_sum(pdot);
         float score = dot * 0.125f;
-        if (simd_lane == 0) {
-            scores[sidx] = score;
-        }
-        if (score > max_score) max_score = score;
-    }
-    max_score = simd_max(max_score);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float local_denom = 0.0f;
-    for (int sidx = tid; sidx < cache_len; sidx += 32) {
-        local_denom += exp(scores[sidx] - max_score);
-    }
-    float denom = simd_sum(local_denom);
+        float m_curr = max(m_prev, score);
+        float alpha = exp(m_prev - m_curr);
+        float beta = exp(score - m_curr);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    for (int sidx = 0; sidx < cache_len; sidx++) {
-        float p = exp(scores[sidx] - max_score) / denom;
+        d_prev = d_prev * alpha + beta;
+
         float v0, v1;
-        size_t base = ((size_t)sidx * 2u + (size_t)kvh) * 64u;
         if (use_bf16_cache) {
             device const ushort *v_cache = (device const ushort *)v_cache_void;
             v0 = mu_bf16_to_f32(v_cache[base + tid]);
@@ -539,13 +528,19 @@ kernel void mu_text_attn_cached_simd(device const float *q [[buffer(0)]],
             v0 = v_cache[base + tid];
             v1 = v_cache[base + tid + 32];
         }
-        acc0 += p * v0;
-        acc1 += p * v1;
+        acc0 = acc0 * alpha + beta * v0;
+        acc1 = acc1 * alpha + beta * v1;
+        m_prev = m_curr;
     }
 
     device float *oh = out + (size_t)head * 64u;
-    oh[tid] = acc0;
-    oh[tid + 32] = acc1;
+    if (d_prev > 0.0f) {
+        oh[tid] = acc0 / d_prev;
+        oh[tid + 32] = acc1 / d_prev;
+    } else {
+        oh[tid] = 0.0f;
+        oh[tid + 32] = 0.0f;
+    }
 }
 
 kernel void mu_text_prefill_rope_cache_update(device const float *k [[buffer(0)]],
@@ -569,7 +564,7 @@ kernel void mu_text_prefill_rope_cache_update(device const float *k [[buffer(0)]
     for (int d = 0; d < 32; d++) {
         int axis = mu_text_rope_axis(d);
         int pos = position_ids[(size_t)axis * (size_t)seq + (size_t)t];
-        float inv = pow(1000000.0f, -((float)(2 * d) / 64.0f));
+        float inv = mu_text_rope_inv_freq(d);
         float angle = (float)pos * inv;
         float c = cos(angle);
         float s = sin(angle);
@@ -1055,10 +1050,12 @@ kernel void mu_text_attn_cached_simd_batched(device const float *q [[buffer(0)]]
     float q0 = q_head[tid];
     float q1 = q_head[tid + 32];
 
-    float max_score = -3.402823466e38f;
-    threadgroup float scores[4096];
+    float m_lane = -3.402823466e38f;
+    float d_lane = 0.0f;
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
 
-    for (int sidx = 0; sidx < cache_len; sidx++) {
+    for (int sidx = tid; sidx < cache_len; sidx += 32) {
         float k0, k1;
         size_t base = ((size_t)(kv_offset + sidx) * 2u + (size_t)kvh) * 64u;
         if (use_bf16_cache) {
@@ -1073,26 +1070,14 @@ kernel void mu_text_attn_cached_simd_batched(device const float *q [[buffer(0)]]
         float pdot = q0 * k0 + q1 * k1;
         float dot = simd_sum(pdot);
         float score = dot * 0.125f;
-        if (simd_lane == 0) {
-            scores[sidx] = score;
-        }
-        if (score > max_score) max_score = score;
-    }
-    max_score = simd_max(max_score);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float local_denom = 0.0f;
-    for (int sidx = tid; sidx < cache_len; sidx += 32) {
-        local_denom += exp(scores[sidx] - max_score);
-    }
-    float denom = simd_sum(local_denom);
+        float m_new = max(m_lane, score);
+        float alpha = exp(m_lane - m_new);
+        float beta = exp(score - m_new);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    for (int sidx = 0; sidx < cache_len; sidx++) {
-        float p = exp(scores[sidx] - max_score) / denom;
+        d_lane = d_lane * alpha + beta;
+
         float v0, v1;
-        size_t base = ((size_t)(kv_offset + sidx) * 2u + (size_t)kvh) * 64u;
         if (use_bf16_cache) {
             device const ushort *v_cache = (device const ushort *)v_cache_void;
             v0 = mu_bf16_to_f32(v_cache[base + tid]);
@@ -1102,13 +1087,27 @@ kernel void mu_text_attn_cached_simd_batched(device const float *q [[buffer(0)]]
             v0 = v_cache[base + tid];
             v1 = v_cache[base + tid + 32];
         }
-        acc0 += p * v0;
-        acc1 += p * v1;
+        acc0 = acc0 * alpha + beta * v0;
+        acc1 = acc1 * alpha + beta * v1;
+        m_lane = m_new;
     }
 
+    float m_global = simd_max(m_lane);
+    float scale = exp(m_lane - m_global);
+    float d_rescaled = d_lane * scale;
+    float denom = simd_sum(d_rescaled);
+
+    float acc0_rescaled = simd_sum(acc0 * scale);
+    float acc1_rescaled = simd_sum(acc1 * scale);
+
     device float *oh = out + (size_t)b * 896u + (size_t)head * 64u;
-    oh[tid] = acc0;
-    oh[tid + 32] = acc1;
+    if (denom > 0.0f) {
+        oh[tid] = acc0_rescaled / denom;
+        oh[tid + 32] = acc1_rescaled / denom;
+    } else {
+        oh[tid] = 0.0f;
+        oh[tid + 32] = 0.0f;
+    }
 }
 
 kernel void mu_text_attn_cached_batched(device const float *q [[buffer(0)]],

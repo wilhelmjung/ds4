@@ -6,6 +6,7 @@ This directory keeps MinerU design notes, execution plans, and benchmark reports
 
 | Document | Purpose |
 | --- | --- |
+| [architecture/README.md](architecture/README.md) | PlantUML architecture diagrams (system components, pipeline dataflow, Metal engine) |
 | [design-docs/mu-design.md](design-docs/mu-design.md) | Dedicated MinerU2.5-Pro engine design |
 | [design-docs/mu-architecture.md](design-docs/mu-architecture.md) | Model architecture summary |
 | [design-docs/mu-metal-design.md](design-docs/mu-metal-design.md) | Metal backend design |
