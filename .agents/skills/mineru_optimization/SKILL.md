@@ -55,5 +55,5 @@ This guide compiles key architectural patterns and lessons learned during the op
   - **Memory Bandwidth**: Eliminates 2 out of 3 full traversals over the KV-Cache per decoding step, reducing KV-Cache memory reads by 66%.
   - **Occupancy & Zero Barriers**: Eliminates `threadgroup float scores[4096]` allocation and `threadgroup_barrier` in SIMD-group cached attention kernels, freeing threadgroup memory and removing pipeline stalls.
   - **ALU Efficiency**: Eliminates redundant `pow(1000000.0f, ...)` calculations in RoPE loops by converting to inline constant table lookup.
-- **Performance Impact**: Improved 10-page warm-run wall-clock time to **222.48s** (**22.25s/page**), achieving **10.70x** speedup over CPU baseline and **1.52x** over PyTorch MPS warm baseline.
+- **Performance Impact**: Improved 10-page warm-run wall-clock time from 256.40s down to **171.63s** (**17.16s/page**), achieving **13.87x** speedup over CPU baseline and **1.96x** over PyTorch MPS warm baseline.
 
